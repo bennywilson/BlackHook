@@ -1,0 +1,26 @@
+// The negative profile test, loaded by `mv_testhost --negative-profile` through
+// MV_PROFILE_FILE and MV_PROFILE.
+//
+// Narrows velocity's format table to the wrong entry: the real SceneVelocity is
+// R16G16B16A16_UNORM, and the only R16G16_UNORM resource in the line-up is the
+// compute-written decoy, which never takes the RENDER_TARGET -> shader-resource
+// edge. The structural gate admits only the decoy and the behaviour gate must
+// reject it. Required outcome: "identify: NO candidate", nothing selected,
+// nothing captured. Falling back to the full table would find SceneVelocity
+// and pass for the wrong reason.
+{
+  "schema_version": 1,
+  "profiles": {
+    "test-velocity-wrong-format": {
+      "extends": "ue5-generic",
+      "description": "Negative test: velocity narrowed to R16G16_UNORM only.",
+      "surfaces": {
+        "velocity": {
+          "formats": [
+            { "format": "R16G16_UNORM", "score": 4, "description": "R16G16_UNORM (the only entry - deliberately wrong for testhost)" }
+          ]
+        }
+      }
+    }
+  }
+}

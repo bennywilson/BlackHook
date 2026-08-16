@@ -1,0 +1,231 @@
+SceneVelocity extraction - offline validation
+========================================================================
+generated: 2026-08-14 16:36:06
+dump:      D:/mv_captures/skyrunner_moderate
+title:     skyrunner
+command:   python tools/run_validation.py <dump_dir> [tag]
+
+This file is generated verbatim from the committed tools. Nothing here
+is hand-edited, including the parts that fail.
+
+
+========================================================================
+inspect_velocity.py
+========================================================================
+What is in the capture at all: coverage, motion magnitude, and the
+reassembled V.z from channels 2/3.
+------------------------------------------------------------------------
+meta: {'velocity_width': 1708, 'velocity_height': 1068, 'velocity_row_pitch': 13824, 'velocity_format': 11, 'velocity_bytes': 14763872, 'velocity_subresources': 1, 'color_width': 1707, 'color_height': 1067, 'color_row_pitch': 6912, 'color_format': 24, 'color_bytes': 7375020, 'color_subresources': 1}
+velocity format 11: 4 channels, 8 bytes/pixel
+decoding as UE 5.2 (from MV_ENGINE_VERSION; not recorded in the capture)
+
+120 captured frames: 0..119
+
+frame     0: written= 25.73%  raw_ch0=[0.0000,0.6856] raw_ch1=[0.0000,0.6104]
+              motion(px): mean= 100.792 p50= 119.721 p95= 170.392 max= 237.015
+              V.z (DeviceZ delta): mean=+1.010e-04 p05=-7.362e-04 p95=+8.805e-04  bHasPixelAnimation not encoded in this engine version
+frame    20: written= 30.20%  raw_ch0=[0.0000,0.5244] raw_ch1=[0.0000,0.5455]
+              motion(px): mean=   2.878 p50=   2.945 p95=   4.136 max=   9.165
+              V.z (DeviceZ delta): mean=-2.840e-04 p05=-1.898e-03 p95=+4.571e-07  bHasPixelAnimation not encoded in this engine version
+frame    40: written= 29.22%  raw_ch0=[0.0000,0.5595] raw_ch1=[0.0000,0.5508]
+              motion(px): mean=   3.655 p50=   3.456 p95=   7.266 max=  26.723
+              V.z (DeviceZ delta): mean=+5.072e-04 p05=+6.927e-06 p95=+3.062e-03  bHasPixelAnimation not encoded in this engine version
+frame    60: written= 23.43%  raw_ch0=[0.0000,0.5504] raw_ch1=[0.0000,0.5785]
+              motion(px): mean=  10.246 p50=   9.698 p95=  22.514 max=  43.616
+              V.z (DeviceZ delta): mean=-2.832e-05 p05=-7.338e-04 p95=+2.057e-04  bHasPixelAnimation not encoded in this engine version
+frame    80: written= 19.80%  raw_ch0=[0.0000,0.5304] raw_ch1=[0.0000,0.5933]
+              motion(px): mean=  10.818 p50=   9.777 p95=  23.050 max=  61.357
+              V.z (DeviceZ delta): mean=+1.554e-04 p05=-8.797e-06 p95=+4.583e-04  bHasPixelAnimation not encoded in this engine version
+frame   100: written= 24.09%  raw_ch0=[0.0000,0.6110] raw_ch1=[0.0000,0.5408]
+              motion(px): mean=  32.350 p50=  33.079 p95=  69.466 max=  95.842
+              V.z (DeviceZ delta): mean=+8.652e-05 p05=-6.067e-04 p95=+1.584e-03  bHasPixelAnimation not encoded in this engine version
+
+
+========================================================================
+check_decode.py
+========================================================================
+The decode against independently measured image motion (block matching),
+with the project's old linear decode alongside for comparison.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (118 adjacent, 1 rejected)
+
+  pair   eng_dx   eng_dy   bm_dx   bm_dy  eng|v|  bm|v| legacy|v|
+     1  -31.214   -2.470  -23.53   -4.43  31.312  23.95    16.758
+     9   51.400    6.828   40.73    4.09  51.851  40.93    23.408
+    17   -3.664   -1.420   -1.64   -1.01   3.930   1.92     7.139
+    25  -19.317    2.307   -2.97   -0.18  19.455   2.98    13.405
+    33   12.543    5.189    0.79    0.36  13.574   0.87    12.428
+    41   -3.152    0.160   -1.77    0.07   3.156   1.77     5.947
+    49  -52.721   -6.446  -35.11   -4.73  53.113  35.43    22.917
+    57   69.054   13.165   49.06    6.04  70.298  49.43    27.936
+
+pairs scored:                  60
+mean block-matched |v|:        15.076 px   <- ground truth
+mean decoded |v| (engine):     27.047 px
+mean decoded |v| (legacy lin): 14.790 px
+mean |engine - measured|:      12.690 px
+mean |legacy  - measured|:     11.034 px
+corr X: +0.954
+corr Y: +0.801
+
+zero point, vs UE5 documented 32767 (Common.ush:2069):
+  ch0: modal code  32734.5  (offset -32.5, spread across frames 12591.0)
+        -> 0.002 px under the engine's sqrt decode, 0.149 px under the legacy linear one
+  ch1: modal code  32805.8  (offset +38.8, spread across frames 5364.6)
+        -> 0.002 px under the engine's sqrt decode, 0.126 px under the legacy linear one
+
+channels 2/3 (VELOCITY_ENCODE_DEPTH, Common.ush:2071):
+  frame 31: ch2 spans 0.000..0.726, ch3 spans 0.000..1.000
+  reassembled V.z (DeviceZ delta): mean +4.960e-05  range -4.738e-04..+1.413e-03
+  finite and denormal-free: 100.0% (a mis-read of these channels would be full of NaN/Inf)
+  bHasPixelAnimation: not encoded in this engine version (no VELOCITY_Z_LOW_MASK), so channel 3's low bit is float mantissa, not a flag
+
+
+========================================================================
+derive_scale.py
+========================================================================
+Per-pixel regression of decoded against block-matched displacement, plus
+a fit of the encoding exponent that does not assume the answer.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (118 adjacent, 1 rejected)
+12 pairs after stride 3 (capped at 12)
+
+559281 confidently-matched written pixels pooled across pairs
+measured displacement: |x| p50=0.99px p99=30.28px, |y| p50=0.73px p99=10.24px
+
+1. Encoding exponent (does not assume the answer)
+   fitting  log|measured_px| = p * log|code_offset| + log k
+   p ~ 1 => linear encoding;  p ~ 2 => sqrt encoding (VELOCITY_ENCODE_GAMMA)
+   axis X: p = 0.005   R^2 = 0.003   (n=544494)  -> UNINFORMATIVE (R^2 too low to distinguish)
+   axis Y: p = -0.018   R^2 = -0.018   (n=539622)  -> UNINFORMATIVE (R^2 too low to distinguish)
+
+2. Engine decode vs measured (slope 1.000, intercept 0 = correct)
+   axis X: measured = 0.397 * decoded -0.016 px   R^2 = 0.346
+   axis Y: measured = 0.228 * decoded +0.291 px   R^2 = 0.164
+
+3. Legacy linear decode vs measured, for comparison
+   axis X: measured = 0.626 * decoded -0.257 px   R^2 = 0.370
+   axis Y: measured = 0.329 * decoded +0.088 px   R^2 = 0.350
+
+RMS error against measured displacement, per pixel:
+   axis X: engine   8.187 px   legacy   5.949 px
+   axis Y: engine   3.782 px   legacy   3.394 px
+
+wrote D:\hook\ue5-motion-vectors\results\decode_scatter_skyrunner.png
+
+--- stderr ---
+D:\hook\ue5-motion-vectors\tools\derive_scale.py:160: RankWarning: Polyfit may be poorly conditioned
+  a, b = np.polyfit(x, y, 1)
+D:\hook\ue5-motion-vectors\tools\derive_scale.py:160: RankWarning: Polyfit may be poorly conditioned
+  a, b = np.polyfit(x, y, 1)
+
+
+========================================================================
+region_match.py
+========================================================================
+The same comparison per REGION rather than per pixel, against wide-range
+cross-correlation of the game's own frames. Weaker than derive_scale.py by
+construction, but it is the one that works on footage where per-pixel
+matching is defeated by motion blur and thin foliage - and its magnitude
+sweep is what discriminates the square-root encoding from a linear one.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (118 adjacent, 1 rejected)
+
+      pair  measured dx      dy    ncc |  engine dx      dy |  legacy dx      dy
+   0->1           -26.0    -4.0  0.975 |     -26.35   -4.03 |     -18.60   -6.52
+   1->2           -17.0    -2.0  0.984 |     -17.04   -1.87 |     -14.96   -4.44
+   2->3            -9.0    -2.0  0.984 |      -8.51   -2.01 |     -10.57   -4.60
+   3->4             1.0     0.0  0.983 |       0.60    0.00 |       2.81    0.15
+   4->5            70.0    10.0  0.942 |      71.46    9.75 |      30.64   10.13
+   5->6            88.0    14.0  0.981 |      89.76   13.89 |      34.34   12.09
+   6->7            42.0     5.0  0.986 |      43.41    5.56 |      23.88    7.65
+   7->8            36.0     4.0  0.987 |      38.32    4.67 |      22.44    7.01
+   8->9            42.0     3.0  0.982 |      44.85    1.86 |      24.28    4.43
+   9->10            6.0     2.0  0.971 |       6.11    2.09 |       8.96    4.70
+  10->11          -12.0    -2.0  0.986 |     -13.23   -2.19 |     -13.18   -4.81
+  11->12          -16.0    -3.0  0.988 |     -17.38   -2.33 |     -15.11   -4.96
+
+118 pairs matched above ncc 0.7; measured |dx| spans 0..94 px
+
+slope of measured against decoded (1.000 = correct), and correlation:
+  engine (sqrt, Common.ush)    X: slope  0.921  r +0.995    Y: slope  0.751  r +0.935
+  legacy (linear, fitted)      X: slope  1.604  r +0.937    Y: slope  0.697  r +0.881
+
+ratio measured/decoded by displacement band (flat = correct encoding):
+       band (px)    n    engine    legacy
+    0.0-5.6        39     0.402     0.303
+    5.6-20.0       40     0.953     0.951
+   20.0-94.0       45     0.944     1.604
+
+Read the lowest band with care: template matching resolves whole pixels only,
+so at a few px the quantisation dominates and BOTH decodes read low. That is the
+reference running out of precision, not a property of either decode - which is why
+it shows up in both columns at once. The discrimination lives in the upper bands,
+where a linear decode of square-root-encoded data must diverge and a correct one
+must stay flat.
+
+
+========================================================================
+warp_validate.py
+========================================================================
+Warp frame N-1 by frame N's field and score it, against three controls:
+a sign flip, the best possible single rigid translation, and a
+deliberately mismatched frame's field.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (118 adjacent, 1 rejected)
+118 adjacent pairs: 15 held out to probe the multiplier, 103 scored
+
+Sweeping the decode multiplier on the held-out probe pairs
+(mean absolute error over written pixels, lower is better)
+1.0 = the constants transcribed from Common.ush, unmodified. Nothing
+downstream was fitted to this sweep, so where it peaks is evidence.
+
+    multiplier         MAE    vs baseline
+   0 (no warp)     0.04983             --
+           0.4     0.03980         +20.1%
+           0.5     0.03726         +25.2%
+           0.6     0.03478         +30.2%
+           0.7     0.03249         +34.8%
+           0.8     0.03045         +38.9%
+           0.9     0.02889         +42.0%
+           1.0     0.02826         +43.3%
+           1.1     0.02906         +41.7%
+           1.2     0.03076         +38.3%
+           1.3     0.03301         +33.8%
+           1.4     0.03562         +28.5%
+           1.5     0.03843         +22.9%
+           1.6     0.04127         +17.2%
+
+Best multiplier: 1.0 (MAE 0.02826 vs baseline 0.04983)
+Scoring below uses multiplier 1.0 (the unmodified engine decode), not the swept optimum.
+
+Full validation on the scored pairs, with controls
+  per-pixel  - the decoded SceneVelocity field, as-is
+  sign flip  - the same field negated; must get clearly WORSE
+  global     - the single best rigid translation for the masked region,
+               found by block matching; an upper bound on what any
+               rigid-motion model could achieve on this pair
+  mismatched - the field from frame N+5 applied to the N-1 -> N pair;
+               must get clearly worse
+
+  pairs scored: 103
+
+             condition    mean MAE    vs baseline   better than baseline
+    no warp (baseline)     0.04908          +0.0%            0/103      
+       per-pixel field     0.03059         +37.7%          102/103      
+          sign-flipped     0.06959         -41.8%            0/103      
+     best global shift     0.04892          +0.3%           66/103      
+      mismatched frame     0.18118        -265.8%            0/98       
+
+Control verdicts:
+  sign flip        : +127.5% vs the per-pixel field  -> PASS (clearly worse, as required)
+  mismatched frame : +498.1% vs the per-pixel field  -> PASS (clearly worse, as required)
+  best global shift: +59.9% vs the per-pixel field
+      -> the per-pixel field beats the best rigid translation, so it is
+         carrying information a single global shift cannot express.
+
+  wrote D:\hook\ue5-motion-vectors\results\warp_validation_skyrunner.png (pair 5 -> 6, MAE 0.12998 -> 0.03793)
+
+
+========================================================================
+5/5 tools ran to completion.

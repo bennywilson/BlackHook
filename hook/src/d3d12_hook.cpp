@@ -1,0 +1,514 @@
+#include "d3d12_hook.h"
+
+#include <windows.h>
+
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+
+#include <MinHook.h>
+
+#include <atomic>
+#include <memory>
+#include <string>
+
+#include "capture.h"
+#include "logging.h"
+#include "overlay.h"
+#include "surface_profile.h"
+#include "surface_registry.h"
+
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+
+using Microsoft::WRL::ComPtr;
+
+namespace mv
+{
+namespace
+{
+
+// Vtable slot indices, from the Windows SDK IDL (dxgi.idl, dxgi1_2.idl,
+// d3d12.idl, 10.0.26100.0). A vtable is the inherited methods followed by the
+// interface's own in declaration order; COM keeps these indices stable.
+//
+// IDXGISwapChain:
+//      [00-02] IUnknown                (QueryInterface, AddRef, Release)
+//      [03-06] IDXGIObject
+//      [07]    IDXGIDeviceSubObject    (GetDevice)
+//      [08-17] IDXGISwapChain          (Present = 8, GetBuffer = 9, ...)
+//
+//  IDXGISwapChain1:
+//      [00-17] Inherits IDXGISwapChain
+//      [18-21] IDXGISwapChain1         (GetDesc1 .. GetCoreWindow)
+//      [22]    Present1                <-- Target hook
+//
+//  ID3D12CommandQueue:
+//      [00-02] IUnknown
+//      [03-06] ID3D12Object
+//      [07]    ID3D12DeviceChild/ ID3D12Pageables
+//      [08]    UpdateTileMappings
+//      [09]    CopyTileMappings
+//      [10]    ExecuteCommandLists  <-- Target hook
+//
+//  ID3D12GraphicsCommandList:
+//      [00-07] Base Interfaces      (IUnknown through ID3D12Pageable)
+//      [08]    ID3D12CommandList    (GetType)
+//      [09]    Close
+//      [26]    ResourceBarrier      <-- Target hook
+
+constexpr size_t kPresentIndex = 8;
+constexpr size_t kPresent1Index = 22;
+constexpr size_t kExecuteCommandListsIndex = 10;
+constexpr size_t kResourceBarrierIndex = 26;
+
+void* VTableEntry(void* instance, size_t index)
+{
+    void** vtable = *reinterpret_cast<void***>(instance);
+    return vtable[index];
+}
+
+// The hooked functions' signatures; the first parameter is `this`.
+using Present_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+using ResourceBarrier_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+
+Present_t g_originalPresent = nullptr;
+Present1_t g_originalPresent1 = nullptr;
+ExecuteCommandLists_t g_originalExecuteCommandLists = nullptr;
+ResourceBarrier_t g_originalResourceBarrier = nullptr;
+
+// The present count: the frame key pairing a frame's barrier-time copies with
+// its Present. Atomic: games record command lists on several threads. The
+// counters below are diagnostics only.
+std::atomic<uint64_t> g_frameCounter{0};
+
+std::atomic<uint64_t> g_presentCount{0};
+std::atomic<uint64_t> g_present1Count{0};
+std::atomic<uint64_t> g_executeCommandListsCount{0};
+std::atomic<uint64_t> g_resourceBarrierCount{0};
+
+// Periodic heartbeat with the hook call counts.
+void LogHeartbeatIfDue()
+{
+    // Either Present path: UE5 presents via Present1 (flip model).
+    const uint64_t n = g_presentCount.load(std::memory_order_relaxed) + g_present1Count.load(std::memory_order_relaxed);
+    if (n <= 5 || n % 300 == 0)
+    {
+        Log("heartbeat: frames=" + std::to_string(n) +
+            " present=" + std::to_string(g_presentCount.load(std::memory_order_relaxed)) +
+            " present1=" + std::to_string(g_present1Count.load(std::memory_order_relaxed)) +
+            " executeCommandLists=" + std::to_string(g_executeCommandListsCount.load(std::memory_order_relaxed)) +
+            " resourceBarrier=" + std::to_string(g_resourceBarrierCount.load(std::memory_order_relaxed)));
+    }
+}
+
+// These hooks replace the game's calls; every path must call the original.
+//
+// Capture runs before the frame counter advances and before the real Present:
+// the back buffer still holds the finished frame, and the frame index matches
+// the one the frame's barriers were tagged with.
+//
+// The back-buffer size is read every frame until velocity is identified, then
+// polled: a resize abandons the identified scene textures.
+constexpr uint64_t kResizePollFrames = 30;
+
+void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t frame)
+{
+    if (!swapChain)
+    {
+        return;
+    }
+
+    if (mv::GetSurfaceRegistry().Selected("velocity") && (frame % kResizePollFrames))
+    {
+        return;
+    }
+
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (SUCCEEDED(swapChain->GetDesc(&desc)))
+    {
+        mv::GetSurfaceRegistry().NoteBackBufferSize(desc.BufferDesc.Width, desc.BufferDesc.Height);
+    }
+}
+
+// Known-source exclusion, fed on every Present. A surface whose formats include
+// the back buffer's (normals: R8G8B8A8_UNORM) would otherwise shortlist, and
+// hold references to, the swapchain's buffers: flip-model teardown then hangs
+// at exit and the game's `ResizeBuffers` fails. All buffers, because one can
+// take a barrier before it is first presented.
+void NoteKnownSources(IDXGISwapChain* const swapChain)
+{
+    if (!swapChain)
+    {
+        return;
+    }
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swapChain->GetDesc(&desc)))
+    {
+        return;
+    }
+    for (UINT i = 0; i < desc.BufferCount; ++i)
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        if (SUCCEEDED(swapChain->GetBuffer(i, IID_PPV_ARGS(&buffer))) && buffer)
+        {
+            mv::GetSurfaceRegistry().NoteKnownSourceResource(buffer.Get());
+        }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
+{
+    const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
+    mv::SetFrameIndex(frame);
+    NoteKnownSources(swapChain);
+    NoteBackBufferSizeIfNeeded(swapChain, frame);
+    mv::GetSurfaceRegistry().OnFrame(frame);
+    mv::OnPresent(swapChain);
+    mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
+    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+    g_presentCount.fetch_add(1, std::memory_order_relaxed);
+    LogHeartbeatIfDue();
+    return g_originalPresent(swapChain, syncInterval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE
+HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DXGI_PRESENT_PARAMETERS* presentParams)
+{
+    const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
+    mv::SetFrameIndex(frame);
+    NoteKnownSources(swapChain);
+    NoteBackBufferSizeIfNeeded(swapChain, frame);
+    mv::GetSurfaceRegistry().OnFrame(frame);
+    mv::OnPresent(swapChain);
+    mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
+    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+    g_present1Count.fetch_add(1, std::memory_order_relaxed);
+    LogHeartbeatIfDue();
+    return g_originalPresent1(swapChain, syncInterval, flags, presentParams);
+}
+
+void STDMETHODCALLTYPE
+HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
+{
+    g_executeCommandListsCount.fetch_add(1, std::memory_order_relaxed);
+    // The game's direct queue: our back-buffer copy goes there, under the same
+    // fence as the velocity copy.
+    mv::NoteCommandQueue(queue);
+    // Checks that the list carrying the velocity copy goes to that queue.
+    mv::NoteSubmission(queue, numCommandLists, commandLists);
+    g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
+}
+
+// Re-entrancy guard. Under the D3D12 debug layer each `ResourceBarrier` call
+// reaches this hook twice (the validation layer forwards through the same
+// patched code). Counted twice, every profile doubles: the real velocity buffer
+// scores 4 and is rejected, and the continuity check reports violations that
+// never happened.
+thread_local int g_barrierHookDepth = 0;
+
+void STDMETHODCALLTYPE
+HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    ++g_barrierHookDepth;
+    g_originalResourceBarrier(cmdList, numBarriers, barriers);
+    const int depth = --g_barrierHookDepth;
+    if (depth > 0)
+    {
+        // The inner, forwarded call: the outer one handles the same barriers.
+        return;
+    }
+    g_resourceBarrierCount.fetch_add(1, std::memory_order_relaxed);
+
+    if (!barriers)
+    {
+        return;
+    }
+
+    const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
+    mv::SurfaceRegistry& registry = mv::GetSurfaceRegistry();
+    for (UINT i = 0; i < numBarriers; ++i)
+    {
+        switch (barriers[i].Type)
+        {
+            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+            {
+                ID3D12Resource* const resource = barriers[i].Transition.pResource;
+                const int stateBefore = static_cast<int>(barriers[i].Transition.StateBefore);
+                const int stateAfter = static_cast<int>(barriers[i].Transition.StateAfter);
+                registry.ConsiderResource(resource);
+
+                if (mv::DiagEnabled() && registry.IsAnyCandidate(resource))
+                {
+                    LogTo(
+                        "candidates",
+                        "frame=" + std::to_string(frame) +
+                            " ptr=" + std::to_string(reinterpret_cast<uintptr_t>(resource)) + " TRANSITION before=" +
+                            std::to_string(stateBefore) + " after=" + std::to_string(stateAfter));
+                }
+
+                // Profiles the transition, tracks liveness, and returns the
+                // surfaces whose selected or adopted resource just took its
+                // trigger edge. A reopen it causes reaches capture.cpp through
+                // the registry's `ReopenObserver`.
+                constexpr int kMaxTriggers = 4; // mutual exclusion: at most one in practice
+                mv::SurfaceTrigger triggers[kMaxTriggers];
+                const int triggerCount = registry.OnBarrierTransition(resource, frame, stateBefore, stateAfter, triggers, kMaxTriggers);
+                for (int t = 0; t < triggerCount; ++t)
+                {
+                    const mv::SurfaceTrigger& trig = triggers[t];
+                    const int surface = mv::SurfaceIndex(trig.identifier->Spec().name);
+                    mv::SetFrameIndex(frame);
+                    mv::OnSurfaceReadable(surface, cmdList, trig.resource, trig.stateAfter);
+                    // The live overlay copies at the same edge, on the GPU.
+                    mv::OverlayCaptureSurface(surface, cmdList, trig.resource,
+                                              static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
+                }
+                break;
+            }
+            case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+            {
+                ID3D12Resource* resource = barriers[i].UAV.pResource;
+                registry.ConsiderResource(resource);
+                registry.OnUavBarrier(resource);
+                if (mv::DiagEnabled() && registry.IsAnyCandidate(resource))
+                {
+                    LogTo(
+                        "candidates",
+                        "frame=" + std::to_string(frame) +
+                            " ptr=" + std::to_string(reinterpret_cast<uintptr_t>(resource)) + " UAV");
+                }
+                break;
+            }
+            default:
+            {
+                break;
+            }
+        }
+    }
+
+    // Which edges share one `ResourceBarrier` call: the input of
+    // `shares_call_with_edge`, `MV_DIAG` and `MV_SNAPSHOT`. One branch otherwise.
+    if (registry.WantsBarrierBatches())
+    {
+        registry.OnBarrierBatch(cmdList, barriers, numBarriers);
+    }
+}
+
+bool CreateHook(void* target, void* detour, void** original, const char* name)
+{
+    const MH_STATUS status = MH_CreateHook(target, detour, original);
+    if (status != MH_OK)
+    {
+        Log(std::string("MH_CreateHook failed for ") + name + ": " + MH_StatusToString(status));
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool InstallD3D12Hooks()
+{
+    // A message-only window to create the dummy swapchain on.
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = DefWindowProcW;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = L"MvHookDummyWindowClass";
+    RegisterClassExW(&windowClass);
+
+    HWND hwnd = CreateWindowExW(
+        0,
+        windowClass.lpszClassName,
+        L"",
+        WS_POPUP,
+        0,
+        0,
+        64,
+        64,
+        HWND_MESSAGE,
+        nullptr,
+        windowClass.hInstance,
+        nullptr);
+    if (!hwnd)
+    {
+        Log("InstallD3D12Hooks: CreateWindowExW failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+
+    // The high-performance adapter, for hybrid-graphics laptops.
+    ComPtr<IDXGIFactory6> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: CreateDXGIFactory1 failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    ComPtr<IDXGIAdapter1> adapter;
+    hr = factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: EnumAdapterByGpuPreference failed: 0x" +
+            std::to_string(static_cast<unsigned long>(hr)) + ", falling back to default adapter");
+
+        // nullptr: the system default adapter.
+        adapter.Reset();
+    }
+    else
+    {
+        DXGI_ADAPTER_DESC1 adapterDesc{};
+        adapter->GetDesc1(&adapterDesc);
+        char nameBuf[128]{};
+        WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, nameBuf, sizeof(nameBuf), nullptr, nullptr);
+        Log(std::string("InstallD3D12Hooks: selected high-performance adapter: ") + nameBuf);
+    }
+
+    ComPtr<ID3D12Device> device;
+    hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: D3D12CreateDevice failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queueDesc{};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> commandQueue;
+    hr = device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: CreateCommandQueue failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
+    swapChainDesc.BufferCount = 2;
+    swapChainDesc.Width = 64;
+    swapChainDesc.Height = 64;
+    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapChainDesc.SampleDesc.Count = 1;
+
+    ComPtr<IDXGISwapChain1> swapChain;
+    hr = factory->CreateSwapChainForHwnd(commandQueue.Get(), hwnd, &swapChainDesc, nullptr, nullptr, &swapChain);
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: CreateSwapChainForHwnd failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    // A dummy command list, for `ID3D12GraphicsCommandList`'s vtable.
+    ComPtr<ID3D12CommandAllocator> commandAllocator;
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: CreateCommandAllocator failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    hr = device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator.Get(), nullptr, IID_PPV_ARGS(&commandList));
+    if (FAILED(hr))
+    {
+        Log("InstallD3D12Hooks: CreateCommandList failed: 0x" + std::to_string(static_cast<unsigned long>(hr)));
+        DestroyWindow(hwnd);
+        return false;
+    }
+    commandList->Close();
+
+    // MinHook patches the function code behind each vtable slot, which every
+    // instance of the interface shares: once patched, the game's calls go
+    // through the hooks too.
+    Log("InstallD3D12Hooks: dummy device/swapchain/command-list created, installing hooks");
+
+    if (MH_Initialize() != MH_OK)
+    {
+        Log("InstallD3D12Hooks: MH_Initialize failed");
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    bool ok = true;
+    ok &= CreateHook(
+        VTableEntry(swapChain.Get(), kPresentIndex),
+        reinterpret_cast<void*>(&HookPresent),
+        reinterpret_cast<void**>(&g_originalPresent),
+        "Present");
+    ok &= CreateHook(
+        VTableEntry(swapChain.Get(), kPresent1Index),
+        reinterpret_cast<void*>(&HookPresent1),
+        reinterpret_cast<void**>(&g_originalPresent1),
+        "Present1");
+    ok &= CreateHook(
+        VTableEntry(commandQueue.Get(), kExecuteCommandListsIndex),
+        reinterpret_cast<void*>(&HookExecuteCommandLists),
+        reinterpret_cast<void**>(&g_originalExecuteCommandLists),
+        "ExecuteCommandLists");
+    ok &= CreateHook(
+        VTableEntry(commandList.Get(), kResourceBarrierIndex),
+        reinterpret_cast<void*>(&HookResourceBarrier),
+        reinterpret_cast<void**>(&g_originalResourceBarrier),
+        "ResourceBarrier");
+
+    // Wire the surface registry before any hook can fire. Velocity registers
+    // first; the others name it in `spec.extentFrom`. If the profile failed to
+    // load, nothing is registered: the game runs, nothing is identified, and the
+    // log says why.
+    if (const mv::SurfaceProfile* profile = mv::LoadSurfaceProfile())
+    {
+        mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->velocity));
+        mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
+        // Optional surfaces whose spec exists and `MV_SURFACES` enabled.
+        for (const mv::SurfaceProfile::OptionalSurface& optional : profile->optional)
+        {
+            if (optional.present && optional.spec.enabled)
+            {
+                mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(optional.spec));
+            }
+        }
+    }
+    mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
+    if (GetEnvironmentVariableA("MV_SNAPSHOT", nullptr, 0) != 0)
+    {
+        mv::GetSurfaceRegistry().SetCandidateEdgeObserver(&mv::SnapshotCandidate);
+    }
+    mv::GetSurfaceRegistry().Configure();
+
+    if (ok)
+    {
+        const MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
+        if (enableStatus != MH_OK)
+        {
+            Log(std::string("InstallD3D12Hooks: MH_EnableHook failed: ") + MH_StatusToString(enableStatus));
+            ok = false;
+        }
+    }
+
+    // Capture and the overlay record through the original functions.
+    if (ok)
+    {
+        mv::SetOriginalFunctions(g_originalResourceBarrier, g_originalExecuteCommandLists);
+        mv::StartCaptureHotkeyThread();
+        mv::OverlaySetOriginals(g_originalResourceBarrier, g_originalExecuteCommandLists);
+        mv::StartOverlayHotkeyThread();
+    }
+
+    DestroyWindow(hwnd);
+    UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
+
+    Log(std::string("InstallD3D12Hooks: ") + (ok ? "all hooks installed" : "one or more hooks failed"));
+    return ok;
+}
+
+} // namespace mv

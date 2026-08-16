@@ -1,0 +1,28 @@
+# Everything generated: build tree, hook logs, dumps, ad-hoc tool output.
+# Layout documented in tools/paths.py.
+temp/
+
+# CMake / MSVC build output that escapes temp/ (stale trees, VS "Open Folder")
+build/
+out/
+*.dll
+*.exe
+*.lib
+*.pdb
+*.exp
+*.ilk
+*.obj
+
+# Raw capture dumps (large; regenerate with F8 in-game) - normally in temp/dumps/
+mv_dump/
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+old/
+
+# Local copies of third-party games used for capture (not redistributable)
+testgames/
+# Claude Code local settings
+.claude/

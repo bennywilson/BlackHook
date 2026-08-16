@@ -1,0 +1,11 @@
+#pragma once
+
+// Generated on every build by hook/stamp_build_commit.cmake from
+// build_commit.h.in; do not edit the generated header.
+
+namespace mv
+{
+// `git rev-parse --short HEAD`, with "-dirty" appended when the working tree
+// had uncommitted or untracked changes at build time.
+inline constexpr const char* kBuildGitCommit = "@MV_GIT_COMMIT@";
+}

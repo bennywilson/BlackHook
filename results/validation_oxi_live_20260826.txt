@@ -1,0 +1,244 @@
+SceneVelocity extraction - offline validation
+========================================================================
+generated: 2026-08-26 19:59:49
+dump:      C:\Users\ben_a\AppData\Local\Temp\mv_dump_oxi_20260826_195534
+title:     oxi_live_20260826
+command:   python tools/run_validation.py <dump_dir> [tag]
+
+This file is generated verbatim from the committed tools. Nothing here
+is hand-edited, including the parts that fail.
+
+
+========================================================================
+inspect_velocity.py
+========================================================================
+What is in the capture at all: coverage, motion magnitude, and the
+reassembled V.z from channels 2/3.
+------------------------------------------------------------------------
+meta: {'velocity_width': 1212, 'velocity_height': 760, 'velocity_row_pitch': 9728, 'velocity_format': 11, 'velocity_bytes': 7393248, 'velocity_subresources': 1, 'color_width': 1707, 'color_height': 1067, 'color_row_pitch': 6912, 'color_format': 24, 'color_bytes': 7375020, 'color_subresources': 1, 'engine_version_major': 5, 'engine_version_minor': 7}
+velocity format 11: 4 channels, 8 bytes/pixel
+decoding as UE 5.7 (recorded in the capture)
+
+2317 captured frames: 0..2399
+
+frame     0: written=  9.08%  raw_ch0=[0.0000,0.5080] raw_ch1=[0.0000,0.4982]
+              motion(px): mean=   0.135 p50=   0.110 p95=   0.296 max=   0.381
+              V.z (DeviceZ delta): mean=+4.948e-05 p05=+1.507e-05 p95=+1.098e-04  bHasPixelAnimation on 0.0%
+frame   386: written=  8.82%  raw_ch0=[0.0000,0.5567] raw_ch1=[0.0000,0.5190]
+              motion(px): mean=   1.057 p50=   0.764 p95=   1.845 max=  17.151
+              V.z (DeviceZ delta): mean=-1.481e-04 p05=-1.301e-03 p95=+9.297e-06  bHasPixelAnimation on 0.0%
+frame   772: written= 11.50%  raw_ch0=[0.0000,0.5214] raw_ch1=[0.0000,0.5234]
+              motion(px): mean=   1.225 p50=   0.985 p95=   2.890 max=   4.121
+              V.z (DeviceZ delta): mean=-1.972e-04 p05=-2.175e-03 p95=+3.919e-06  bHasPixelAnimation on 0.0%
+frame  1158: written= 14.80%  raw_ch0=[0.0000,0.6114] raw_ch1=[0.0000,0.5288]
+              motion(px): mean=  17.364 p50=  15.182 p95=  39.185 max=  60.470
+              V.z (DeviceZ delta): mean=-4.111e-07 p05=-1.002e-05 p95=+1.974e-06  bHasPixelAnimation on 0.0%
+frame  1544: written= 23.75%  raw_ch0=[0.0000,0.5082] raw_ch1=[0.0000,0.5510]
+              motion(px): mean=   3.282 p50=   2.320 p95=   7.764 max=   8.955
+              V.z (DeviceZ delta): mean=-4.543e-04 p05=-1.666e-03 p95=+1.180e-07  bHasPixelAnimation on 0.0%
+frame  1930: written= 19.49%  raw_ch0=[0.0000,0.5601] raw_ch1=[0.0000,0.6028]
+              motion(px): mean=  46.375 p50=  54.552 p95=  68.410 max=  70.981
+              V.z (DeviceZ delta): mean=+2.746e-03 p05=+2.757e-07 p95=+5.154e-03  bHasPixelAnimation on 0.0%
+frame  2399: written= 15.59%  raw_ch0=[0.0000,0.5012] raw_ch1=[0.0000,0.5033]
+              motion(px): mean=   0.042 p50=   0.042 p95=   0.081 max=   0.162
+              V.z (DeviceZ delta): mean=+7.641e-07 p05=-2.236e-12 p95=+2.072e-06  bHasPixelAnimation on 0.0%
+
+
+========================================================================
+check_decode.py
+========================================================================
+The decode against independently measured image motion (block matching),
+with the project's old linear decode alongside for comparison.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (2284 adjacent, 0 rejected)
+
+  pair   eng_dx   eng_dy   bm_dx   bm_dy  eng|v|  bm|v| legacy|v|
+     1   -0.121   -0.128   -0.01    0.01   0.176   0.02     1.629
+     9   -0.191   -0.294    0.02   -0.01   0.350   0.02     2.269
+    17   -0.196   -0.228   -0.01    0.00   0.301   0.01     2.126
+    25   -0.095   -0.542    0.08   -0.06   0.551   0.10     2.581
+    33   -0.062   -0.441    0.07   -0.06   0.446   0.10     2.291
+    41   -0.054   -0.673    0.11   -0.11   0.675   0.16     2.749
+    49   -4.183   -9.078    0.19   -0.27   9.995   0.33    11.828
+    57   -0.012   -0.664    0.17   -0.24   0.664   0.29     2.654
+
+pairs scored:                  60
+mean block-matched |v|:        0.339 px   <- ground truth
+mean decoded |v| (engine):     1.561 px
+mean decoded |v| (legacy lin): 3.467 px
+mean |engine - measured|:      1.291 px
+mean |legacy  - measured|:     3.128 px
+corr X: +0.415
+corr Y: +0.709
+
+zero point, vs UE5 documented 32767 (Common.ush:2069):
+  ch0: modal code  33066.1  (offset +299.1, spread across frames 2656.7)
+        -> 0.101 px under the engine's sqrt decode, 0.972 px under the legacy linear one
+  ch1: modal code  32045.7  (offset -721.3, spread across frames 5094.2)
+        -> 0.370 px under the engine's sqrt decode, 1.665 px under the legacy linear one
+
+channels 2/3 (VELOCITY_ENCODE_DEPTH, Common.ush:2071):
+  frame 31: ch2 spans 0.210..0.221, ch3 spans 0.000..1.000
+  reassembled V.z (DeviceZ delta): mean +2.623e-05  range +1.661e-06..+6.908e-05
+  finite and denormal-free: 100.0% (a mis-read of these channels would be full of NaN/Inf)
+  bHasPixelAnimation set on 0.0% of written pixels
+
+
+========================================================================
+derive_scale.py
+========================================================================
+Per-pixel regression of decoded against block-matched displacement, plus
+a fit of the encoding exponent that does not assume the answer.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (2284 adjacent, 0 rejected)
+12 pairs after stride 3 (capped at 12)
+
+267348 confidently-matched written pixels pooled across pairs
+measured displacement: |x| p50=0.08px p99=0.41px, |y| p50=0.10px p99=0.49px
+
+========================================================================
+WARNING: this capture has no dynamic range to regress against.
+  99th-percentile measured motion is 0.49px, comparable to block
+  matching's own precision. Slopes and exponents below are NOT
+  meaningful and must not be quoted. Recapture with real motion in
+  frame. The RMS comparison at the end is still informative, since it
+  does not require the ground truth to vary.
+========================================================================
+
+1. Encoding exponent (does not assume the answer)
+   fitting  log|measured_px| = p * log|code_offset| + log k
+   p ~ 1 => linear encoding;  p ~ 2 => sqrt encoding (VELOCITY_ENCODE_GAMMA)
+   axis X: p = 0.027   R^2 = 0.001   (n=175720)  -> UNINFORMATIVE (R^2 too low to distinguish)
+   axis Y: p = 0.258   R^2 = 0.046   (n=197795)  -> UNINFORMATIVE (R^2 too low to distinguish)
+
+2. Engine decode vs measured (slope 1.000, intercept 0 = correct)
+   axis X: measured = 0.071 * decoded +0.009 px   R^2 = 0.006
+   axis Y: measured = 0.010 * decoded -0.054 px   R^2 = 0.000
+
+3. Legacy linear decode vs measured, for comparison
+   axis X: measured = 0.019 * decoded +0.022 px   R^2 = 0.008
+   axis Y: measured = 0.017 * decoded -0.030 px   R^2 = 0.005
+
+RMS error against measured displacement, per pixel:
+   axis X: engine   0.248 px   legacy   1.390 px
+   axis Y: engine   0.333 px   legacy   1.648 px
+
+wrote C:\projects\VelocityBufferHook\results\decode_scatter_oxi_live_20260826.png
+
+
+========================================================================
+region_match.py
+========================================================================
+The same comparison per REGION rather than per pixel, against wide-range
+cross-correlation of the game's own frames. Weaker than derive_scale.py by
+construction, but it is the one that works on footage where per-pixel
+matching is defeated by motion blur and thin foliage - and its magnitude
+sweep is what discriminates the square-root encoding from a linear one.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (2284 adjacent, 0 rejected)
+
+      pair  measured dx      dy    ncc |  engine dx      dy |  legacy dx      dy
+ 677->678           0.0     0.0  0.737 |      -1.43   44.76 |      -4.32   21.71
+ 678->679           0.0     0.0  0.720 |      -1.24   39.21 |      -4.04   20.32
+ 679->680           0.0     0.0  0.713 |      -1.13   34.86 |      -3.86   19.16
+ 680->681           0.0     0.0  0.725 |      -1.95   29.05 |      -5.05   17.49
+ 681->682           0.0     0.0  0.732 |      -0.14   23.53 |      -1.37   15.74
+ 730->731           0.0     0.0  0.816 |      -0.42  -15.17 |      -2.34  -12.64
+ 731->732           0.0     0.0  0.804 |       0.06  -15.37 |       0.87  -12.72
+ 732->733           0.0     0.0  0.766 |       1.06   -9.15 |       3.73   -9.82
+ 734->735           0.0     0.0  0.732 |       0.08   -9.61 |       1.01  -10.06
+ 735->736           0.0     0.0  0.870 |       0.99   -3.66 |       3.60   -6.21
+ 736->737           0.0     0.0  0.968 |      -0.22   -2.57 |      -1.71   -5.21
+ 737->738           0.0     0.0  0.990 |      -0.30    1.28 |      -1.97    3.67
+
+673 pairs matched above ncc 0.7; measured |dx| spans 0..73 px
+
+slope of measured against decoded (1.000 = correct), and correlation:
+  engine (sqrt, Common.ush)    X: slope  0.167  r +0.415    Y: slope  0.469  r +0.815
+  legacy (linear, fitted)      X: slope  0.814  r +0.719    Y: slope  0.908  r +0.735
+
+ratio measured/decoded by displacement band (flat = correct encoding):
+       band (px)    n    engine    legacy
+    0.0-0.0       235     0.000     0.000
+    0.0-3.0       475     0.688     0.000
+    3.0-73.0      245     0.862     0.678
+
+Read the lowest band with care: template matching resolves whole pixels only,
+so at a few px the quantisation dominates and BOTH decodes read low. That is the
+reference running out of precision, not a property of either decode - which is why
+it shows up in both columns at once. The discrimination lives in the upper bands,
+where a linear decode of square-root-encoded data must diverge and a correct one
+must stay flat.
+
+
+========================================================================
+warp_validate.py
+========================================================================
+Warp frame N-1 by frame N's field and score it, against three controls:
+a sign flip, the best possible single rigid translation, and a
+deliberately mismatched frame's field.
+------------------------------------------------------------------------
+pairing: adjacency verified against frames.csv (2284 adjacent, 0 rejected)
+2284 adjacent pairs: 15 held out to probe the multiplier, 2269 scored
+
+Sweeping the decode multiplier on the held-out probe pairs
+(mean absolute error over written pixels, lower is better)
+1.0 = the constants transcribed from Common.ush, unmodified. Nothing
+downstream was fitted to this sweep, so where it peaks is evidence.
+
+    multiplier         MAE    vs baseline
+   0 (no warp)     0.00762             --
+           0.4     0.00907         -18.9%
+           0.5     0.00897         -17.6%
+           0.6     0.00881         -15.6%
+           0.7     0.00859         -12.7%
+           0.8     0.00833          -9.3%
+           0.9     0.00804          -5.5%
+           1.0     0.00800          -4.9%
+           1.1     0.00894         -17.2%
+           1.2     0.01003         -31.6%
+           1.3     0.01108         -45.4%
+           1.4     0.01204         -57.9%
+           1.5     0.01282         -68.1%
+           1.6     0.01359         -78.2%
+
+Best multiplier: 1.0 (MAE 0.00800 vs baseline 0.00762)
+WARNING: no multiplier beats the un-warped baseline, so this sweep says
+  NOTHING about the decode scale. When the true motion is smaller than the
+  blur a resample introduces, every multiplier loses to not warping at all
+  and the sweep just ranks them by how little they move the image - which is
+  why the optimum here is the smallest value tried rather than an interior
+  peak. Read that as 'this capture has no motion to reconstruct', not as a
+  measurement. Recapture with real motion in frame.
+Scoring below uses multiplier 1.0 (the unmodified engine decode), not the swept optimum.
+
+Full validation on the scored pairs, with controls
+  per-pixel  - the decoded SceneVelocity field, as-is
+  sign flip  - the same field negated; must get clearly WORSE
+  global     - the single best rigid translation for the masked region,
+               found by block matching; an upper bound on what any
+               rigid-motion model could achieve on this pair
+  mismatched - the field from frame N+5 applied to the N-1 -> N pair;
+               must get clearly worse
+
+  pairs scored: 2269
+
+             condition    mean MAE    vs baseline   better than baseline
+    no warp (baseline)     0.02703          +0.0%            0/2269     
+       per-pixel field     0.01390         +48.6%         1392/2269     
+          sign-flipped     0.04385         -62.2%           29/2269     
+     best global shift     0.02209         +18.3%         1147/2269     
+      mismatched frame     0.04505         -70.3%          203/2186     
+
+Control verdicts:
+  sign flip        : +215.4% vs the per-pixel field  -> PASS (clearly worse, as required)
+  mismatched frame : +226.9% vs the per-pixel field  -> PASS (clearly worse, as required)
+  best global shift: +58.9% vs the per-pixel field
+      -> the per-pixel field beats the best rigid translation, so it is
+         carrying information a single global shift cannot express.
+
+  wrote C:\projects\VelocityBufferHook\results\warp_validation_oxi_live_20260826.png (pair 1850 -> 1851, MAE 0.21959 -> 0.04813)
+
+
+========================================================================
+5/5 tools ran to completion.

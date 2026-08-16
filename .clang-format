@@ -1,0 +1,18 @@
+BasedOnStyle: Microsoft
+ColumnLimit: 120
+
+# Braces: Microsoft base already sets Allman (brace on own line)
+BreakBeforeBraces: Allman
+
+# Force break right after the opening paren instead of inlining first param
+AlignAfterOpenBracket: AlwaysBreak
+
+# One param per line, for both declarations and call sites
+BinPackParameters: false
+BinPackArguments: false
+AllowAllParametersOfDeclarationOnNextLine: true
+
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+IndentCaseLabels: true
