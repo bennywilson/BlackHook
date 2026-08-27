@@ -1,5 +1,7 @@
 #pragma once
 
+#include "surface_identify.h" // IsDepthReadableState - canonical definition, docs/REFACTOR_PLAN.md sec 2.3
+
 #include <d3d12.h>
 
 #include <cstdint>
@@ -14,23 +16,15 @@
 //
 // Not an independent identification: it's linked to velocity's extent, so a
 // mis-identified velocity buffer would mis-identify depth the same way.
+//
+// As of docs/REFACTOR_PLAN.md Phase 7, depth is a pure SurfaceIdentifier
+// (see surface_identify.h) configured by data - this header's declarations
+// are unchanged so nothing outside depth_identify.cpp needed to change, but
+// depth_identify.cpp itself is now a thin wrapper, not a second copy of the
+// identification logic.
 
 namespace mv
 {
-
-// True for the states a depth buffer is read in: DEPTH_READ or any subset
-// of the shader-resource bits (UE5 consumes depth both ways).
-inline bool IsDepthReadableState(int state)
-{
-    if (state == 0)
-    {
-        return false;
-    }
-
-    constexpr int kReadable =
-        static_cast<int>(D3D12_RESOURCE_STATE_DEPTH_READ) | static_cast<int>(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    return (state & ~kReadable) == 0;
-}
 
 // Every resource the barrier hook walks past, once per resource.
 void NoteResourceDescForDepth(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc);

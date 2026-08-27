@@ -31,6 +31,7 @@ add_library(mv_hook SHARED
   src/logging.cpp
   src/d3d12_hook.cpp
   src/resource_tracking.cpp
+  src/surface_identify.cpp
   src/velocity_identify.cpp
   src/depth_identify.cpp
   src/capture.cpp

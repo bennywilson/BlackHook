@@ -1,5 +1,7 @@
 #pragma once
 
+#include "surface_identify.h" // IsShaderResourceState - canonical definition, docs/REFACTOR_PLAN.md sec 2.3
+
 #include <d3d12.h>
 
 #include <cstdint>
@@ -29,14 +31,6 @@
 
 namespace mv
 {
-
-// True for any non-empty subset of the shader-resource state bits. UE5's
-// RDG maps SRVMask -> ALL_SHADER_RESOURCE (0x40|0x80) and pixel-shader-only
-// reads (SRVGraphics) -> PIXEL_SHADER_RESOURCE (0x80).
-inline bool IsShaderResourceState(int state)
-{
-    return state != 0 && (state & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE) == state;
-}
 
 // Every resource the barrier hook walks past, once per resource. Records
 // the structural shortlist and seeds the behaviour profile.
@@ -100,5 +94,11 @@ uint64_t FramesSinceVelocityEdge(uint64_t frame);
 // capturable. Adoption is bounded internally; past the limit this returns
 // false rather than adopt indefinitely.
 bool NoteRivalVelocityEdge(ID3D12Resource* resource, uint64_t frame);
+
+// The velocity identifier itself, for depth_identify.cpp to bind its extent
+// dependency to (SurfaceIdentifier::SetExtentSource) - docs/REFACTOR_PLAN.md
+// Phase 7. Not for general use; every other need is served by the functions
+// above.
+const SurfaceIdentifier& VelocityIdentifier();
 
 } // namespace mv
