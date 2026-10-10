@@ -6,13 +6,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 // SurfaceRegistry - docs/REFACTOR_PLAN.md sec 2.5, Phase 8.
 //
-// Owns nothing about any one surface's identification logic (that stays in
-// velocity_identify.cpp/depth_identify.cpp, each still keeping its own
-// SurfaceSpec/subclass); what it owns is everything that used to be
+// Owns the identifiers themselves (built by InstallD3D12Hooks from the active
+// profile's specs - a plain SurfaceIdentifier for depth, velocity_identify.h's
+// subclass for velocity's rival adoption), and everything that used to be
 // hand-wired across d3d12_hook.cpp and resource_tracking.h because no single
 // file had visibility into every registered identifier at once:
 //
@@ -31,9 +32,9 @@
 //     identifier's search (sec 3.3).
 //
 // d3d12_hook.cpp calls this registry's entry points instead of the
-// per-surface free functions it used to call directly; capture.cpp/
-// dllmain.cpp still reach individual surfaces through velocity_identify.h/
-// depth_identify.h's now-much-smaller free-function surface.
+// per-surface free functions it used to call directly, and capture.cpp/
+// dllmain.cpp reach individual surfaces by name (Find/Selected) rather than
+// through per-surface wrapper headers.
 
 namespace mv
 {
@@ -50,13 +51,13 @@ class SurfaceRegistry : public MutualExclusionChecker
 public:
     SurfaceRegistry() noexcept;
 
-    // Called once per surface, from its own TU's RegisterXIdentifier
-    // function, before Configure(). Order matters only in that a surface
-    // naming another via spec.extentFrom must be registered after the
-    // surface it names - true for depth-after-velocity today, and worth
-    // keeping true rather than making Configure() topologically sort a
-    // two-node graph.
-    void Register(SurfaceIdentifier* identifier) noexcept;
+    // Called once per surface, from InstallD3D12Hooks, before Configure().
+    // Takes ownership; the identifier lives for the process. Order matters
+    // only in that a surface naming another via spec.extentFrom must be
+    // registered after the surface it names - true for depth-after-velocity
+    // today, and worth keeping true rather than making Configure()
+    // topologically sort a two-node graph.
+    void Register(std::unique_ptr<SurfaceIdentifier> identifier) noexcept;
 
     // Called at most once, any time before the first Reopen (typically from
     // InstallD3D12Hooks, alongside Register/Configure). ReopenCascade calls
@@ -75,7 +76,13 @@ public:
     // and the extentFrom dependency graph.
     void Configure() noexcept;
 
+    // nullptr if no surface of that name is registered - which is every
+    // surface, if the profile failed to load (surface_profile.h).
     SurfaceIdentifier* Find(const char* name) noexcept;
+
+    // The named surface's selected resource, or nullptr while it is
+    // searching, ambiguous, or not registered at all.
+    ID3D12Resource* Selected(const char* name) noexcept;
 
     // ---- barrier-hook entry points --------------------------------------
 
@@ -141,6 +148,7 @@ private:
     void CollectCascade(Entry* root, std::vector<Entry*>* out) noexcept;
     void DumpBarrierProfiles() noexcept;
 
+    std::vector<std::unique_ptr<SurfaceIdentifier>> owned_;
     std::vector<Entry> entries_;
     BarrierProfileStore profileStore_;
     KnownSourceSet knownSources_;

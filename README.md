@@ -65,6 +65,19 @@ set MV_DUMP_DIR=%CD%\temp\dumps\testhost
 temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
 ```
 
+### Surface profiles
+
+What identification searches for — format tables, flags, thresholds, signal
+weights — is data in [`profiles/ue5.json`](profiles/ue5.json), embedded into
+the DLL at build time. The hook picks a profile from `MV_PROFILE`, else
+`ue<major>.<minor>-generic` from `MV_ENGINE_VERSION` (the capture script sets
+this), else `ue5-generic`. `MV_PROFILE_FILE=<path>` adds profiles from a file
+without rebuilding. A profile can only describe what to look for, never name
+a resource. Anything wrong with a profile (unknown name, misspelt field, bad
+value) disables identification for the session and says why in
+`mv_hook.log`; there is no built-in fallback. `manifest.json` records which
+profile a dump was captured under.
+
 ## Results
 
 Everything below is already in `results/` and reproducible without a running

@@ -1,107 +1,17 @@
 #include "velocity_identify.h"
 
 #include "logging.h"
-#include "surface_identify.h"
-#include "surface_registry.h"
 
 #include <windows.h>
 
-#include <wrl/client.h>
-
 #include <atomic>
-#include <mutex>
 #include <string>
-
-using Microsoft::WRL::ComPtr;
 
 namespace mv
 {
 
 namespace
 {
-
-// FVelocityRendering::GetFormat() returns PF_A16B16G16R16 and PF_R16G16_UINT
-// on Windows which map to D3D12's DXGI_FORMAT_R16G16_UNORM, and
-// DXGI_FORMAT_R16G16B16A16_UNORM. Android GLES-only in the engine, so the
-// UINT variants should never appear on a D3D12 title - kept as low-score
-// fallbacks rather than excluded, so a near-miss still shows up in the log
-// with its actual score instead of a flat rejection.
-constexpr FormatCandidate kVelocityFormats[] = {
-    {DXGI_FORMAT_R16G16B16A16_UNORM, 4, "R16G16B16A16_UNORM (PF_A16B16G16R16, NeedVelocityDepth)"},
-    {DXGI_FORMAT_R16G16_UNORM, 4, "R16G16_UNORM (PF_G16R16, no velocity depth)"},
-    {DXGI_FORMAT_R16G16B16A16_UINT, 1, "R16G16B16A16_UINT (PF_R16G16B16A16_UINT, Android GLES path)"},
-    {DXGI_FORMAT_R16G16_UINT, 1, "R16G16_UINT (PF_R16G16_UINT, Android GLES path)"},
-};
-
-const SurfaceSpec kVelocitySpec = []
-{
-    SurfaceSpec spec{};
-    spec.name = "velocity";
-    spec.logPrefix = "identify";
-
-    spec.formatCount = 0;
-    for (const FormatCandidate& f : kVelocityFormats)
-    {
-        spec.formats[spec.formatCount++] = f;
-    }
-    // FVelocityRendering::GetCreateFlags: TexCreate_RenderTargetable | UAV |
-    // ShaderResource maps to ALLOW_RENDER_TARGET (0x01) | ALLOW_UNORDERED_ACCESS
-    // (0x04). The filter only requires those two bits set; an exact Flags == 5
-    // match scores higher than a superset with other flags (see the
-    // ExactRequiredFlags signal below).
-    spec.requiredFlags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    spec.forbiddenFlags = 0;
-    // Anything smaller than this is a downsampled/tile target. Deliberately
-    // generous - excludes 1/16-res things like MotionBlur.VelocityFlatten,
-    // doesn't try to guess the render resolution.
-    spec.minWidth = 320;
-    spec.minHeight = 180;
-    spec.maxBackBufferMultiple = 2;
-    spec.extentFrom = nullptr; // velocity is the extent source, not a dependent
-
-    spec.trigger = TriggerEdge::RenderTargetToShaderResource;
-    // Behaviour: how long to watch before deciding. The barrier signature is
-    // a per-frame invariant, not an average - 90 frames to be sure it's
-    // genuine.
-    spec.minFramesObserved = 30;
-    spec.settleFrames = 90;
-    // Format-tier bonus counts only at the desktop-tier score (4) - see
-    // SurfaceIdentifier::CollectSignals. GLES-fallback formats (score 1)
-    // pass the structural gate but earn nothing from this baseline.
-    spec.formatScoreGate = 4;
-
-    spec.signalCount = 0;
-    spec.signals[spec.signalCount++] = {SignalId::AtModalResolution, 3};
-    spec.signals[spec.signalCount++] = {SignalId::ExactRequiredFlags, 2};
-    spec.signals[spec.signalCount++] = {SignalId::ProducedOnceExactly, 2};
-    spec.signals[spec.signalCount++] = {SignalId::NeverTakesUavBarrier, 2};
-    spec.signals[spec.signalCount++] = {SignalId::NeverEntersUnorderedAccess, 2};
-    spec.signals[spec.signalCount++] = {SignalId::StrictTwoEventsPerFrame, 3};
-    spec.signals[spec.signalCount++] = {SignalId::NoContinuityViolations, 1};
-
-    spec.ambiguityRule = AmbiguityRule::ScoreMargin;
-    spec.ambiguityMargin = 2;
-
-    // Behaviour, tracked outside the profile map: how long to watch a stall
-    // before checking for a rival, and how many consecutive frames a rival
-    // must carry the edge before being adopted as a second target.
-    spec.rivalStallFrames = 3;
-    spec.rivalFramesBeforeAdopt = 8;
-    // Sized for a single one-off reallocation, the only pattern seen before a
-    // slow-motion sequence reallocated SceneVelocity 6 times in ~8 seconds and
-    // exhausted this budget seconds before the pass was reported STOPPED - at
-    // which point a further reallocation would have looked like silence
-    // rather than being followed. Raised to give sustained churn real
-    // headroom instead of a limit sized for a rare one-time event.
-    spec.rivalMaxAdoptions = 64;
-    // Output cap for the rival-edge diagnostic - stalls recur every few
-    // seconds and would otherwise log forever; a few dozen lines is enough to
-    // tell whether a rival exists.
-    spec.rivalMaxReports = 40;
-
-    spec.reopenClearsShortlist = true; // reopen re-scans everything
-    return spec;
-}();
 
 // Rival adoption: a run-length state machine over consecutive frames, kept
 // as a subclass per docs/REFACTOR_PLAN.md sec 2.4 because no arrangement of
@@ -263,23 +173,11 @@ private:
     std::atomic<bool> adoptLimitReported_{false};
 };
 
-VelocitySurfaceIdentifier g_velocity(kVelocitySpec);
-
 } // namespace
 
-void RegisterVelocityIdentifier(SurfaceRegistry& registry)
+std::unique_ptr<SurfaceIdentifier> MakeVelocityIdentifier(const SurfaceSpec& spec)
 {
-    registry.Register(&g_velocity);
-}
-
-bool VelocityPassIsSilent(uint64_t frame, uint64_t* framesSilent)
-{
-    return g_velocity.IsSilent(frame, framesSilent);
-}
-
-ID3D12Resource* IdentifiedVelocityResource()
-{
-    return g_velocity.Selected();
+    return std::make_unique<VelocitySurfaceIdentifier>(spec);
 }
 
 } // namespace mv

@@ -1,0 +1,27 @@
+// docs/REFACTOR_PLAN.md Phase 9's negative test, loaded by
+// `mv_testhost --phase9-negative` through MV_PROFILE_FILE + MV_PROFILE.
+//
+// Narrows velocity's format table to the WRONG entry for this harness: the
+// real SceneVelocity is R16G16B16A16_UNORM, and the only R16G16_UNORM resource
+// in the line-up is the compute-written decoy, which never takes the
+// RENDER_TARGET -> shader-resource edge. So the structural gate admits only
+// the decoy and the behaviour gate must still reject it. Required outcome:
+// "identify: NO candidate", nothing selected, nothing captured - and in
+// particular no fallback to the full table, which would find SceneVelocity
+// and make this test pass for the wrong reason.
+{
+  "schema_version": 1,
+  "profiles": {
+    "test-velocity-wrong-format": {
+      "extends": "ue5-generic",
+      "description": "Phase 9 negative test: velocity narrowed to R16G16_UNORM only.",
+      "surfaces": {
+        "velocity": {
+          "formats": [
+            { "format": "R16G16_UNORM", "score": 4, "description": "R16G16_UNORM (the only entry - deliberately wrong for testhost)" }
+          ]
+        }
+      }
+    }
+  }
+}

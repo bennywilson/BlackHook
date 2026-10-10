@@ -55,7 +55,11 @@
 // SCOPE NOTE: this remains the identification-relevant subset of the plan's
 // SurfaceSpec (sec 2.1). The capture-side fields - source/known,
 // arbitration, required/enabled - stay on capture.cpp's own (TU-local)
-// SurfaceSpec until Phase 9 actually needs one struct for both concerns.
+// SurfaceSpec. Phase 9 (JSON profiles) did not need them merged: a profile
+// only describes what identification searches for, and colour - the one
+// capture-side-only surface - is known by construction, not searched for
+// (sec 3.1). Phase 10's `enabled` is the first capture-side field a profile
+// will need.
 
 namespace mv
 {
@@ -154,8 +158,9 @@ enum class AmbiguityRule : uint8_t
 };
 
 // Data-only. Every field here is what velocity_identify.cpp/depth_identify.cpp
-// used to spell as file-scope constants or hand-written control flow; the
-// values are unchanged, just given one home.
+// used to spell as file-scope constants or hand-written control flow. Since
+// Phase 9 the values come from a JSON profile (profiles/ue5.json, parsed by
+// surface_profile.cpp, which maps each JSON field to one field here).
 struct SurfaceSpec
 {
     const char* name;

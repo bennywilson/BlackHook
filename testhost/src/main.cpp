@@ -58,9 +58,16 @@
 // would have rejected. Both pipelines must select the right resource, which is
 // what turns "works across titles" from an anecdote into a test.
 //
+// `--phase9-negative` runs under testhost/profiles/phase9_negative.json, a
+// profile narrowing velocity's format table to the wrong entry
+// (docs/REFACTOR_PLAN.md Phase 9). The only correct outcome is a loud
+// "NO candidate" and nothing selected - asserted against the hook's own log,
+// and against MvActiveProfile so a profile that failed to load cannot pass
+// for one that loaded and found nothing.
+//
 // USAGE
 //   mv_testhost.exe [--hook <dll>] [--frames N] [--no-gbv] [--ambiguous]
-//                   [--pipeline oxi|skyrunner]
+//                   [--pipeline oxi|skyrunner] [--phase9-negative]
 //   mv_testhost.exe --wpo-encode-test <output_dir>
 //
 // Set MV_AUTOCAPTURE=1 in the environment to have the hook start a capture
@@ -83,6 +90,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -269,6 +277,8 @@ int main(int argc, char** argv) {
     // reopen must end the burst rather than silently drop frames. See
     // RunPhase8BehaviorTests below.
     bool phase8Tests = false;
+    // docs/REFACTOR_PLAN.md Phase 9's negative test - see the file header.
+    bool phase9Negative = false;
     // Which shape of velocity pass to model. "oxi" is the strict 2-cycle this
     // project was developed against; "skyrunner" is the 5-transition,
     // UNORDERED_ACCESS-touching pass measured on a third-party UE 5.2 title.
@@ -293,6 +303,8 @@ int main(int argc, char** argv) {
             wpoEncodeTestDir = argv[++i];
         } else if (arg == "--phase8-tests") {
             phase8Tests = true;
+        } else if (arg == "--phase9-negative") {
+            phase9Negative = true;
         }
     }
 
@@ -313,6 +325,17 @@ int main(int argc, char** argv) {
     snprintf(identifyFramesText, sizeof(identifyFramesText), "%d", identifyFrames);
     SetEnvironmentVariableA("MV_IDENTIFY_FRAMES", identifyFramesText);
     printf("[testhost] MV_IDENTIFY_FRAMES=%d (decision expected around that frame)\n", identifyFrames);
+
+    // The hook reads these once, in InstallD3D12Hooks, so before LoadLibrary.
+    const char* const kNegativeProfile = "test-velocity-wrong-format";
+    if (phase9Negative) {
+        SetEnvironmentVariableA("MV_PROFILE_FILE", MV_TESTHOST_PROFILE_DIR "/phase9_negative.json");
+        SetEnvironmentVariableA("MV_PROFILE", kNegativeProfile);
+        printf("[testhost] Phase 9 negative test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
+               "identification must find NO candidate and must not fall back\n", kNegativeProfile);
+    }
+    // Every path below that expects identification to select nothing.
+    const bool expectNothingSelected = ambiguous || phase9Negative;
 
     // 1. Debug layer BEFORE device creation - it has no effect afterwards.
     ComPtr<ID3D12Debug> debug;
@@ -882,7 +905,42 @@ int main(int argc, char** argv) {
                 printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED" : "");
             }
-            if (ambiguous) {
+            if (phase9Negative) {
+                // Three things, each guarding a different way to pass for the
+                // wrong reason: the narrowed profile is the one that ran (not a
+                // load failure, which also selects nothing), nothing was
+                // selected (not a fallback to the full format table, which
+                // would find SceneVelocity), and the hook SAID so (the plan's
+                // "loudly").
+                using StringFn = const char* (*)();
+                auto activeProfile = reinterpret_cast<StringFn>(
+                    reinterpret_cast<void*>(GetProcAddress(hookModule, "MvActiveProfile")));
+                auto logDirectory = reinterpret_cast<StringFn>(
+                    reinterpret_cast<void*>(GetProcAddress(hookModule, "MvLogDirectory")));
+                const std::string profile = activeProfile != nullptr ? activeProfile() : "<no MvActiveProfile export>";
+                const bool profileOk = profile == kNegativeProfile;
+
+                // Only this run's part of the log: it is appended across runs.
+                bool saidNoCandidate = false;
+                if (logDirectory != nullptr) {
+                    std::ifstream in(std::string(logDirectory()) + "mv_hook.log", std::ios::binary);
+                    const std::string log((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    const size_t start = log.rfind(std::string("profile: using '") + kNegativeProfile + "'");
+                    saidNoCandidate = start != std::string::npos &&
+                                      log.find("identify: NO candidate", start) != std::string::npos;
+                }
+
+                identificationPassed = profileOk && picked == nullptr && saidNoCandidate;
+                printf("[testhost]   active profile: %s %s\n", profile.empty() ? "<none - failed to load>" : profile.c_str(),
+                       profileOk ? "(as requested)" : "(NOT the negative-test profile)");
+                printf("[testhost]   selected:       %s\n", picked == nullptr ? "nothing" : "SOMETHING");
+                printf("[testhost]   log says 'identify: NO candidate' this run: %s\n", saidNoCandidate ? "yes" : "NO");
+                printf("[testhost] %s\n",
+                       identificationPassed
+                           ? "PASS - a profile narrowed to the wrong format found NO candidate, said so, and did not "
+                             "fall back"
+                           : "FAIL - Phase 9 negative test (see the three lines above)");
+            } else if (ambiguous) {
                 // Two indistinguishable candidates. The only correct answer is
                 // to refuse: a ranked guess between them would be a coin toss
                 // presented as an identification.
@@ -929,10 +987,11 @@ int main(int argc, char** argv) {
                 printf("[testhost]   %-16s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED" : "");
             }
-            if (ambiguous) {
-                // Velocity identification refuses in this mode, and depth
-                // identification is gated on the velocity extent, so the only
-                // correct answer here is also to have picked nothing. Worth
+            if (expectNothingSelected) {
+                // Velocity identification refuses (or finds nothing) in this
+                // mode, and depth identification is gated on the velocity
+                // extent, so the only correct answer here is also to have
+                // picked nothing. Worth
                 // asserting rather than skipping: a depth search that quietly
                 // ran anyway would be keying off an extent nobody established.
                 depthIdentificationPassed = picked == nullptr;
@@ -977,7 +1036,8 @@ int main(int argc, char** argv) {
     bool midBurstReopenEndedBurst = true;
     bool resizeTestPassed = true;
     bool depthReopenRecoveryPassed = true;
-    if (phase8Tests && hookModule != nullptr && !ambiguous && identificationPassed && depthIdentificationPassed) {
+    if (phase8Tests && hookModule != nullptr && !expectNothingSelected && identificationPassed &&
+        depthIdentificationPassed) {
         printf("\n[testhost] ==== Phase 8 behaviour tests ====\n");
         char dumpDirBuf[MAX_PATH]{};
         std::string dir;
@@ -1272,16 +1332,16 @@ int main(int argc, char** argv) {
             printf("\n[testhost] ==== dump contents ====\n");
             printf("[testhost]   velocity frames: %d\n", velocities);
             printf("[testhost]   depth frames:    %d\n", depths);
-            if (ambiguous) {
-                // Identification refuses to pick in this mode, so capturing
+            if (expectNothingSelected) {
+                // Identification selects nothing in this mode, so capturing
                 // NOTHING is the correct outcome and an empty dump is the
                 // assertion. A file here would mean the hook captured from a
-                // resource it had just said it could not identify.
+                // resource it had not identified.
                 dumpContentsPassed = velocities == 0 && depths == 0;
                 printf("[testhost] %s\n",
                        dumpContentsPassed
-                           ? "PASS - nothing was captured, which is correct when identification refused to pick"
-                           : "FAIL - something was captured despite identification refusing to pick");
+                           ? "PASS - nothing was captured, which is correct when identification selected nothing"
+                           : "FAIL - something was captured despite identification selecting nothing");
             } else if (GetEnvironmentVariableA("MV_CAPTURE_DEPTH", nullptr, 0) != 0 && !depthCaptureEnabled) {
                 // MV_CAPTURE_DEPTH=0 is the bandwidth control test: the hook is
                 // asked not to copy depth, so a dump with depth in it is the

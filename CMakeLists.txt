@@ -23,6 +23,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Parses profiles/ue5.json inside the hook (Phase 9). Header-only; used once,
+# at startup, never on a hot path.
+FetchContent_Declare(
+  json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(json)
+
 add_subdirectory(hook)
 add_subdirectory(injector)
 add_subdirectory(testhost)

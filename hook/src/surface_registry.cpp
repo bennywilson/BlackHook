@@ -26,10 +26,11 @@ SurfaceRegistry::SurfaceRegistry() noexcept
     entries_.reserve(8); // kMaxSurfaces, capture.cpp's own constant - avoid any reallocation after Configure()
 }
 
-void SurfaceRegistry::Register(SurfaceIdentifier* identifier) noexcept
+void SurfaceRegistry::Register(std::unique_ptr<SurfaceIdentifier> identifier) noexcept
 {
     Entry e;
-    e.identifier = identifier;
+    e.identifier = identifier.get();
+    owned_.push_back(std::move(identifier));
     entries_.push_back(e);
 }
 
@@ -99,6 +100,12 @@ SurfaceIdentifier* SurfaceRegistry::Find(const char* name) noexcept
 {
     Entry* e = FindEntry(name);
     return e != nullptr ? e->identifier : nullptr;
+}
+
+ID3D12Resource* SurfaceRegistry::Selected(const char* name) noexcept
+{
+    SurfaceIdentifier* identifier = Find(name);
+    return identifier != nullptr ? identifier->Selected() : nullptr;
 }
 
 void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept

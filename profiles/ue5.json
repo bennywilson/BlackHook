@@ -1,0 +1,205 @@
+// Surface identification profiles - docs/REFACTOR_PLAN.md sec 2.1/2.8, Phase 9.
+//
+// JSON with // comments (the hook parses with comments allowed). Embedded into
+// mv_hook.dll at CMake configure time, so a DLL's commit hash determines its
+// profiles; MV_PROFILE_FILE adds/replaces profiles from a file at runtime
+// (recorded in manifest.json as session.profile_source).
+//
+// Which profile runs, first match wins - and a named profile that does not
+// exist is an error, never a fallback:
+//   1. MV_PROFILE=<name>
+//   2. MV_ENGINE_VERSION=5.2 -> "ue5.2-generic"
+//   3. default_profile below
+// MV_IDENTIFY_FRAMES=<n> then overrides velocity's settle_frames for that run
+// (logged as "profile:   override:"); mv_testhost uses it to fit short runs.
+//
+// What a profile may do (sec 2.8): narrow or widen candidate sets, adjust
+// weights and thresholds. What it may NOT do: assert an identity. There is no
+// field for a resource, an exact descriptor, or skipping a gate - the
+// narrowest thing expressible is a one-entry format table, which still has to
+// pass the behaviour gate and win on score.
+//
+// "extends" applies this profile as an RFC 7386 merge patch over the named
+// one: objects merge field by field, arrays (formats, flags, signals) are
+// replaced whole.
+//
+// Every field below is required unless marked optional. Unknown fields are an
+// error, so a typo cannot silently leave a value at some default.
+{
+  "schema_version": 1,
+  "default_profile": "ue5-generic",
+
+  "profiles": {
+    "ue5-generic": {
+      "description": "The values hardcoded in velocity_identify.cpp/depth_identify.cpp before Phase 9, unchanged. Used when the engine version is not known.",
+      "surfaces": {
+        "velocity": {
+          "log_prefix": "identify",
+
+          // FVelocityRendering::GetFormat() returns PF_A16B16G16R16 and
+          // PF_R16G16_UINT on Windows which map to D3D12's
+          // DXGI_FORMAT_R16G16_UNORM, and DXGI_FORMAT_R16G16B16A16_UNORM.
+          // Android GLES-only in the engine, so the UINT variants should never
+          // appear on a D3D12 title - kept as low-score fallbacks rather than
+          // excluded, so a near-miss still shows up in the log with its actual
+          // score instead of a flat rejection.
+          "formats": [
+            { "format": "R16G16B16A16_UNORM", "score": 4, "description": "R16G16B16A16_UNORM (PF_A16B16G16R16, NeedVelocityDepth)" },
+            { "format": "R16G16_UNORM",       "score": 4, "description": "R16G16_UNORM (PF_G16R16, no velocity depth)" },
+            { "format": "R16G16B16A16_UINT",  "score": 1, "description": "R16G16B16A16_UINT (PF_R16G16B16A16_UINT, Android GLES path)" },
+            { "format": "R16G16_UINT",        "score": 1, "description": "R16G16_UINT (PF_R16G16_UINT, Android GLES path)" }
+          ],
+
+          // FVelocityRendering::GetCreateFlags: TexCreate_RenderTargetable |
+          // UAV | ShaderResource maps to ALLOW_RENDER_TARGET (0x01) |
+          // ALLOW_UNORDERED_ACCESS (0x04). The filter only requires those two
+          // bits set; an exact Flags == 5 match scores higher than a superset
+          // with other flags (see the exact_required_flags signal below).
+          "required_flags": ["ALLOW_RENDER_TARGET", "ALLOW_UNORDERED_ACCESS"],
+          "forbidden_flags": [],
+
+          // Anything smaller than this is a downsampled/tile target.
+          // Deliberately generous - excludes 1/16-res things like
+          // MotionBlur.VelocityFlatten, doesn't try to guess the render
+          // resolution.
+          "min_width": 320,
+          "min_height": 180,
+          "max_back_buffer_multiple": 2,
+          // extent_from (optional) omitted: velocity is the extent source,
+          // not a dependent.
+
+          "trigger": "render_target_to_shader_resource",
+          // Behaviour: how long to watch before deciding. The barrier
+          // signature is a per-frame invariant, not an average - 90 frames to
+          // be sure it's genuine.
+          "min_frames_observed": 30,
+          "settle_frames": 90,
+          // Format-tier bonus counts only at the desktop-tier score (4) - see
+          // SurfaceIdentifier::CollectSignals. GLES-fallback formats (score 1)
+          // pass the structural gate but earn nothing from this baseline.
+          "format_score_gate": 4,
+
+          "signals": [
+            { "signal": "at_modal_resolution",           "weight": 3 },
+            { "signal": "exact_required_flags",          "weight": 2 },
+            { "signal": "produced_once_exactly",         "weight": 2 },
+            { "signal": "never_takes_uav_barrier",       "weight": 2 },
+            { "signal": "never_enters_unordered_access", "weight": 2 },
+            { "signal": "strict_two_events_per_frame",   "weight": 3 },
+            { "signal": "no_continuity_violations",      "weight": 1 }
+          ],
+
+          // Top two survivors must differ by at least 2 points.
+          "ambiguity": { "rule": "score_margin", "margin": 2 },
+
+          // Optional (absent = never adopt). Consumed only by
+          // VelocitySurfaceIdentifier's rival-adoption state machine.
+          "rival": {
+            // How long to watch a stall before checking for a rival, and how
+            // many consecutive frames a rival must carry the edge before being
+            // adopted as a second target.
+            "stall_frames": 3,
+            "frames_before_adopt": 8,
+            // Sized for a single one-off reallocation, the only pattern seen
+            // before a slow-motion sequence reallocated SceneVelocity 6 times
+            // in ~8 seconds and exhausted this budget seconds before the pass
+            // was reported STOPPED - at which point a further reallocation
+            // would have looked like silence rather than being followed.
+            // Raised to give sustained churn real headroom instead of a limit
+            // sized for a rare one-time event.
+            "max_adoptions": 64,
+            // Output cap for the rival-edge diagnostic - stalls recur every
+            // few seconds and would otherwise log forever; a few dozen lines
+            // is enough to tell whether a rival exists.
+            "max_reports": 40
+          },
+
+          // Reopen re-scans everything.
+          "reopen_clears_shortlist": true
+        },
+
+        "depth": {
+          "log_prefix": "depth",
+
+          // GPixelFormats[PF_DepthStencil].PlatformFormat (D3D12RHI.cpp:117/127)
+          // is one of exactly two things, chosen by the r.D3D12.UseD24 cvar:
+          //
+          //     UseD24 != 0 : DXGI_FORMAT_R24G8_TYPELESS      (44)
+          //     UseD24 == 0 : DXGI_FORMAT_R32G8X24_TYPELESS   (19)
+          //
+          // Both are TYPELESS (UE puts a typed view on top) and MULTI-PLANE
+          // (depth in plane 0, stencil in plane 1) - capture.cpp already
+          // derives plane/subresource counts from the desc rather than
+          // assuming one.
+          //
+          // Fully-typed and single-plane variants are listed below but unused
+          // in practice - UE5 never creates scene depth that way - kept so a
+          // near-miss still scores instead of being flatly rejected.
+          "formats": [
+            { "format": "R24G8_TYPELESS",       "score": 4, "description": "R24G8_TYPELESS (PF_DepthStencil, r.D3D12.UseD24=1)" },
+            { "format": "R32G8X24_TYPELESS",    "score": 4, "description": "R32G8X24_TYPELESS (PF_DepthStencil, r.D3D12.UseD24=0)" },
+            { "format": "D24_UNORM_S8_UINT",    "score": 2, "description": "D24_UNORM_S8_UINT (typed - not how UE creates it)" },
+            { "format": "D32_FLOAT_S8X24_UINT", "score": 2, "description": "D32_FLOAT_S8X24_UINT (typed - not how UE creates it)" },
+            { "format": "R32_TYPELESS",         "score": 1, "description": "R32_TYPELESS (depth without stencil)" },
+            { "format": "D32_FLOAT",            "score": 1, "description": "D32_FLOAT (depth without stencil, typed)" }
+          ],
+
+          // TexCreate_DepthStencilTargetable | TexCreate_ShaderResource maps
+          // to ALLOW_DEPTH_STENCIL with no DENY_SHADER_RESOURCE; requiring the
+          // deny bit absent separates scene depth from shadow-map atlases
+          // (TargetableOnly).
+          "required_flags": ["ALLOW_DEPTH_STENCIL"],
+          "forbidden_flags": ["DENY_SHADER_RESOURCE"],
+
+          // No size floor of its own, unbounded by the back buffer - bounded
+          // by the exact extent test against velocity instead.
+          "min_width": 0,
+          "min_height": 0,
+          "max_back_buffer_multiple": 0,
+          "extent_from": "velocity",
+
+          "trigger": "depth_write_to_readable",
+          // Measured from when velocity produces an extent (depth
+          // identification can't start before that) - see
+          // SurfaceIdentifier::OnFrame's extent-dependency path. settle_frames
+          // is currently unused there (that path decides the frame the
+          // dependency resolves), kept as documentation of the
+          // pre-extraction constant.
+          "min_frames_observed": 30,
+          "settle_frames": 60,
+          // depth's score IS the raw format score, always - gate of 0 means
+          // every structurally-accepted format counts in full, with no
+          // bonus/checkbox breakdown.
+          "format_score_gate": 0,
+          "signals": [],
+
+          // A clear margin: 1.5x as many produce-then-consume edges per frame
+          // is the difference between a depth buffer the frame is built
+          // around and one that's occasionally rendered (e.g. CustomDepth).
+          // margin is a percentage for this rule.
+          "ambiguity": { "rule": "edge_count_ratio", "margin": 150 },
+
+          // rival omitted: depth never adopts.
+
+          // Reopen keeps the shortlist and only resets counters.
+          "reopen_clears_shortlist": false
+        }
+      }
+    },
+
+    // Per-engine-version profiles. Identical to ue5-generic today: no value
+    // the hook uses has yet been shown to differ between 5.2 and 5.7 (the
+    // 5.2/5.7 difference that IS known - velocity channel 2/3 packing - is
+    // decode-side, in tools/mvtools.py, not identification). They exist so a
+    // version-specific finding lands as an override here, not as a branch in
+    // C++, and so the manifest names the version the capture was tuned for.
+    "ue5.2-generic": {
+      "extends": "ue5-generic",
+      "description": "UE 5.2 (e.g. Skyrunner). No overrides yet."
+    },
+    "ue5.7-generic": {
+      "extends": "ue5-generic",
+      "description": "UE 5.7 (e.g. Oxi). No overrides yet."
+    }
+  }
+}

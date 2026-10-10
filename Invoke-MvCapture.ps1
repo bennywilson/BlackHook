@@ -51,6 +51,12 @@
     decode for channels 2/3, which 5.2 and 5.7 pack differently. Inferred from
     the executable name for titles this repo knows; otherwise you must pass it,
     because a wrong value here silently corrupts V.z and bHasPixelAnimation.
+    Also picks the surface profile: 5.2 -> ue5.2-generic (profiles/ue5.json).
+
+.PARAMETER SurfaceProfile
+    Surface profile name from profiles/ue5.json, overriding the one derived
+    from EngineVersion. A name that does not exist disables identification
+    (the hook log says so) rather than falling back.
 
 .PARAMETER DumpDir
     Where captures go. Defaults to a fresh timestamped directory under the
@@ -84,6 +90,7 @@ param(
     [string] $Game,
 
     [string] $EngineVersion,
+    [string] $SurfaceProfile,
     [string] $DumpDir,
     [string] $Hook,
     [string] $RenderProcess = '*-Win64-Shipping',
@@ -309,7 +316,8 @@ if (-not $AttachOnly) {
     # which is exactly why that switch must not be used here.
     $env:MV_DUMP_DIR       = $DumpDir
     $env:MV_ENGINE_VERSION = $resolvedVersion
-    if ($AutoCapture)    { $env:MV_AUTOCAPTURE   = '1' } else { Remove-Item Env:\MV_AUTOCAPTURE   -ErrorAction SilentlyContinue }
+    if ($SurfaceProfile) { $env:MV_PROFILE       = $SurfaceProfile } else { Remove-Item Env:\MV_PROFILE       -ErrorAction SilentlyContinue }
+    if ($AutoCapture)   { $env:MV_AUTOCAPTURE   = '1' } else { Remove-Item Env:\MV_AUTOCAPTURE   -ErrorAction SilentlyContinue }
     if ($NoCaptureDepth) { $env:MV_CAPTURE_DEPTH = '0' } else { Remove-Item Env:\MV_CAPTURE_DEPTH -ErrorAction SilentlyContinue }
 
     $workingDir = Split-Path -Parent $Game

@@ -1,10 +1,9 @@
 #include "capture.h"
 
 #include "build_info.h"
-#include "depth_identify.h"
 #include "logging.h"
+#include "surface_profile.h"
 #include "surface_registry.h"
-#include "velocity_identify.h"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -1053,9 +1052,21 @@ std::string BuildManifest()
     j += "    \"process\": " + JsonString(process) + ",\n";
     j += "    \"started_utc\": " + JsonString(g_dumpStartedUtc) + ",\n";
     j += "    \"sealed_utc\": " + JsonString(sealedUtc) + ",\n";
-    // Profiles arrive in Phase 9; every dump today is captured against the
-    // hardcoded specs in this file, which is what "default" names.
-    j += "    \"profile\": \"default\",\n";
+    // Which surface profile identification ran under (Phase 9), and where it
+    // came from: "embedded" means the DLL's own copy of profiles/ue5.json, so
+    // producer.commit pins it; anything else is an MV_PROFILE_FILE path, which
+    // the commit does not. A dump only exists if velocity was identified,
+    // which needs a loaded profile, so null here would be a bug.
+    if (const SurfaceProfile* profile = ActiveSurfaceProfile())
+    {
+        j += "    \"profile\": " + JsonString(profile->name) + ",\n";
+        j += "    \"profile_source\": " + JsonString(profile->source) + ",\n";
+    }
+    else
+    {
+        j += "    \"profile\": null,\n";
+        j += "    \"profile_source\": null,\n";
+    }
     if (g_dumpLayout[kSurfaceColor].known)
     {
         const D3D12_RESOURCE_DESC& bb = g_dumpLayout[kSurfaceColor].desc;
@@ -1763,7 +1774,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         // Frozen once, here, not re-read live per frame - see the field
         // comment (finding 1.14).
         g_depthRequiredForBurst.store(
-            DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr, std::memory_order_relaxed);
+            DepthCaptureEnabled() && GetSurfaceRegistry().Selected("depth") != nullptr, std::memory_order_relaxed);
         if (g_dumpStartedUtc.empty())
         {
             g_dumpStartedUtc = UtcNowIso8601();
@@ -1776,7 +1787,9 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         const unsigned long long presented = g_frameIndex.load(std::memory_order_relaxed);
         uint64_t silentFor = 0;
-        if (g_framesRemaining.load(std::memory_order_relaxed) > 0 && VelocityPassIsSilent(presented, &silentFor))
+        SurfaceIdentifier* velocity = GetSurfaceRegistry().Find("velocity");
+        if (g_framesRemaining.load(std::memory_order_relaxed) > 0 && velocity != nullptr &&
+            velocity->IsSilent(presented, &silentFor))
         {
             const int short_by = EndBurst(BurstEndReason::VelocityPassSilent);
             Log("capture: burst ENDED - the game has not rendered the velocity pass for " + std::to_string(silentFor) +

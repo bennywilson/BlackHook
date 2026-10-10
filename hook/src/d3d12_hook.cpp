@@ -9,15 +9,16 @@
 #include <MinHook.h>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 #include "capture.h"
-#include "depth_identify.h"
 #include "logging.h"
 #include "overlay.h"
 #include "resource_tracking.h"
+#include "surface_profile.h"
 #include "surface_registry.h"
 #include "velocity_identify.h"
 
@@ -209,7 +210,7 @@ void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t 
         return;
     }
 
-    if (mv::IdentifiedVelocityResource() && (frame % kResizePollFrames))
+    if (mv::GetSurfaceRegistry().Selected("velocity") && (frame % kResizePollFrames))
     {
         return;
     }
@@ -713,8 +714,16 @@ bool InstallD3D12Hooks()
     // register before depth, since depth's spec.extentFrom names
     // "velocity" and Configure() resolves that name by looking it up in
     // what's already registered.
-    mv::RegisterVelocityIdentifier(mv::GetSurfaceRegistry());
-    mv::RegisterDepthIdentifier(mv::GetSurfaceRegistry());
+    //
+    // The specs come from the active profile (Phase 9). If it failed to load
+    // nothing is registered: hooks still install, so the game runs and the
+    // log explains, but no surface is ever identified or captured - there is
+    // no built-in spec to fall back to (surface_profile.h).
+    if (const mv::SurfaceProfile* profile = mv::LoadSurfaceProfile())
+    {
+        mv::GetSurfaceRegistry().Register(mv::MakeVelocityIdentifier(profile->velocity));
+        mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
+    }
     mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
     mv::GetSurfaceRegistry().Configure();
 

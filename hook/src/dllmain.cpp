@@ -5,21 +5,35 @@
 #include "build_info.h"
 #include "capture.h"
 #include "d3d12_hook.h"
-#include "depth_identify.h"
 #include "logging.h"
 #include "overlay.h"
+#include "surface_profile.h"
 #include "surface_registry.h"
-#include "velocity_identify.h"
 
 // MvIdentified*Resource() functions are used by the test harness (testhost/)
 // after placing several look alike buffers. Returns nullptr while search is 
 // running or when it refused to 
 extern "C" __declspec(dllexport) void* MvIdentifiedVelocityResource() {
-    return mv::IdentifiedVelocityResource();
+    return mv::GetSurfaceRegistry().Selected("velocity");
 }
 
 extern "C" __declspec(dllexport) void* MvIdentifiedDepthResource() {
-    return mv::IdentifiedDepthResource();
+    return mv::GetSurfaceRegistry().Selected("depth");
+}
+
+// The profile identification is running under, or "" if none loaded - so the
+// harness can tell "searched under the profile I asked for and found nothing"
+// apart from "never searched because the profile failed to load".
+extern "C" __declspec(dllexport) const char* MvActiveProfile() {
+    const mv::SurfaceProfile* profile = mv::ActiveSurfaceProfile();
+    return profile != nullptr ? profile->name.c_str() : "";
+}
+
+// Where mv_hook.log is, with a trailing separator - so the harness can assert
+// on what the hook said, not just on what it selected.
+extern "C" __declspec(dllexport) const char* MvLogDirectory() {
+    static const std::string dir = mv::OutputDir("logs");
+    return dir.c_str();
 }
 
 // Drains the writer thread's queue so a host can count dump files right

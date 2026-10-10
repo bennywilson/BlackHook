@@ -112,27 +112,59 @@ def blob_hash(dump_dir, prefix, capture_index):
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
+# manifest.json fields that differ between two runs of the SAME build, so
+# comparing them would make the oracle fail on every run (measured: it did,
+# from Phase 4 until this list existed). Two kinds:
+#   - provenance: which build/profile, and when. Differs by design across the
+#     change under test; shown, not judged. A profile that changes behaviour
+#     shows up in the blobs and in the fields that ARE compared.
+#   - timing: how many frames the writer drained vs dropped under backpressure
+#     is GPU/CPU timing, the same reason frames are keyed on game frame index.
+RUN_VARYING = {
+    "producer.commit", "producer.configured_utc", "producer.built",
+    "session.started_utc", "session.sealed_utc",
+    "session.profile", "session.profile_source",
+    "burst.drained_frames",
+    "integrity.dropped_frames_backpressure", "integrity.slots_missed_busy",
+}
+
+
+def flatten(meta, prefix=""):
+    """{"a": {"b": 1}} -> {"a.b": 1}. Lists stay whole values."""
+    out = {}
+    for key, value in meta.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict) and value:
+            out.update(flatten(value, path + "."))
+        else:
+            out[path] = value
+    return out
+
+
 def diff_metadata(before, after):
-    """Returns a list of human-readable differences."""
+    """Returns (problems, run_varying): human-readable lines for differences
+    that count against equivalence, and for those that don't (RUN_VARYING)."""
     (before_src, before_meta) = before
     (after_src, after_meta) = after
-    problems = []
+    problems, varying = [], []
     if before_meta is None or after_meta is None:
         problems.append(
-            f"metadata missing: before={before_src or 'NONE'} after={after_src or 'NONE'}")
-        return problems
+            f"metadata missing: before={before_src or 'NONE'} after={after_src or 'NONE'}"
+            " (manifest.json is written when a burst SEALS - a short testhost run never gets there)")
+        return problems, varying
     if before_src != after_src:
         problems.append(f"metadata format changed: {before_src} -> {after_src}")
         # Not fatal on its own - Phase 4 does exactly this deliberately - but the
         # dicts below will not be comparable, so stop here rather than emit noise.
-        return problems
+        return problems, varying
     if not isinstance(before_meta, dict) or not isinstance(after_meta, dict):
-        return problems
-    for key in sorted(set(before_meta) | set(after_meta)):
-        b, a = before_meta.get(key), after_meta.get(key)
+        return problems, varying
+    b_flat, a_flat = flatten(before_meta), flatten(after_meta)
+    for key in sorted(set(b_flat) | set(a_flat)):
+        b, a = b_flat.get(key), a_flat.get(key)
         if b != a:
-            problems.append(f"  {key}: {b!r} -> {a!r}")
-    return problems
+            (varying if key in RUN_VARYING else problems).append(f"  {key}: {b!r} -> {a!r}")
+    return problems, varying
 
 
 def main():
@@ -153,14 +185,18 @@ def main():
     print(f"after:  {args.after}")
     print()
 
-    # --- metadata: must match exactly ---------------------------------------
-    meta_problems = diff_metadata(load_metadata(args.before), load_metadata(args.after))
+    # --- metadata: must match exactly, outside RUN_VARYING -----------------
+    meta_problems, meta_varying = diff_metadata(load_metadata(args.before), load_metadata(args.after))
     if meta_problems:
         print("METADATA DIFFERS:")
         for p in meta_problems:
             print(p)
     else:
         print("metadata: identical")
+    if meta_varying:
+        print("run-varying (provenance/timing - shown, not compared):")
+        for p in meta_varying:
+            print(p)
 
     # --- frame maps ---------------------------------------------------------
     before_map = load_frame_map(args.before)
@@ -228,8 +264,9 @@ def main():
               f"than --min-common={args.min_common}. That is not enough to conclude much; "
               f"re-run with more frames rather than treating this as a pass.")
         return 2
-    print(f"RESULT: EQUIVALENT - metadata identical, and all {len(common)} shared game frames "
-          f"byte-identical across every surface.")
+    print(f"RESULT: EQUIVALENT - metadata identical (outside {len(meta_varying)} run-varying "
+          f"field(s) above), and all {len(common)} shared game frames byte-identical across "
+          f"every surface.")
     return 0
 
 

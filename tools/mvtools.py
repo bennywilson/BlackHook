@@ -97,8 +97,8 @@ class IdentifiedSurface:
     Deliberately has no .score/.margin/.signals/.survivors attributes: the
     hook does not track that state anywhere queryable yet (see the commit
     that added manifest writing, docs/REFACTOR_PLAN.md Phase 4c-2) - it
-    exists only as local variables inside velocity_identify.cpp/
-    depth_identify.cpp's Decide() that get logged and discarded. Adding
+    exists only as local variables inside SurfaceIdentifier::Decide()
+    (hook/src/surface_identify.cpp) that get logged and discarded. Adding
     placeholder fields for it here would invite exactly the kind of
     silent-plausible-wrong reading this project's own README warns about
     (the format-enum bug, the missing sqrt in the velocity decode - both
