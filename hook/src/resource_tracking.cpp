@@ -2,8 +2,6 @@
 
 #include "logging.h"
 
-#include <wrl/client.h>
-
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -11,8 +9,6 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
-
-using Microsoft::WRL::ComPtr;
 
 namespace mv {
 namespace {
@@ -38,41 +34,6 @@ std::unordered_set<ID3D12Resource*> g_seenResources;
 constexpr int64_t kIdentifyBudget = 8000;
 std::atomic<int64_t> g_identifyBudget{kIdentifyBudget};
 std::atomic<bool> g_budgetExhaustionReported{false};
-
-// Candidates are held BY REFERENCE, not by raw pointer.
-//
-// The target is a transient placed resource out of UE5's
-// TransientResourceAllocator - precisely the category most likely to be
-// released and have its address handed straight back out for something else.
-// Keyed on a bare ID3D12Resource*, a recycled address makes IsCandidate()
-// answer true for a completely unrelated resource, and the consequences are
-// not a wrong picture: we would issue a transition barrier asserting a
-// StateBefore that resource was never in (undefined behaviour, and a debug
-// layer error), then CopyTextureRegion out of it using footprints computed
-// from the old resource's desc. Both fail silently on a driver that tolerates
-// them. Worse, TryMarkResourceSeen guarantees a recycled address is never
-// re-examined, so the mistake would be permanent for the session.
-//
-// An AddRef costs one leaked ID3D12Resource object per candidate for the
-// process lifetime. That is cheap here (one candidate per session, measured
-// across six sessions) and it does NOT pin the underlying heap memory - a
-// placed resource's storage belongs to the heap, which the engine keeps
-// aliasing as it likes. What it does buy is that the address cannot be
-// reissued while we are still using it as an identity, which is the whole
-// requirement.
-struct Candidate {
-    ComPtr<ID3D12Resource> resource;
-    D3D12_RESOURCE_DESC desc{};
-};
-
-std::shared_mutex g_candidateMutex;
-std::unordered_map<ID3D12Resource*, Candidate> g_candidateResources;
-
-bool SameLayout(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
-    return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
-           a.DepthOrArraySize == b.DepthOrArraySize && a.MipLevels == b.MipLevels && a.Format == b.Format &&
-           a.SampleDesc.Count == b.SampleDesc.Count && a.Flags == b.Flags;
-}
 
 } // namespace
 
@@ -129,69 +90,6 @@ void ForgetAllResourcesSeen() {
     g_budgetExhaustionReported.store(false, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_seenMutex);
     g_seenResources.clear();
-}
-
-void MarkAsCandidate(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) {
-    std::unique_lock lock(g_candidateMutex);
-    auto& entry = g_candidateResources[resource];
-    entry.resource = resource; // ComPtr::operator= AddRefs
-    entry.desc = desc;
-}
-
-bool IsCandidate(ID3D12Resource* resource) {
-    std::shared_lock lock(g_candidateMutex);
-    return g_candidateResources.count(resource) != 0;
-}
-
-bool ValidateCandidate(ID3D12Resource* resource) {
-    // Safe to call GetDesc() here specifically because we hold a reference -
-    // this is the one place in the project where touching a resource outside
-    // the call that handed it to us is defensible, and only for that reason.
-    D3D12_RESOURCE_DESC recorded{};
-    {
-        std::shared_lock lock(g_candidateMutex);
-        const auto it = g_candidateResources.find(resource);
-        if (it == g_candidateResources.end()) {
-            return false;
-        }
-        recorded = it->second.desc;
-    }
-    const D3D12_RESOURCE_DESC current = resource->GetDesc();
-    if (SameLayout(recorded, current)) {
-        return true;
-    }
-    // Either the address was recycled despite the reference (it cannot be, so
-    // this would mean the reference was lost) or the resource was genuinely
-    // recreated at a new resolution. Both mean the footprints and the assumed
-    // StateBefore are stale, so stop acting on it rather than issue a barrier
-    // that asserts a state it is not in.
-    Log("resource-tracking: candidate " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
-        " no longer matches the desc it was accepted with (" + std::to_string(recorded.Width) + "x" +
-        std::to_string(recorded.Height) + " fmt=" + std::to_string(static_cast<int>(recorded.Format)) + " -> " +
-        std::to_string(current.Width) + "x" + std::to_string(current.Height) + " fmt=" +
-        std::to_string(static_cast<int>(current.Format)) + "); dropping it");
-    {
-        std::unique_lock lock(g_candidateMutex);
-        g_candidateResources.erase(resource);
-    }
-    return false;
-}
-
-void ForgetAllCandidates() {
-    size_t dropped = 0;
-    {
-        std::unique_lock lock(g_candidateMutex);
-        dropped = g_candidateResources.size();
-        // Releases the reference each candidate is held by, which is the point:
-        // past this line nothing keeps an abandoned resource's address reserved,
-        // and IsCandidate() answers false until a new decision marks one.
-        g_candidateResources.clear();
-    }
-    if (dropped != 0) {
-        Log("resource-tracking: dropped " + std::to_string(dropped) +
-            " candidate(s) because a search reopened - capture stops here and does not resume until a "
-            "new decision is reached");
-    }
 }
 
 } // namespace mv

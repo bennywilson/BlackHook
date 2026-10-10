@@ -3,6 +3,7 @@
 #include "build_info.h"
 #include "depth_identify.h"
 #include "logging.h"
+#include "surface_registry.h"
 #include "velocity_identify.h"
 
 #include <windows.h>
@@ -269,6 +270,18 @@ std::atomic<int> g_burstPresentsLeft{0};
 // from the start.
 std::atomic<bool> g_burstArmed{false};
 
+// Frozen at burst arm (docs/REFACTOR_PLAN.md sec 2.7 mechanism 1, finding
+// 1.14): whether depth was identified (and enabled) at the moment THIS burst
+// started, not re-evaluated live every frame. The pre-Phase-8 completeness
+// check read IdentifiedDepthResource() != nullptr fresh on every Present, so
+// a mid-burst depth reopen made the gate stop requiring depth the instant
+// identification went live-null - producing a dump that mixes frames with
+// and without depth while passing its own homogeneity check. Freezing this
+// once, at arm time, makes that impossible: either every frame in the burst
+// is held to the same requirement, or (see NotifySurfaceReopened) the burst
+// ends instead of drifting.
+std::atomic<bool> g_depthRequiredForBurst{false};
+
 // Arms the burst for the next Present.
 void ArmBurst()
 {
@@ -287,6 +300,14 @@ enum class BurstEndReason : uint8_t
     LayoutChanged,             // a surface's layout changed mid-dump
     VelocityPassSilent,        // the velocity pass stopped rendering
     PresentBudgetExhausted,    // kBurstPresentBudget Presents spent
+    // A surface required for this burst (frozen at arm time, see
+    // g_depthRequiredForBurst) reopened mid-burst - docs/REFACTOR_PLAN.md
+    // finding 1.14/test 3. Ending honestly beats the pre-Phase-8 behaviour of
+    // silently dropping frames (or, before the frozen-mask fix, writing
+    // frames without the reopened surface at all once IdentifiedXResource()
+    // went live-null and the completeness check's live read stopped
+    // requiring it).
+    SurfaceReopened,
 };
 std::atomic<BurstEndReason> g_burstEndReason{BurstEndReason::NotEnded};
 
@@ -1063,7 +1084,8 @@ std::string BuildManifest()
     }
 
     static const char* const kReasonNames[] = {
-        "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted"};
+        "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted",
+        "surface_reopened"};
     const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
     j += "  \"burst\": {\n";
     j += "    \"requested_frames\": " + std::to_string(kCaptureFrames) + ",\n";
@@ -1695,6 +1717,35 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
     }
 }
 
+void NotifySurfaceReopened(const char* surfaceName)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0)
+    {
+        return; // no burst in progress; nothing to end
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0)
+    {
+        return; // ended between the check above and taking the lock
+    }
+    const std::string name = surfaceName != nullptr ? surfaceName : "";
+    // velocity is unconditionally required (capture.cpp:1810-ish drops any
+    // frame without it, always); depth's requirement is frozen per burst -
+    // see g_depthRequiredForBurst.
+    const bool required = name == "velocity" || (name == "depth" && g_depthRequiredForBurst.load(std::memory_order_relaxed));
+    if (!required)
+    {
+        return;
+    }
+    const int short_by = EndBurst(BurstEndReason::SurfaceReopened);
+    Log("capture: burst ENDED - the " + name +
+        " search reopened mid-burst, so later frames would have been captured against a different resource (or "
+        "none) than earlier ones. " +
+        std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
+        " never landed. Ending rather than silently dropping frames until reidentification completes keeps the "
+        "dump homogeneous - press F8 again once the search has settled.");
+}
+
 void OnPresent(IDXGISwapChain* swapChain)
 {
     if (swapChain == nullptr || g_originalExecuteCommandLists == nullptr)
@@ -1712,6 +1763,10 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.store(kBurstPresentBudget);
         g_burstEndReason.store(BurstEndReason::NotEnded, std::memory_order_relaxed);
         g_manifestDirty.store(true, std::memory_order_relaxed);
+        // Frozen once, here, not re-read live per frame - see the field
+        // comment (finding 1.14).
+        g_depthRequiredForBurst.store(
+            DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr, std::memory_order_relaxed);
         if (g_dumpStartedUtc.empty())
         {
             g_dumpStartedUtc = UtcNowIso8601();
@@ -1770,7 +1825,8 @@ void OnPresent(IDXGISwapChain* swapChain)
     if (g_manifestDirty.load(std::memory_order_relaxed) && DumpFullyDrained())
     {
         static const char* const kReasonNames[] = {
-            "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted"};
+            "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted",
+            "surface_reopened"};
         const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
         Log("capture: dump directory sealed - " + std::to_string(g_drainedFrames.load(std::memory_order_relaxed)) +
             " frame(s) drained, ended_because=" + kReasonNames[static_cast<int>(reason)] +
@@ -1832,7 +1888,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     // Gates on the artefact having been produced at least once, so a title
     // that never identifies depth still captures velocity rather than nothing.
     const char* missing = nullptr;
-    if (!slot->surfaces[kSurfaceDepth].present && DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr)
+    if (!slot->surfaces[kSurfaceDepth].present && g_depthRequiredForBurst.load(std::memory_order_relaxed))
     {
         missing = "depth";
     }
@@ -1862,6 +1918,12 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         return;
     }
+    // Known-source exclusion (docs/REFACTOR_PLAN.md sec 3.3): a resource
+    // obtained through this exact API contract is never eligible for any
+    // identifier's search, no matter what its descriptor looks like. Fed
+    // every Present, not just the first - ResizeBuffers/fullscreen
+    // transitions can hand back a different set of buffer pointers.
+    mv::GetSurfaceRegistry().NoteKnownSourceResource(backBuffer.Get());
 
     // Same every-frame revalidation as velocity: a resize or fullscreen
     // transition recreates swapchain buffers at a new size, and stale

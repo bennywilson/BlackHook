@@ -18,7 +18,10 @@
 #include "logging.h"
 #include "overlay.h"
 #include "resource_tracking.h"
+#include "surface_registry.h"
 #include "velocity_identify.h"
+
+#include <cstring>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -214,11 +217,7 @@ void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t 
     DXGI_SWAP_CHAIN_DESC desc{};
     if (SUCCEEDED(swapChain->GetDesc(&desc)))
     {
-        if (mv::NoteBackBufferSize(desc.BufferDesc.Width, desc.BufferDesc.Height))
-        {
-            mv::ReopenIdentification("the back buffer changed size which abandons identified Scene Textures");
-            mv::ReopenDepthIdentification("the velocity search was reopened after a back-buffer resize");
-        }
+        mv::GetSurfaceRegistry().NoteBackBufferSize(desc.BufferDesc.Width, desc.BufferDesc.Height);
     }
 }
 
@@ -227,8 +226,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
     mv::SetFrameIndex(frame);
     NoteBackBufferSizeIfNeeded(swapChain, frame);
-    mv::OnFrameForIdentification(frame);
-    mv::OnFrameForDepthIdentification(frame);
+    mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
     mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
@@ -243,8 +241,7 @@ HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DX
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
     mv::SetFrameIndex(frame);
     NoteBackBufferSizeIfNeeded(swapChain, frame);
-    mv::OnFrameForIdentification(frame);
-    mv::OnFrameForDepthIdentification(frame);
+    mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
     mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
@@ -292,13 +289,12 @@ void TryIdentifyResource(ID3D12Resource* resource)
         return;
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    mv::NoteResourceDesc(resource, desc);
-    // Same desc feeds the depth search. Reading it once and sharing it is
-    // deliberate: GetDesc() on a barrier-encountered resource is a considered
-    // bet, not proven-safe (see the budget above and the
+    // Read once, shared with every registered identifier (SurfaceRegistry::
+    // ConsiderResource) - GetDesc() on a barrier-encountered resource is a
+    // considered bet, not proven-safe (see the budget above and the
     // CreateRenderTargetView crash in DEBUGGING.md), so it's called once per
-    // resource total, not once per module.
-    mv::NoteResourceDescForDepth(resource, desc);
+    // resource total, not once per surface.
+    mv::GetSurfaceRegistry().ConsiderResource(resource, desc);
 }
 
 // Re-entrancy guard for the barrier hook.
@@ -333,6 +329,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
 
     // Recurrence logging for known candidates
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
+    mv::SurfaceRegistry& registry = mv::GetSurfaceRegistry();
     for (UINT i = 0; i < numBarriers; ++i)
     {
         switch (barriers[i].Type)
@@ -343,97 +340,53 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 const int stateBefore = static_cast<int>(barriers[i].Transition.StateBefore);
                 const int stateAfter = static_cast<int>(barriers[i].Transition.StateAfter);
                 TryIdentifyResource(resource);
-                mv::NoteTransition(resource, frame, stateBefore, stateAfter);
-                mv::NoteDepthTransition(resource, frame, stateBefore, stateAfter);
-                // DEPTH_WRITE -> readable is the depth buffer's equivalent of
-                // velocity's RENDER_TARGET -> shader-resource edge: the pass
-                // that was writing it has finished and something is about to
-                // read it. Same reason for copying here rather than at Present -
-                // scene depth is a transient placed resource too.
-                if (mv::IsDepthCandidate(resource) && stateBefore == D3D12_RESOURCE_STATE_DEPTH_WRITE &&
-                    mv::IsDepthReadableState(stateAfter))
-                {
-                    if (mv::ValidateDepthCandidate(resource))
-                    {
-                        mv::SetFrameIndex(frame);
-                        mv::OnDepthReadable(cmdList, resource, stateAfter);
-                    }
-                    else
-                    {
-                        mv::ReopenDepthIdentification("the selected depth resource's descriptor changed underneath us");
-                    }
-                }
-                if (IsCandidate(resource))
+
+                if (registry.IsAnyCandidate(resource))
                 {
                     LogTo(
                         "candidates",
                         "frame=" + std::to_string(frame) +
                             " ptr=" + std::to_string(reinterpret_cast<uintptr_t>(resource)) + " TRANSITION before=" +
-                            std::to_string(static_cast<int>(barriers[i].Transition.StateBefore)) +
-                            " after=" + std::to_string(static_cast<int>(barriers[i].Transition.StateAfter)));
-
-                    // RENDER_TARGET -> shader-resource is the moment velocity
-                    // has been fully written and is about to be read - the
-                    // only safe point to copy it, since it's a
-                    // transient/placed resource whose heap memory gets
-                    // aliased later in the frame.
-                    //
-                    // Destination state is matched as any subset of the
-                    // shader-resource bits, not ALL_SHADER_RESOURCE exactly:
-                    // UE5's RDG usually maps to ALL_SHADER_RESOURCE (0xC0),
-                    // but a pixel-shader-only read gets PIXEL_SHADER_RESOURCE
-                    // (0x80). The actual state is passed through and restored
-                    // rather than assumed.
-                    if (stateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && IsShaderResourceState(stateAfter))
-                    {
-                        // Confirm the resource still has the desc it was
-                        // accepted with before recording a barrier/copy sized
-                        // from its footprints - cheap (once per frame), and
-                        // the only guard against a recycled address or
-                        // resolution change causing silent corruption.
-                        if (ValidateCandidate(resource))
-                        {
-                            mv::SetFrameIndex(frame);
-                            mv::OnVelocityReadable(cmdList, resource, stateAfter);
-                            // Same moment, same validity argument - the live
-                            // overlay samples a GPU-side copy taken here rather
-                            // than anything read back to the CPU.
-                            mv::OverlayCaptureVelocity(
-                                cmdList, resource, static_cast<D3D12_RESOURCE_STATES>(stateAfter), frame);
-                        }
-                        else
-                        {
-                            mv::ReopenIdentification(
-                                "the selected resource's descriptor changed underneath us (resolution change, "
-                                "dynamic resolution scaling, or a swapchain resize)");
-                            // Depth identification is gated on the velocity
-                            // extent, so a velocity resolution change
-                            // invalidates the depth answer too - silently,
-                            // since the depth resource is usually recreated
-                            // at the same moment and passes its own
-                            // descriptor check right up until it doesn't.
-                            mv::ReopenDepthIdentification("the velocity search was reopened");
-                        }
-                    }
+                            std::to_string(stateBefore) + " after=" + std::to_string(stateAfter));
                 }
-                else if (stateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && IsShaderResourceState(stateAfter))
+
+                // Records the transition into the shared profile store once,
+                // fans out to every identifier's liveness tracking, and
+                // reproduces what used to be two hand-wired per-surface
+                // blocks here: candidate validation (capture on success,
+                // reopen on failure - the resolution-change/DRS/resize case)
+                // and rival-edge adoption for velocity. A reopen triggered
+                // here reaches capture.cpp via the registry's
+                // ReopenObserver (wired in InstallD3D12Hooks below), not a
+                // return value - see SurfaceRegistry::SetReopenObserver.
+                constexpr int kMaxTriggers = 4; // generous for today's 2 identifiers
+                mv::SurfaceTrigger triggers[kMaxTriggers];
+                const int triggerCount = registry.OnBarrierTransition(resource, frame, stateBefore, stateAfter, triggers, kMaxTriggers);
+                for (int t = 0; t < triggerCount; ++t)
                 {
-                    // Not the identified resource. Uninteresting normally -
-                    // but if the identified one is mid-stall, a same-format
-                    // texture taking this exact edge is the difference
-                    // between "stopped rendering velocity" and "rendering it
-                    // somewhere else". Gated on an in-progress stall, so free
-                    // otherwise.
-                    if (mv::NoteRivalVelocityEdge(resource, frame))
+                    const mv::SurfaceTrigger& trig = triggers[t];
+                    mv::SetFrameIndex(frame);
+                    if (std::strcmp(trig.identifier->Spec().name, "velocity") == 0)
                     {
-                        // Adopted, not reidentified: marking it a candidate
-                        // puts it on the ordinary capture path above, so from
-                        // the next edge onward it validates/copies/feeds the
-                        // overlay like the first target. Reopening the search
-                        // instead would throw away a correct answer and land
-                        // in AMBIGUOUS - both widths are live and neither is
-                        // wrong.
-                        mv::MarkAsCandidate(resource, resource->GetDesc());
+                        // RENDER_TARGET -> shader-resource is the moment
+                        // velocity has been fully written and is about to be
+                        // read - the only safe point to copy it, since it's a
+                        // transient/placed resource whose heap memory gets
+                        // aliased later in the frame.
+                        mv::OnVelocityReadable(cmdList, trig.resource, trig.stateAfter);
+                        // Same moment, same validity argument - the live
+                        // overlay samples a GPU-side copy taken here rather
+                        // than anything read back to the CPU.
+                        mv::OverlayCaptureVelocity(
+                            cmdList, trig.resource, static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
+                    }
+                    else if (std::strcmp(trig.identifier->Spec().name, "depth") == 0)
+                    {
+                        // DEPTH_WRITE -> readable is depth's equivalent of
+                        // velocity's trigger edge - same reason for copying
+                        // here rather than at Present, scene depth is a
+                        // transient placed resource too.
+                        mv::OnDepthReadable(cmdList, trig.resource, trig.stateAfter);
                     }
                 }
                 break;
@@ -442,8 +395,8 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
             {
                 ID3D12Resource* resource = barriers[i].UAV.pResource;
                 TryIdentifyResource(resource);
-                mv::NoteUavBarrier(resource);
-                if (IsCandidate(resource))
+                registry.OnUavBarrier(resource);
+                if (registry.IsAnyCandidate(resource))
                 {
                     LogTo(
                         "candidates",
@@ -754,6 +707,16 @@ bool InstallD3D12Hooks()
 
     // Todo: Investigate why installing CreateRenderTargetView,
     // CreateCommittedResource, CreatePlacedResource crash here
+
+    // Wire the surface registry before any hook can fire (docs/
+    // REFACTOR_PLAN.md sec 2.5, Phase 8). Order matters: velocity must
+    // register before depth, since depth's spec.extentFrom names
+    // "velocity" and Configure() resolves that name by looking it up in
+    // what's already registered.
+    mv::RegisterVelocityIdentifier(mv::GetSurfaceRegistry());
+    mv::RegisterDepthIdentifier(mv::GetSurfaceRegistry());
+    mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
+    mv::GetSurfaceRegistry().Configure();
 
     if (ok)
     {

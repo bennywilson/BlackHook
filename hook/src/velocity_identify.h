@@ -28,38 +28,23 @@
 //
 // When more than one resource survives, the top two scores decide: a margin
 // of 2+ picks the top scorer. Ambiguous picks are treated as failure.
+//
+// As of docs/REFACTOR_PLAN.md Phase 8, the hot-path entry points
+// (ConsiderResource/OnTransition/etc.) are reached only through
+// SurfaceRegistry, not by d3d12_hook.cpp calling into this file directly -
+// see RegisterVelocityIdentifier below. This header now exposes only what
+// still has external callers: capture.cpp's silence check and dllmain.cpp's
+// DLL export.
 
 namespace mv
 {
 
-// Every resource the barrier hook walks past, once per resource. Records
-// the structural shortlist and seeds the behaviour profile.
-void NoteResourceDesc(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc);
+class SurfaceRegistry;
 
-// Every transition barrier, for the behaviour profile.
-void NoteTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter);
-
-// Every UAV barrier - a scored signal, not a hard rule. A resource taking
-// UAV barriers is compute-written, which SceneVelocity mostly isn't, but
-// this was falsified on a second title (see README, "the second title").
-void NoteUavBarrier(ID3D12Resource* resource);
-
-// Called once per presented frame. Runs the decision when the settling window
-// has elapsed, and dumps the full behaviour survey when due.
-void OnFrameForIdentification(uint64_t frame);
-
-// The swapchain's back-buffer size, when known - velocity renders at or
-// below it, one of the few resolution facts available without source.
-//
-// Returns true when the size CHANGED after a decision was already made. UE
-// rebuilds scene textures at the new extent rather than resizing them, so
-// the caller must reopen both searches - see the definition.
-bool NoteBackBufferSize(uint64_t width, uint32_t height);
-
-// Starts the search again from scratch, e.g. when a resolution change
-// recreates the velocity texture and the confirmed candidate's descriptor
-// changes.
-void ReopenIdentification(const char* reason);
+// Called once, from InstallD3D12Hooks, before hooks go live. Constructs
+// nothing (g_velocity is a file-scope static, per the usual static-init-order
+// caution) - just hands the registry a pointer to it.
+void RegisterVelocityIdentifier(SurfaceRegistry& registry);
 
 // True if the identified velocity buffer hasn't taken a RENDER_TARGET ->
 // shader-resource edge in over 300 frames while the game keeps presenting.
@@ -68,37 +53,5 @@ bool VelocityPassIsSilent(uint64_t frame, uint64_t* framesSilent);
 // The identified resource, or nullptr while the search is running or
 // ambiguous. Exported so the test harness can check which resource won.
 ID3D12Resource* IdentifiedVelocityResource();
-
-// The extent of the identified velocity texture, or false if there isn't one.
-// Depth identification keys off it: UE5 creates SceneDepth and
-// SceneVelocity at the same SceneTexturesConfig::Extent.
-bool IdentifiedVelocityExtent(uint64_t* width, uint32_t* height);
-
-// Frames since the identified resource last took a RENDER_TARGET ->
-// shader-resource edge. Unlike VelocityPassIsSilent this reports the raw
-// number rather than gating on a 300-frame threshold - real stalls turned
-// out to be shorter than that.
-uint64_t FramesSinceVelocityEdge(uint64_t frame);
-
-// Diagnostic, not a decision: while the identified resource is stalled,
-// checks whether another texture of the same format has taken over its
-// edge - i.e. the engine moved the velocity pass to a different target
-// rather than stopped rendering it. Needed because resource tracking stops
-// examining new resources once its identification budget is spent, so a
-// later-allocated replacement is otherwise invisible; this looks at the
-// barrier directly and only costs a GetDesc during a stall.
-//
-// Returns true once the resource has held the edge long enough to be
-// adopted as a second velocity target (the target game switches between
-// R16G16B16A16F and R16G16F) - caller should start treating it as
-// capturable. Adoption is bounded internally; past the limit this returns
-// false rather than adopt indefinitely.
-bool NoteRivalVelocityEdge(ID3D12Resource* resource, uint64_t frame);
-
-// The velocity identifier itself, for depth_identify.cpp to bind its extent
-// dependency to (SurfaceIdentifier::SetExtentSource) - docs/REFACTOR_PLAN.md
-// Phase 7. Not for general use; every other need is served by the functions
-// above.
-const SurfaceIdentifier& VelocityIdentifier();
 
 } // namespace mv

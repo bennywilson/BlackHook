@@ -82,6 +82,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -262,6 +263,12 @@ int main(int argc, char** argv) {
     int frames = 240;
     bool gpuValidation = true;
     bool ambiguous = false;
+    // docs/REFACTOR_PLAN.md Phase 8's three required positive tests: resize
+    // must pause capture until reidentification, a depth reallocation must
+    // recover to SELECTED (not stuck AMBIGUOUS/nothing), and a mid-burst
+    // reopen must end the burst rather than silently drop frames. See
+    // RunPhase8BehaviorTests below.
+    bool phase8Tests = false;
     // Which shape of velocity pass to model. "oxi" is the strict 2-cycle this
     // project was developed against; "skyrunner" is the 5-transition,
     // UNORDERED_ACCESS-touching pass measured on a third-party UE 5.2 title.
@@ -284,6 +291,8 @@ int main(int argc, char** argv) {
             pipeline = argv[++i];
         } else if (arg == "--wpo-encode-test" && i + 1 < argc) {
             wpoEncodeTestDir = argv[++i];
+        } else if (arg == "--phase8-tests") {
+            phase8Tests = true;
         }
     }
 
@@ -725,7 +734,11 @@ int main(int argc, char** argv) {
 
     int totalErrors = 0;
 
-    for (int frame = 0; frame < frames; ++frame) {
+    // One frame's worth of work, extracted into a lambda so the Phase 8
+    // behaviour tests (below, gated on --phase8-tests) can keep driving the
+    // exact same render loop past the initial identify-and-capture window -
+    // a resize or a reopen only means anything if frames keep coming.
+    auto renderFrame = [&](int frame) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -832,6 +845,10 @@ int main(int argc, char** argv) {
         char phase[32];
         snprintf(phase, sizeof(phase), "frame%d", frame);
         totalErrors += DrainInfoQueue(infoQueue.Get(), phase);
+    };
+
+    for (int frame = 0; frame < frames; ++frame) {
+        renderFrame(frame);
     }
 
     // ---- Did it identify the right one? --------------------------------
@@ -935,6 +952,227 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- docs/REFACTOR_PLAN.md Phase 8's three required behaviour tests -
+    // written to exercise SurfaceRegistry's postconditions, not just
+    // identification correctness.
+    //
+    // Order matters. MV_AUTOCAPTURE arms exactly one burst for this whole
+    // process (there is no F8 press available to arm a second), and both
+    // test 3 and - usually - a real resize end it (capture.cpp's PRE-
+    // existing, non-Phase-8 DumpLayoutAccepts(color, ...) check notices a
+    // resized back buffer on the very next Present, no poll interval, and
+    // ends the burst via BurstEndReason::LayoutChanged well before
+    // velocity's own resize poll - every 30 frames - would). So test 3 runs
+    // FIRST, via MvForceReopenVelocity (see its comment in dllmain.cpp for
+    // why a direct trigger is used rather than a real resize), while the
+    // burst is still fresh; test 1's later resize can then only prove its
+    // search-level half (finding 1.11) - the capture-stops half is already
+    // proven by test 3's burst-level assertion plus ForgetAllCandidates()
+    // being unconditional now (surface_identify.cpp), not gated on which
+    // path triggered the reopen.
+    //
+    // Must run BEFORE MvFlushCapture below: it permanently stops the writer
+    // thread, and test 3's manifest check (after it) needs the burst to
+    // have actually sealed.
+    bool midBurstReopenEndedBurst = true;
+    bool resizeTestPassed = true;
+    bool depthReopenRecoveryPassed = true;
+    if (phase8Tests && hookModule != nullptr && !ambiguous && identificationPassed && depthIdentificationPassed) {
+        printf("\n[testhost] ==== Phase 8 behaviour tests ====\n");
+        char dumpDirBuf[MAX_PATH]{};
+        std::string dir;
+        if (GetEnvironmentVariableA("MV_DUMP_DIR", dumpDirBuf, MAX_PATH) != 0) {
+            dir = dumpDirBuf;
+            if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') {
+                dir += '\\';
+            }
+        }
+        if (GetEnvironmentVariableA("MV_AUTOCAPTURE", nullptr, 0) == 0 || dir.empty()) {
+            printf("[testhost]   FAIL - --phase8-tests requires MV_AUTOCAPTURE=1 and MV_DUMP_DIR set (same as the "
+                   "dump-contents check) - nothing to observe without an active burst\n");
+            midBurstReopenEndedBurst = false;
+            resizeTestPassed = false;
+            depthReopenRecoveryPassed = false;
+        } else {
+            using IdentifiedFn = void* (*)();
+            using VoidFn = void (*)();
+            auto identifiedVelocityFn = reinterpret_cast<IdentifiedFn>(
+                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedVelocityResource")));
+            auto identifiedDepthFn = reinterpret_cast<IdentifiedFn>(
+                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedDepthResource")));
+            auto forceReopenDepth = reinterpret_cast<VoidFn>(
+                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvForceReopenDepth")));
+            auto forceReopenVelocity = reinterpret_cast<VoidFn>(
+                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvForceReopenVelocity")));
+
+            int nextFrame = frames;
+            auto runFrames = [&](int n) {
+                for (int i = 0; i < n; ++i) {
+                    renderFrame(nextFrame++);
+                }
+            };
+            // Renders one frame at a time until `pred` is true, up to
+            // `maxFrames`. Returns the frame it became true on, or -1.
+            auto waitFor = [&](int maxFrames, auto pred) {
+                for (int i = 0; i < maxFrames; ++i) {
+                    renderFrame(nextFrame++);
+                    if (pred()) {
+                        return nextFrame - 1;
+                    }
+                }
+                return -1;
+            };
+            auto capturingHasStarted = [&] {
+                WIN32_FIND_DATAA found{};
+                HANDLE h = FindFirstFileA((dir + "vel_*.bin").c_str(), &found);
+                if (h == INVALID_HANDLE_VALUE) {
+                    return false;
+                }
+                FindClose(h);
+                return true;
+            };
+
+            // MV_AUTOCAPTURE arms its burst 1 real-world second after the
+            // hotkey thread starts (capture.cpp), which may not have
+            // elapsed yet even after the identify-frames loop above (this
+            // harness can render well under 1ms/frame with --no-gbv) - wait
+            // for actual evidence of capturing rather than assuming it by
+            // frame count.
+            if (!capturingHasStarted() && waitFor(120, capturingHasStarted) < 0) {
+                printf("[testhost]   FAIL - MV_AUTOCAPTURE never produced a captured frame within 120 extra frames - "
+                       "is the burst actually arming?\n");
+                midBurstReopenEndedBurst = false;
+                resizeTestPassed = false;
+                depthReopenRecoveryPassed = false;
+            } else {
+                // ---- Test 3: a mid-burst reopen must END the burst rather
+                // than silently drop frames from later ones (finding 1.14).
+                printf("[testhost] test 3: forcing velocity to reopen mid-burst (no swapchain change)...\n");
+                if (forceReopenVelocity == nullptr) {
+                    printf("[testhost]   FAIL - mv_hook.dll does not export MvForceReopenVelocity\n");
+                    midBurstReopenEndedBurst = false;
+                } else {
+                    forceReopenVelocity();
+                    // Give any in-flight slots (kSlots = 4 in capture.cpp)
+                    // time to drain and the burst to seal - checked for real
+                    // via the manifest after MvFlushCapture below, so this
+                    // is generous rather than exact.
+                    runFrames(20);
+                    printf("[testhost]   reopened - burst.ended_because is checked against the sealed manifest "
+                           "after MvFlushCapture below\n");
+                }
+
+                // ---- Test 1: a swapchain resize must trigger
+                // reidentification, not silently keep the abandoned
+                // resource selected (finding 1.11's search-level half). The
+                // burst from test 3 has already ended by this point, so
+                // this cannot ALSO prove capture stops - see the block
+                // comment above for why that half is proven separately.
+                printf("[testhost] test 1: forcing a swapchain resize mid-session...\n");
+                for (UINT i = 0; i < kBackBufferCount; ++i) {
+                    backBuffers[i].Reset(); // DXGI requires no outstanding back-buffer refs before ResizeBuffers
+                }
+                queue->Signal(fence.Get(), ++fenceValue);
+                if (fence->GetCompletedValue() < fenceValue) {
+                    fence->SetEventOnCompletion(fenceValue, fenceEvent);
+                    WaitForSingleObject(fenceEvent, 5000);
+                }
+                const UINT resizedWidth = kWidth + 128;
+                const UINT resizedHeight = kHeight + 72;
+                if (!Check(
+                        swapChain->ResizeBuffers(
+                            kBackBufferCount, resizedWidth, resizedHeight, DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+                        "ResizeBuffers")) {
+                    resizeTestPassed = false;
+                } else {
+                    for (UINT i = 0; i < kBackBufferCount; ++i) {
+                        Check(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])), "GetBuffer (post-resize)");
+                        device->CreateRenderTargetView(backBuffers[i].Get(), nullptr, rtvAt(i));
+                    }
+                    printf(
+                        "[testhost]   resized back buffer %ux%u -> %ux%u\n", kWidth, kHeight, resizedWidth,
+                        resizedHeight);
+
+                    // Polled every 30 presented frames once identified
+                    // (d3d12_hook.cpp's kResizePollFrames) - generous budget
+                    // for the poll to notice plus the reopen to fire.
+                    const int reopenFrame = waitFor(50, [&] { return identifiedVelocityFn() == nullptr; });
+                    if (reopenFrame < 0) {
+                        printf("[testhost]   FAIL - velocity was never observed reopened (null) within 50 frames of "
+                               "the resize\n");
+                        resizeTestPassed = false;
+                    } else {
+                        // Same resource, same descriptor - it settles again
+                        // after spec.settleFrames (90); generous margin.
+                        const int reselectedFrame = waitFor(150, [&] { return identifiedVelocityFn() != nullptr; });
+                        if (reselectedFrame < 0) {
+                            printf("[testhost]   FAIL - velocity never reidentified after the resize (reopened at "
+                                   "frame %d)\n",
+                                   reopenFrame);
+                            resizeTestPassed = false;
+                        } else {
+                            printf("[testhost]   PASS - reopened at frame %d, search recovered at frame %d\n",
+                                   reopenFrame, reselectedFrame);
+                        }
+                    }
+                }
+                printf(
+                    "[testhost] test 1 (resize triggers reidentification): %s\n", resizeTestPassed ? "PASS" : "FAIL");
+
+                // ---- Test 2: a depth reallocation must produce a depth
+                // answer again afterward, not get stuck AMBIGUOUS or empty.
+                printf("[testhost] test 2: forcing scene depth to move to a different resource...\n");
+                if (forceReopenDepth == nullptr) {
+                    printf("[testhost]   FAIL - mv_hook.dll does not export MvForceReopenDepth\n");
+                    depthReopenRecoveryPassed = false;
+                } else {
+                    void* before = identifiedDepthFn();
+                    // Simulate the engine reallocating scene depth: stop
+                    // feeding edges to the resource currently selected, and
+                    // start feeding CustomDepth (depth look-alike 4 -
+                    // structurally IDENTICAL to SceneDepth, previously
+                    // excluded only by taking fewer edges/frame)
+                    // SceneDepth's own edge rate instead. Usage rate, not
+                    // structure, is what told them apart in the first place
+                    // (see the depthLineUp comment).
+                    depthLineUp[0].edgesPerFrame = 0; // SceneDepth goes silent
+                    depthLineUp[4].edgesPerFrame = 4; // CustomDepth takes over
+                    forceReopenDepth();
+
+                    const int nullFrame = waitFor(10, [&] { return identifiedDepthFn() == nullptr; });
+                    if (nullFrame < 0) {
+                        printf("[testhost]   FAIL - depth was never observed null after the forced reopen\n");
+                        depthReopenRecoveryPassed = false;
+                    } else {
+                        // depth's post-reopen window needs at least one
+                        // empty-survivors retry cycle (2x settleFrames =
+                        // 120) before CustomDepth's freshly-accumulated
+                        // edges clear the behaviour gate - generous margin.
+                        const int recoveredFrame = waitFor(300, [&] { return identifiedDepthFn() != nullptr; });
+                        void* after = identifiedDepthFn();
+                        if (recoveredFrame < 0) {
+                            printf("[testhost]   FAIL - depth never produced an answer again after the reopen\n");
+                            depthReopenRecoveryPassed = false;
+                        } else if (after == before) {
+                            printf("[testhost]   FAIL - depth re-selected the OLD (now-silent) resource, not the "
+                                   "one actually taking the edge now\n");
+                            depthReopenRecoveryPassed = false;
+                        } else if (after == static_cast<void*>(depthLineUp[4].resource.Get())) {
+                            printf("[testhost]   PASS - depth recovered onto the resource that took over the edge "
+                                   "(CustomDepth) - not stuck AMBIGUOUS or empty\n");
+                        } else {
+                            printf("[testhost]   FAIL - depth selected an unexpected resource %p\n", after);
+                            depthReopenRecoveryPassed = false;
+                        }
+                    }
+                }
+                printf(
+                    "[testhost] test 2 (depth reallocation recovers): %s\n",
+                    depthReopenRecoveryPassed ? "PASS" : "FAIL");
+            }
+        }
+    }
+
     if (hookModule != nullptr) {
         // Drain the writer thread before counting dump files below - it
         // finishes writes on a background thread, so counting without this
@@ -949,6 +1187,38 @@ int main(int argc, char** argv) {
             flushCapture();
         } else {
             printf("[testhost] WARNING: no MvFlushCapture export; dump file counts below may be racy\n");
+        }
+    }
+
+    // ---- Test 3 (continued): the sealed manifest is the source of truth
+    // for why the burst ended (see the MvForceReopenVelocity call above).
+    // No JSON library in this tree for a one-field check - a substring
+    // search on the (small, machine-written) file is sufficient and matches
+    // how the rest of this harness avoids new dependencies. ----------------
+    if (phase8Tests && hookModule != nullptr && midBurstReopenEndedBurst) {
+        char dumpDirBuf[MAX_PATH]{};
+        if (GetEnvironmentVariableA("MV_DUMP_DIR", dumpDirBuf, MAX_PATH) == 0) {
+            printf("[testhost] test 3 (mid-burst reopen ends the burst): FAIL - MV_DUMP_DIR not set\n");
+            midBurstReopenEndedBurst = false;
+        } else {
+            std::string dir = dumpDirBuf;
+            if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') {
+                dir += '\\';
+            }
+            std::ifstream manifestFile(dir + "manifest.json");
+            const std::string content(
+                (std::istreambuf_iterator<char>(manifestFile)), std::istreambuf_iterator<char>());
+            if (content.empty()) {
+                printf("[testhost] test 3 (mid-burst reopen ends the burst): FAIL - manifest.json missing or empty\n");
+                midBurstReopenEndedBurst = false;
+            } else if (content.find("\"surface_reopened\"") != std::string::npos) {
+                printf("[testhost] test 3 (mid-burst reopen ends the burst): PASS - "
+                       "burst.ended_because=surface_reopened\n");
+            } else {
+                printf("[testhost] test 3 (mid-burst reopen ends the burst): FAIL - burst did not end with "
+                       "surface_reopened; check manifest.json's burst.ended_because\n");
+                midBurstReopenEndedBurst = false;
+            }
         }
     }
 
@@ -1044,11 +1314,24 @@ int main(int argc, char** argv) {
                                                         : "FAIL - depth identification");
     printf("[testhost] %s\n", dumpContentsPassed ? "PASS - dump contents"
                                                  : "FAIL - dump contents");
+    if (phase8Tests) {
+        printf("[testhost] %s\n", resizeTestPassed ? "PASS - Phase 8 test 1 (resize stops capture until reidentified)"
+                                                     : "FAIL - Phase 8 test 1 (resize stops capture until reidentified)");
+        printf("[testhost] %s\n",
+               depthReopenRecoveryPassed ? "PASS - Phase 8 test 2 (depth reallocation recovers)"
+                                          : "FAIL - Phase 8 test 2 (depth reallocation recovers)");
+        printf("[testhost] %s\n",
+               midBurstReopenEndedBurst ? "PASS - Phase 8 test 3 (mid-burst reopen ends the burst)"
+                                        : "FAIL - Phase 8 test 3 (mid-burst reopen ends the burst)");
+    }
 
     CloseHandle(fenceEvent);
     DestroyWindow(hwnd);
     const int exitCode =
-        (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed) ? 0 : 1;
+        (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed &&
+         (!phase8Tests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
+            ? 0
+            : 1;
     printf("[testhost] exiting with code %d\n", exitCode);
     fflush(stdout);
     return exitCode;

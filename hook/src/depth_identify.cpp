@@ -1,8 +1,6 @@
 #include "depth_identify.h"
 
-#include "velocity_identify.h"
-
-#include <mutex>
+#include "surface_registry.h"
 
 namespace mv
 {
@@ -52,7 +50,7 @@ const SurfaceSpec kDepthSpec = []
     spec.minWidth = 0;  // no size floor of its own - the extent test below is exact
     spec.minHeight = 0;
     spec.maxBackBufferMultiple = 0; // unbounded - bounded by the exact extent test instead
-    spec.extentFrom = "velocity";   // functional half: SetExtentSource, wired in EnsureExtentSourceWired below
+    spec.extentFrom = "velocity";   // resolved and wired by SurfaceRegistry::Configure()
 
     spec.trigger = TriggerEdge::DepthWriteToReadable;
     // How long to watch before deciding, measured from when velocity
@@ -81,60 +79,22 @@ const SurfaceSpec kDepthSpec = []
     spec.rivalMaxAdoptions = 0;
     spec.rivalMaxReports = 0;
 
-    spec.usesSharedCandidateSet = false; // depth keeps its own local accepted-desc; see Validate()
-    spec.reopenClearsShortlist = false;  // reopen keeps the shortlist, only resets counters
+    spec.reopenClearsShortlist = false; // reopen keeps the shortlist, only resets counters
     return spec;
 }();
 
 SurfaceIdentifier g_depth(kDepthSpec);
 
-std::once_flag g_extentSourceWired;
-
-void EnsureExtentSourceWired()
-{
-    // Deferred rather than done at static-init time: global initialisation
-    // order across translation units (this file's g_depth vs velocity_
-    // identify.cpp's g_velocity) is unspecified, so this cannot safely run
-    // as part of either global's construction.
-    std::call_once(g_extentSourceWired, [] { g_depth.SetExtentSource(&VelocityIdentifier()); });
-}
-
 } // namespace
 
-void NoteResourceDescForDepth(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc)
+void RegisterDepthIdentifier(SurfaceRegistry& registry)
 {
-    g_depth.OnResourceDesc(resource, desc);
-}
-
-void NoteDepthTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter)
-{
-    g_depth.OnTransition(resource, frame, stateBefore, stateAfter);
-}
-
-void OnFrameForDepthIdentification(uint64_t frame)
-{
-    EnsureExtentSourceWired();
-    g_depth.OnFrame(frame);
-}
-
-void ReopenDepthIdentification(const char* reason)
-{
-    g_depth.Reopen(ReopenReason::DependencyReopened, reason);
+    registry.Register(&g_depth);
 }
 
 ID3D12Resource* IdentifiedDepthResource()
 {
     return g_depth.Selected();
-}
-
-bool IsDepthCandidate(ID3D12Resource* resource)
-{
-    return resource != nullptr && resource == g_depth.Selected();
-}
-
-bool ValidateDepthCandidate(ID3D12Resource* resource)
-{
-    return g_depth.Validate(resource);
 }
 
 } // namespace mv

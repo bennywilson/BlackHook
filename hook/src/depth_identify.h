@@ -15,38 +15,27 @@
 // since the extent is already known once velocity identification has run.
 //
 // Not an independent identification: it's linked to velocity's extent, so a
-// mis-identified velocity buffer would mis-identify depth the same way.
+// mis-identified velocity buffer would mis-identify depth the same way. As
+// of docs/REFACTOR_PLAN.md Phase 8, that link (spec.extentFrom == "velocity")
+// is resolved and wired by SurfaceRegistry::Configure(), not by this file
+// reaching into velocity_identify.h directly - depth_identify.cpp no longer
+// includes it at all.
 //
-// As of docs/REFACTOR_PLAN.md Phase 7, depth is a pure SurfaceIdentifier
-// (see surface_identify.h) configured by data - this header's declarations
-// are unchanged so nothing outside depth_identify.cpp needed to change, but
-// depth_identify.cpp itself is now a thin wrapper, not a second copy of the
-// identification logic.
+// As of Phase 7, depth is a pure SurfaceIdentifier (see surface_identify.h)
+// configured by data - this header's declarations are unchanged so nothing
+// outside depth_identify.cpp needed to change, but depth_identify.cpp itself
+// is now a thin wrapper, not a second copy of the identification logic.
 
 namespace mv
 {
 
-// Every resource the barrier hook walks past, once per resource.
-void NoteResourceDescForDepth(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc);
+class SurfaceRegistry;
 
-// Every transition barrier, for the behaviour profile.
-void NoteDepthTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter);
-
-// Called once per presented frame, after velocity identification has run.
-void OnFrameForDepthIdentification(uint64_t frame);
-
-// Throws away the answer and starts again.
-void ReopenDepthIdentification(const char* reason);
+// Called once, from InstallD3D12Hooks, before hooks go live.
+void RegisterDepthIdentifier(SurfaceRegistry& registry);
 
 // The identified resource, or nullptr while the search is running,
 // ambiguous, or waiting for velocity. Exported so the harness can read it.
 ID3D12Resource* IdentifiedDepthResource();
-
-// Fast path for the barrier hook: is this the resource we selected?
-bool IsDepthCandidate(ID3D12Resource* resource);
-
-// Confirms the selected resource still has the descriptor it was accepted
-// with, before recording a barrier/copy sized from its footprints.
-bool ValidateDepthCandidate(ID3D12Resource* resource);
 
 } // namespace mv

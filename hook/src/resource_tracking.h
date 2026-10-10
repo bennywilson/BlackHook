@@ -37,13 +37,14 @@ ID3D12Resource* GetResourceForRenderTargetView(SIZE_T descriptorHandle);
 // one: this set holds bare pointers and no references, so if a resource is
 // released and a later allocation reuses its address, the new resource is
 // treated as already-seen and never identified. For candidates that hole is
-// closed (they are ref-held, below); for the ~8000 resources the identify pass
-// merely walks past, it is not. The failure mode is missing the velocity
-// buffer entirely rather than acting on the wrong one - loud, not silent -
-// and in practice identification completes within the first few seconds, well
-// before the transient allocator has recycled much. Closing it properly means
-// re-running GetDesc() on every barrier, which is exactly the unbounded
-// exposure g_identifyBudget exists to prevent.
+// closed (they are ref-held, in SurfaceIdentifier's own candidate set); for
+// the ~8000 resources the identify pass merely walks past, it is not. The
+// failure mode is missing the velocity buffer entirely rather than acting on
+// the wrong one - loud, not silent - and in practice identification
+// completes within the first few seconds, well before the transient
+// allocator has recycled much. Closing it properly means re-running
+// GetDesc() on every barrier, which is exactly the unbounded exposure
+// g_identifyBudget exists to prevent.
 bool TryMarkResourceSeen(ID3D12Resource* resource);
 
 // Takes one unit of the identification budget, returning false once it is
@@ -67,39 +68,15 @@ bool TryTakeIdentifyBudget();
 // Only used when identification is reopened: the set exists to make GetDesc() a
 // once-per-resource cost, so without clearing it a second search would walk past
 // every resource in the process in silence and find nothing. Costs one more
-// GetDesc() per live resource, once.
+// GetDesc() per live resource, once. As of docs/REFACTOR_PLAN.md Phase 8, called
+// exactly once per SurfaceRegistry::ReopenCascade rather than once per
+// identifier that happens to clear its own shortlist (finding 1.7) - see
+// surface_registry.cpp.
 //
 // The budget refill is not decoration. Reopening after the budget had run out
 // was a guaranteed no-op - the seen set was cleared and then every resource was
 // rejected one layer down for want of budget, so the search would have run
 // forever and found nothing, loudly reporting that it had reopened.
 void ForgetAllResourcesSeen();
-
-// A resource that matched the target format/resolution signature. Unlike the
-// "seen" set, candidates are held BY REFERENCE together with the desc they
-// were accepted with - see resource_tracking.cpp for why that matters for a
-// transient placed resource.
-void MarkAsCandidate(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc);
-bool IsCandidate(ID3D12Resource* resource);
-
-// Re-checks that a candidate still has the desc it was accepted with, and
-// drops it if not. Call before doing anything that depends on its layout or
-// its assumed resource state (recording a barrier, sizing a copy). Returns
-// false if the candidate is gone or no longer matches.
-bool ValidateCandidate(ID3D12Resource* resource);
-
-// Drops every candidate.
-//
-// Must be called by anything that reopens a search, because THIS set - not the
-// identifier's own g_identified pointer - is what the barrier hook gates
-// capture on (see IsCandidate in d3d12_hook.cpp). Leaving entries in it means
-// "the search reopened" does not mean "we stopped capturing", which is exactly
-// what happened on the back-buffer-resize path: UE abandons the velocity
-// texture rather than resizing it, so the abandoned resource's own descriptor
-// stays valid, ValidateCandidate keeps passing, and copies kept being recorded
-// from a texture the engine was no longer rendering into - for the whole
-// duration of a search that logged "Nothing is captured until a new decision is
-// reached".
-void ForgetAllCandidates();
 
 } // namespace mv

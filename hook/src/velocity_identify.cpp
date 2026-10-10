@@ -1,8 +1,8 @@
 #include "velocity_identify.h"
 
 #include "logging.h"
-#include "resource_tracking.h"
 #include "surface_identify.h"
+#include "surface_registry.h"
 
 #include <windows.h>
 
@@ -16,9 +16,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace mv
 {
-
-// Defined at the bottom of this file; called from OnFrameForIdentification.
-void DumpBarrierProfiles();
 
 namespace
 {
@@ -35,11 +32,6 @@ constexpr FormatCandidate kVelocityFormats[] = {
     {DXGI_FORMAT_R16G16B16A16_UINT, 1, "R16G16B16A16_UINT (PF_R16G16B16A16_UINT, Android GLES path)"},
     {DXGI_FORMAT_R16G16_UINT, 1, "R16G16_UINT (PF_R16G16_UINT, Android GLES path)"},
 };
-
-// The survey dump (see README, "identifying by behaviour") stays on its
-// original schedule: late enough that every resource has had thousands of
-// frames to show its pattern.
-constexpr uint64_t kProfileDumpFrame = 2000;
 
 const SurfaceSpec kVelocitySpec = []
 {
@@ -107,8 +99,7 @@ const SurfaceSpec kVelocitySpec = []
     // tell whether a rival exists.
     spec.rivalMaxReports = 40;
 
-    spec.usesSharedCandidateSet = true; // participates in resource_tracking.h's process-wide set
-    spec.reopenClearsShortlist = true;  // reopen re-scans everything
+    spec.reopenClearsShortlist = true; // reopen re-scans everything
     return spec;
 }();
 
@@ -141,7 +132,7 @@ public:
         const D3D12_RESOURCE_DESC desc = resource->GetDesc();
 
         // Judged by the SAME structural filter identification uses.
-        if (!StructurallyPlausibleForRival(desc))
+        if (!StructurallyPlausibleForRival(resource, desc))
         {
             return false;
         }
@@ -276,38 +267,9 @@ VelocitySurfaceIdentifier g_velocity(kVelocitySpec);
 
 } // namespace
 
-bool NoteBackBufferSize(uint64_t width, uint32_t height)
+void RegisterVelocityIdentifier(SurfaceRegistry& registry)
 {
-    return g_velocity.NoteBackBufferSize(width, height);
-}
-
-void NoteResourceDesc(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc)
-{
-    g_velocity.OnResourceDesc(resource, desc);
-}
-
-void NoteTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter)
-{
-    g_velocity.OnTransition(resource, frame, stateBefore, stateAfter);
-}
-
-void NoteUavBarrier(ID3D12Resource* resource)
-{
-    g_velocity.OnUavBarrier(resource);
-}
-
-void OnFrameForIdentification(uint64_t frame)
-{
-    g_velocity.OnFrame(frame);
-    if (frame == kProfileDumpFrame)
-    {
-        DumpBarrierProfiles();
-    }
-}
-
-void ReopenIdentification(const char* reason)
-{
-    g_velocity.Reopen(ReopenReason::DescriptorChanged, reason);
+    registry.Register(&g_velocity);
 }
 
 bool VelocityPassIsSilent(uint64_t frame, uint64_t* framesSilent)
@@ -318,31 +280,6 @@ bool VelocityPassIsSilent(uint64_t frame, uint64_t* framesSilent)
 ID3D12Resource* IdentifiedVelocityResource()
 {
     return g_velocity.Selected();
-}
-
-uint64_t FramesSinceVelocityEdge(uint64_t frame)
-{
-    return g_velocity.FramesSinceEdge(frame);
-}
-
-bool NoteRivalVelocityEdge(ID3D12Resource* resource, uint64_t frame)
-{
-    return g_velocity.OnUnmatchedEdge(resource, frame);
-}
-
-bool IdentifiedVelocityExtent(uint64_t* width, uint32_t* height)
-{
-    return g_velocity.Extent(width, height);
-}
-
-void DumpBarrierProfiles()
-{
-    g_velocity.DumpBarrierProfiles();
-}
-
-const SurfaceIdentifier& VelocityIdentifier()
-{
-    return g_velocity;
 }
 
 } // namespace mv

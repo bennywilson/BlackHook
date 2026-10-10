@@ -8,6 +8,7 @@
 #include "depth_identify.h"
 #include "logging.h"
 #include "overlay.h"
+#include "surface_registry.h"
 #include "velocity_identify.h"
 
 // MvIdentified*Resource() functions are used by the test harness (testhost/)
@@ -26,6 +27,38 @@ extern "C" __declspec(dllexport) void* MvIdentifiedDepthResource() {
 extern "C" __declspec(dllexport) void MvFlushCapture() {
     mv::Log("mv_hook: MvFlushCapture - draining writer queue");
     mv::ShutdownCapture(/*processExiting=*/false);
+}
+
+// Test-only trigger for docs/REFACTOR_PLAN.md Phase 8's depth-reallocation
+// behaviour test: forces depth's own standalone reopen cascade, the same one
+// ValidateCandidate failing on the selected depth resource would trigger in
+// the real hook. A real D3D12 resource's descriptor is immutable once
+// created, so testhost cannot organically reproduce "the selected resource's
+// descriptor changed underneath us" - this reaches the identical code path
+// (SurfaceRegistry::ReopenCascade("depth", ...)) directly instead, so the
+// test verifies the actual recovery machinery rather than a synthetic stand-
+// in for it.
+extern "C" __declspec(dllexport) void MvForceReopenDepth() {
+    mv::GetSurfaceRegistry().ReopenCascade(
+        "depth", mv::ReopenReason::DescriptorChanged, "MvForceReopenDepth (test-only trigger)");
+}
+
+// Test-only trigger for docs/REFACTOR_PLAN.md Phase 8's mid-burst-reopen
+// behaviour test: reopens velocity directly, without touching the swapchain.
+// A real swapchain resize also changes the back buffer's own descriptor,
+// which the PRE-EXISTING (not Phase 8) DumpLayoutAccepts(color, ...) check
+// in capture.cpp usually notices - and ends the burst via BurstEndReason::
+// LayoutChanged - before velocity's own resize poll (every 30 frames) even
+// runs, since that check runs on every Present with no poll interval. That
+// makes a real resize an unreliable way to exercise SurfaceRegistry's OWN
+// mid-burst-reopen path (NotifySurfaceReopened -> BurstEndReason::
+// SurfaceReopened, finding 1.14) in isolation, since the older mechanism
+// usually wins the race. This reaches the identical reopen cascade a real
+// descriptor mismatch would trigger, with nothing about the back buffer
+// disturbed, so the two mechanisms can be told apart.
+extern "C" __declspec(dllexport) void MvForceReopenVelocity() {
+    mv::GetSurfaceRegistry().ReopenCascade(
+        "velocity", mv::ReopenReason::DescriptorChanged, "MvForceReopenVelocity (test-only trigger)");
 }
 
 namespace {

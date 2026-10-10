@@ -46,6 +46,13 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
 // any earlier captures whose GPU work has completed.
 void OnPresent(IDXGISwapChain* swapChain);
 
+// Called by d3d12_hook.cpp whenever SurfaceRegistry::OnBarrierTransition or
+// ::NoteBackBufferSize reports that `surfaceName`'s search reopened. Ends
+// the current burst (docs/REFACTOR_PLAN.md finding 1.14) if that surface is
+// required for it and a burst is in progress; a no-op otherwise. `surfaceName`
+// matches a SurfaceSpec::name - "velocity" or "depth" today.
+void NotifySurfaceReopened(const char* surfaceName);
+
 // Current present index, used to pair velocity and colour within one frame.
 void SetFrameIndex(unsigned long long frameIndex);
 
