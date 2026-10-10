@@ -53,10 +53,11 @@
     because a wrong value here silently corrupts V.z and bHasPixelAnimation.
 
 .PARAMETER DumpDir
-    Where captures go. Defaults to a fresh timestamped directory under %TEMP%.
+    Where captures go. Defaults to a fresh timestamped directory under the
+    repo's gitignored temp\dumps\.
 
 .PARAMETER Hook
-    Path to mv_hook.dll. Defaults to the repo's Release build.
+    Path to mv_hook.dll. Defaults to the repo's Release build in temp\build\.
 
 .PARAMETER RenderProcess
     Process-name pattern for the real renderer. Defaults to *-Win64-Shipping,
@@ -72,10 +73,10 @@
     rather than pretending they took effect.
 
 .EXAMPLE
-    .\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreyja.exe"
+    .\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe
 
 .EXAMPLE
-    .\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreyja.exe" -DumpDir D:\mv_captures\run7 -AutoCapture
+    .\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe -DumpDir D:\mv_captures\run7 -AutoCapture
 #>
 [CmdletBinding()]
 param(
@@ -116,19 +117,32 @@ function Fail        { param([string]$m) Write-Host "ERROR: $m" -ForegroundColor
 # ------------------------------------------------------------- locate bits --
 
 $repoRoot   = $PSScriptRoot
-$injectorEx = Join-Path $repoRoot 'build\injector\Release\mv_injector.exe'
+# Everything generated lives under the gitignored temp/ (see tools/paths.py).
+$tempRoot   = Join-Path $repoRoot 'temp'
+$buildDir   = Join-Path $tempRoot 'build'
+
+# Visual Studio generator puts binaries under Release\; a single-config
+# generator (Ninja, as VS Code's CMake extension uses) does not.
+function Find-Built { param([string]$SubDir, [string]$Leaf)
+    foreach ($candidate in @("$SubDir\Release\$Leaf", "$SubDir\$Leaf")) {
+        $p = Join-Path $buildDir $candidate
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return Join-Path $buildDir "$SubDir\Release\$Leaf"
+}
+
+$buildHint  = "       Build it first:  cmake -B temp/build -S . ; cmake --build temp/build --config Release --target mv_hook mv_injector"
+$injectorEx = Find-Built 'injector' 'mv_injector.exe'
 
 if (-not $Hook) {
-    $Hook = Join-Path $repoRoot 'build\hook\Release\mv_hook.dll'
+    $Hook = Find-Built 'hook' 'mv_hook.dll'
 }
 
 if (-not (Test-Path -LiteralPath $injectorEx)) {
-    Fail ("mv_injector.exe not found at $injectorEx`n" +
-          "       Build it first:  cmake --build build --config Release --target mv_hook mv_injector")
+    Fail ("mv_injector.exe not found at $injectorEx`n" + $buildHint)
 }
 if (-not (Test-Path -LiteralPath $Hook)) {
-    Fail ("mv_hook.dll not found at $Hook`n" +
-          "       Build it first:  cmake --build build --config Release --target mv_hook mv_injector")
+    Fail ("mv_hook.dll not found at $Hook`n" + $buildHint)
 }
 
 # The injector writes this exact path into the target with WriteProcessMemory
@@ -265,7 +279,7 @@ if (-not $AttachOnly) {
     if (-not $DumpDir) {
         $stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
         $slug    = [System.IO.Path]::GetFileNameWithoutExtension($gameLeaf).ToLowerInvariant()
-        $DumpDir = Join-Path $env:TEMP "mv_dump_${slug}_$stamp"
+        $DumpDir = Join-Path $tempRoot "dumps\${slug}_$stamp"
     }
 
     if (Test-Path -LiteralPath $DumpDir) {
@@ -424,7 +438,7 @@ Write-Ok 'Injection reported success.'
 
 # -------------------------------------------------- confirm from the log ----
 
-$logPath = Join-Path $env:TEMP 'mv_hook.log'
+$logPath = Join-Path $tempRoot 'logs\mv_hook.log'
 Write-Step 'Confirming from the hook log'
 Write-Note $logPath
 

@@ -1,9 +1,12 @@
 #include "logging.h"
 
+#include "build_info.h"
+
 #include <windows.h>
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -14,11 +17,23 @@ namespace mv
 namespace
 {
 
-std::string TempDir()
+// Resolved once: the configured root if it exists or can be created, else
+// %TEMP%. Every later OutputDir() call is a single CreateDirectoryA.
+const std::string& OutputRoot()
 {
-    char tempPath[MAX_PATH]{};
-    GetTempPathA(MAX_PATH, tempPath);
-    return std::string(tempPath);
+    static const std::string root = []
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(kOutputRoot, ec);
+        if (std::filesystem::is_directory(kOutputRoot, ec))
+        {
+            return std::string(kOutputRoot) + "/";
+        }
+        char tempPath[MAX_PATH]{};
+        GetTempPathA(MAX_PATH, tempPath);
+        return std::string(tempPath);
+    }();
+    return root;
 }
 
 std::mutex& LogMutex()
@@ -62,13 +77,20 @@ NamedFile* FileFor(const std::string& name)
     if (it == files.end())
     {
         NamedFile nf;
-        nf.stream.open(TempDir() + "mv_" + name + ".log", std::ios::app);
+        nf.stream.open(OutputDir("logs") + "mv_" + name + ".log", std::ios::app);
         it = files.emplace(name, std::move(nf)).first;
     }
     return it->second.stream.is_open() ? &it->second : nullptr;
 }
 
 } // namespace
+
+std::string OutputDir(const std::string& subdir)
+{
+    std::string dir = OutputRoot() + subdir + "/";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir;
+}
 
 // Low-volume log, flushed per-line
 void Log(const std::string& message)

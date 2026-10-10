@@ -13,4 +13,9 @@ void LogTo(const std::string& name, const std::string& message);
 
 void FlushLogs();
 
+// <repo>/temp/<subdir>/, created if missing, with a trailing separator. Falls
+// back to %TEMP%\<subdir>\ when the repo's temp/ can't be created - e.g. a DLL
+// copied to a machine that doesn't have this checkout.
+std::string OutputDir(const std::string& subdir);
+
 } // namespace mv

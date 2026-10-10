@@ -40,6 +40,7 @@ import numpy as np
 
 import blockmatch
 import mvtools
+import paths
 
 try:
     import cv2
@@ -59,7 +60,7 @@ LEGACY_UV_PER_UNIT_Y = +0.1991
 # fails quietly is worse than no reference.
 MIN_SCORE = 0.70
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 dump = mvtools.load_dump(dump_dir)
 meta = dump.meta
 cw, ch = dump.surface("color").width, dump.surface("color").height

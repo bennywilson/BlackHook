@@ -900,7 +900,7 @@ int main(int argc, char** argv) {
                        expected != nullptr ? static_cast<void*>(expected->resource.Get()) : nullptr,
                        expected != nullptr ? expected->name : "?", picked);
                 printf("[testhost]        (nullptr means identification refused or never concluded - "
-                       "check %%TEMP%%\\mv_hook.log for the 'identify:' lines)\n");
+                       "check temp\\logs\\mv_hook.log for the 'identify:' lines)\n");
                 identificationPassed = false;
             }
         }

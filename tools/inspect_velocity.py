@@ -8,8 +8,9 @@ import os
 import sys
 import numpy as np
 import mvtools
+import paths
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 dump = mvtools.load_dump(dump_dir)
 meta = dump.meta
 print("meta:", meta)

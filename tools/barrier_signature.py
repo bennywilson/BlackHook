@@ -11,7 +11,7 @@ resources that had already passed the descriptor filter, so it could confirm
 
 The hook now profiles every resource the identify pass walks past (see
 DumpBarrierProfiles in hook/src/d3d12_hook.cpp) and writes them to
-%TEMP%\\mv_barrier_profile.log. This reads that file and asks the question the
+temp\\logs\\mv_barrier_profile.log. This reads that file and asks the question the
 other way round: of all the resources in the frame, how many exhibit the
 velocity buffer's signature?
 
@@ -28,7 +28,9 @@ import os
 import sys
 from collections import namedtuple
 
-path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_barrier_profile.log")
+import paths
+
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(paths.LOGS, "mv_barrier_profile.log")
 if not os.path.exists(path):
     sys.exit(f"{path} not found - run the game with the hook attached for at least 2000 frames "
              f"(the survey dumps itself once, automatically, at that point)")

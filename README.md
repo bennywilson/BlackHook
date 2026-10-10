@@ -19,31 +19,41 @@ Output of verification tests can be found in `results/` (see below for more)
 ## Build and run
 
 ```
-cmake -B build -S .
-cmake --build build --config Release --target mv_hook mv_injector mv_testhost
+cmake -B temp/build -S .
+cmake --build temp/build --config Release --target mv_hook mv_injector mv_testhost
 ```
+
+Everything the repo generates goes under the gitignored `temp/`:
+`temp/build/`, `temp/logs/` (`mv_hook.log`, `mv_barrier_profile.log`),
+`temp/dumps/` (captures) and `temp/out/` (videos, previews). The hook
+learns this path at CMake configure time; `MV_DUMP_DIR` still overrides the
+dump location. Layout is in `tools/paths.py`.
 
 ```powershell
-.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreya.exe"
-.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreya.exe" -DumpDir D:\mv_captures\run7
+.\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe
+.\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe -DumpDir temp\dumps\run7
 ```
 
-`Valfreya.exe` is the launcher — pass that path in. The script itself waits
+`testgames/` is gitignored; put a local copy of the game there.
+`Valfreyja.exe` is the launcher — pass that path in. The script itself waits
 for and injects into the real renderer process it spawns,
 `Skyrunner-Win64-Shipping.exe`, the same way it does for Oxi's own
 `*-Win64-Shipping.exe` child.
 
-With the game running, **F8** captures a 60-frame burst to `%TEMP%\mv_dump\`
-(or `MV_DUMP_DIR`). Wait for `capture: write queue drained` in
-`%TEMP%\mv_hook.log` before quitting — `capture: burst recorded` does not mean
-flushed. Then run the offline validation:
+With the game running, **F8** captures a 60-frame burst to
+`temp\dumps\mv_dump\` (or `MV_DUMP_DIR`; the capture script sets a fresh
+`temp\dumps\<game>_<stamp>\`). Wait for `capture: write queue drained` in
+`temp\logs\mv_hook.log` before quitting — `capture: burst recorded` does not
+mean flushed. Then run the offline validation:
 
 ```
 cd tools
-python run_validation.py %TEMP%\mv_dump <title>   # everything -> results/validation_<title>.txt
-python make_video.py %TEMP%\mv_dump motion_field.mp4
-python barrier_signature.py                        # needs a >=2000-frame session
+python run_validation.py <dump_dir> <title>   # everything -> results/validation_<title>.txt
+python make_video.py <dump_dir>               # -> temp/out/motion_field.mp4
+python barrier_signature.py                   # needs a >=2000-frame session
 ```
+
+Each tool defaults to `temp\dumps\mv_dump` when no dump dir is given.
 
 To exercise the capture path under the D3D12 debug layer + GPU-based
 validation instead of a real game (requires the Windows **Graphics Tools**
@@ -51,8 +61,8 @@ optional feature):
 
 ```
 set MV_AUTOCAPTURE=1
-set MV_DUMP_DIR=%TEMP%\mv_dump_testhost
-build\testhost\Release\mv_testhost.exe --hook <abs path>\build\hook\Release\mv_hook.dll --frames 240
+set MV_DUMP_DIR=%CD%\temp\dumps\testhost
+temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
 ```
 
 ## Results
@@ -80,7 +90,7 @@ composited over the frame.
 To check any of these yourself:
 
 ```
-build\testhost\Release\mv_testhost.exe --hook <path>\mv_hook.dll --frames 240
+temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
 cd tools && python run_validation.py <dump_dir> <title>   # writes results/validation_<title>.txt
 ```
 

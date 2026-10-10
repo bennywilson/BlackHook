@@ -18,4 +18,7 @@ inline constexpr const char* kBuildGitCommit = "@MV_GIT_COMMIT@";
 // made - when THIS BINARY was configured, which is what "was this DLL built
 // from what I think it was built from" actually needs.
 inline constexpr const char* kBuildConfiguredUtc = "@MV_BUILD_UTC@";
+// The repo's temp/ directory, forward slashes. Logs go to <root>/logs/, the
+// default dump to <root>/dumps/mv_dump/. See OutputDir() in logging.h.
+inline constexpr const char* kOutputRoot = "@MV_OUTPUT_ROOT@";
 }

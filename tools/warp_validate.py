@@ -38,8 +38,9 @@ import cv2
 import numpy as np
 import blockmatch
 import mvtools
+import paths
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 dump = mvtools.load_dump(dump_dir)
 meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
@@ -279,7 +280,7 @@ for label, img in panels:
     cv2.putText(img, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
     imgs.append(img)
 montage = np.hstack(imgs)
-out_path = sys.argv[2] if len(sys.argv) > 2 else "warp_validation.png"
+out_path = sys.argv[2] if len(sys.argv) > 2 else paths.out_path("warp_validation.png")
 # Clamp the figure width. At 1707x1067 a five-panel montage is 8535px wide and
 # 14MB, which is not a sensible thing to commit to a repository and is wider
 # than anything will ever display it. The panels stay legible at half that.

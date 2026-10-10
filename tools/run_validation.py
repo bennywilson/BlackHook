@@ -23,12 +23,14 @@ Omit it for the original results/validation.txt.
 import os
 import subprocess
 import sys
+
+import paths
 import time
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.normpath(os.path.join(TOOLS, "..", "results"))
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 tag = sys.argv[2] if len(sys.argv) > 2 else ""
 suffix = f"_{tag}" if tag else ""
 os.makedirs(RESULTS, exist_ok=True)

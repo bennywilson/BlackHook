@@ -42,8 +42,9 @@ import cv2
 import numpy as np
 import blockmatch
 import mvtools
+import paths
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
 dump = mvtools.load_dump(dump_dir)

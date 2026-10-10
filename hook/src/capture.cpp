@@ -514,11 +514,8 @@ std::string DumpDir()
         CreateDirectoryA(dir.c_str(), nullptr);
         return dir;
     }
-    char tempPath[MAX_PATH]{};
-    GetTempPathA(MAX_PATH, tempPath);
-    std::string dir = std::string(tempPath) + "mv_dump\\";
-    CreateDirectoryA(dir.c_str(), nullptr);
-    return dir;
+    OutputDir("dumps");
+    return OutputDir("dumps/mv_dump");
 }
 
 // MV_CAPTURE_DEPTH=0 disables the depth copy for a session - a bandwidth

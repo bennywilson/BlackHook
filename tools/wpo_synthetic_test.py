@@ -40,8 +40,9 @@ import sys
 import numpy as np
 
 import mvtools
+import paths
 
-dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("TEMP", "."), "wpo_test_out")
+dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(paths.DUMPS, "wpo_test_out")
 
 # Must match the PSMain lerp ranges in testhost/src/wpo_encode_test.cpp
 # exactly - this is a from-scratch re-derivation of what SHOULD have been

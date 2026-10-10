@@ -28,12 +28,13 @@ import cv2
 import numpy as np
 
 import mvtools
+import paths
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = [a for a in sys.argv[1:] if a.startswith("--")]
 
-dump_dir = args[0] if args else os.path.join(os.environ["TEMP"], "mv_dump")
-out_path = args[1] if len(args) > 1 else "motion_field.mp4"
+dump_dir = args[0] if args else paths.DEFAULT_DUMP
+out_path = args[1] if len(args) > 1 else paths.out_path("motion_field.mp4")
 preview_only = "--preview" in flags
 still_index = None
 still_only = "--still" in sys.argv
@@ -174,14 +175,14 @@ if still_only:
     if index not in indices:
         print(f"frame {index} is not in this dump; frames are {indices[0]}..{indices[-1]}")
         sys.exit(1)
-    still_path = out_path if out_path.lower().endswith(".png") else "motion_field_still.png"
+    still_path = out_path if out_path.lower().endswith(".png") else paths.out_path("motion_field_still.png")
     cv2.imwrite(still_path, render(index))
     print(f"wrote {still_path} (frame {index})")
     sys.exit(0)
 
 if preview_only:
     for index in indices[:2]:
-        cv2.imwrite(f"preview_{index:05d}.png", render(index))
+        cv2.imwrite(paths.out_path(f"preview_{index:05d}.png"), render(index))
     print("wrote preview PNGs")
     sys.exit(0)
 
