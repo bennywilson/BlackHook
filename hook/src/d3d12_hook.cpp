@@ -451,6 +451,13 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
             }
         }
     }
+
+    // Phase 10 diagnostic: what shares a ResourceBarrier call with what
+    // (plan sec 3.2 #1). One branch unless MV_SURFACES=normals.
+    if (registry.WantsBarrierBatches())
+    {
+        registry.OnBarrierBatch(barriers, numBarriers);
+    }
 }
 
 void STDMETHODCALLTYPE HookOMSetRenderTargets(

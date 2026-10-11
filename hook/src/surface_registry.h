@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 // SurfaceRegistry - docs/REFACTOR_PLAN.md sec 2.5, Phase 8.
@@ -109,6 +111,22 @@ public:
     // Called once per presented frame.
     void OnFrame(uint64_t frame) noexcept;
 
+    // DIAGNOSTIC (Phase 10, plan sec 3.2 open question #1): one whole
+    // ResourceBarrier call, after OnBarrierTransition has seen each entry.
+    // Records, for every normals-shortlisted resource taking its RT -> SRV
+    // edge, what ELSE changed state in the same call - velocity's selected
+    // edge, depth's selected edge, other RT -> SRV transitions (MRT siblings)
+    // - and logs the tallies at frames 600 and 2000. Decides nothing. A
+    // no-op unless the normals identifier is registered (MV_SURFACES=normals),
+    // so the default hot path pays one branch.
+    // Also feeds BarrierProfile::triggerEdgesSharingCallWith, the input of
+    // SignalId::SharesCallWithEdge, whenever a registered spec uses it.
+    bool WantsBarrierBatches() const noexcept
+    {
+        return normals_ != nullptr || sharedCallSignals_;
+    }
+    void OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept;
+
     // Forwards to every self-contained identifier (spec.extentFrom ==
     // nullptr) - a dependent inherits reopening through the cascade instead
     // of tracking the back buffer itself. Reopens (reaching the
@@ -155,6 +173,23 @@ private:
     KnownSourceSet knownSources_;
     std::atomic<bool> profileDumped_{false};
     ReopenObserver reopenObserver_ = nullptr;
+
+    // OnBarrierBatch's tallies - diagnostic only, see there.
+    struct BatchStats
+    {
+        uint64_t edges = 0;              // RT -> SRV edges counted (velocity and depth both selected)
+        uint64_t withVelocityEdge = 0;   // ...in a call that also held velocity's selected edge
+        uint64_t withDepthEdge = 0;      // ...in a call that also held depth's selected edge
+        uint64_t otherRtToSrv = 0;       // sum, over those edges, of OTHER RT -> SRV entries in the call
+        uint64_t maxOtherRtToSrv = 0;
+    };
+    void DumpBatchStats(uint64_t frame) noexcept;
+    SurfaceIdentifier* velocity_ = nullptr; // resolved at Configure(), for OnBarrierBatch
+    SurfaceIdentifier* depth_ = nullptr;
+    SurfaceIdentifier* normals_ = nullptr;
+    bool sharedCallSignals_ = false; // any registered spec uses SignalId::SharesCallWithEdge
+    std::mutex batchMutex_;
+    std::unordered_map<ID3D12Resource*, BatchStats> batchStats_;
 };
 
 // The one process-wide registry. Register()/Configure() are called once from

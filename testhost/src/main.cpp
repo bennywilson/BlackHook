@@ -144,6 +144,10 @@ constexpr float kVelocityClear[4] = {0.5f, 0.5f, 13696.0f / 65535.0f, 0.0f};
 // filter that is right for the wrong reason fails here rather than in a game.
 enum class Behaviour {
     Velocity,       // RT -> shader-resource -> RT. Exactly 2 events per frame.
+    // Velocity's shape, but the RT -> SRV edge goes out in ONE ResourceBarrier
+    // call together with scene depth's DEPTH_WRITE -> DEPTH_READ - how GBufferA
+    // was measured to become readable on Skyrunner (Phase 10).
+    ReadWithDepth,
     ComputeWritten, // goes through UNORDERED_ACCESS and takes a UAV barrier
     ExtraPass,      // the same RT <-> SRV cycle, but twice per frame
     // Measured on a third-party UE 5.2 title, and the reason --pipeline exists.
@@ -472,11 +476,23 @@ int main(int argc, char** argv) {
         // names. Only mutual exclusion keeps it out, and the HDR pool target
         // (R16G16B16A16_FLOAT, also a normals format) and the twin must lose
         // on evidence. Velocity's own gate rejects this one: no UAV flag.
-        LookAlike gbufferA{"GBufferA", "normals: R10G10B10A2, RT only, base-pass RT->SRV once a frame",
-                           DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::Velocity,
+        //
+        // Plus the decoy that made normals AMBIGUOUS on Skyrunner, twice: a
+        // second R10G10B10A2, RT-only target at scene extent (a post-process
+        // output), identical to GBufferA on every other signal. The one thing
+        // separating them - measured live - is that GBufferA becomes readable
+        // in the same ResourceBarrier call as scene depth and the decoy never
+        // does. So this pair passes only through SignalId::SharesCallWithEdge.
+        LookAlike gbufferA{"GBufferA", "normals: R10G10B10A2, RT only, readable in the same call as depth",
+                           DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::ReadWithDepth,
                            false};
         gbufferA.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         gbufferA.shouldBeNormals = true;
+        LookAlike postOutput{"post-process output", "normals decoy: same format/flags/extent, never batched with depth",
+                             DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::Velocity,
+                             false};
+        postOutput.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        lineUp.insert(lineUp.begin(), postOutput);
         lineUp.insert(lineUp.begin(), gbufferA);
     }
 
@@ -832,6 +848,25 @@ int main(int argc, char** argv) {
                     barrier(resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_RENDER_TARGET);
                     break;
+                case Behaviour::ReadWithDepth: {
+                    ID3D12Resource* sceneDepth = nullptr;
+                    for (const DepthLookAlike& d : depthLineUp) {
+                        if (d.shouldBeSelected) {
+                            sceneDepth = d.resource.Get();
+                        }
+                    }
+                    D3D12_RESOURCE_BARRIER pair[2]{};
+                    pair[0].Type = pair[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    pair[0].Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE};
+                    pair[1].Transition = {sceneDepth, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ};
+                    cmdList->ResourceBarrier(2, pair);
+                    barrier(resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    barrier(sceneDepth, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                    break;
+                }
                 case Behaviour::ComputeWritten: {
                     barrier(resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

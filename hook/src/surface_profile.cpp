@@ -100,6 +100,7 @@ constexpr Named<SignalId> kSignals[] = {
     {"never_enters_unordered_access", SignalId::NeverEntersUnorderedAccess},
     {"strict_two_events_per_frame", SignalId::StrictTwoEventsPerFrame},
     {"no_continuity_violations", SignalId::NoContinuityViolations},
+    {"shares_call_with_edge", SignalId::SharesCallWithEdge},
 };
 
 template <typename T, size_t N>
@@ -305,10 +306,20 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         const std::string signalName = sf.String("signal");
         signal.id = Lookup(kSignals, signalName, "signal", sf.Path("signal"));
         signal.weight = static_cast<int>(sf.Int("weight", -100, 100));
+        // Parameters exist only on shares_call_with_edge; on any other signal
+        // RejectUnknown() below refuses them, so they cannot be set and ignored.
+        if (signal.id == SignalId::SharesCallWithEdge)
+        {
+            signal.edge = Lookup(kTriggers, sf.String("edge"), "edge", sf.Path("edge"));
+            signal.minPercent = static_cast<int>(sf.Int("min_percent", 1, 100));
+        }
         sf.RejectUnknown();
         for (uint8_t j = 0; j < spec.signalCount; ++j)
         {
-            if (spec.signals[j].id == signal.id)
+            // Two shares_call_with_edge entries on different edges are
+            // distinct evidence; any other repeat is a mistake.
+            if (spec.signals[j].id == signal.id &&
+                (signal.id != SignalId::SharesCallWithEdge || spec.signals[j].edge == signal.edge))
             {
                 Fail(sf.Path("signal") + ": '" + signalName + "' is listed twice");
             }

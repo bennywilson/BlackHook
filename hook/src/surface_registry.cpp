@@ -3,6 +3,8 @@
 #include "logging.h"
 #include "resource_tracking.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -65,6 +67,17 @@ void SurfaceRegistry::Configure() noexcept
         e.identifier->SetProfileStore(&profileStore_);
         e.identifier->SetKnownSourceExclusion(&knownSources_);
         e.identifier->SetMutualExclusion(this);
+    }
+    velocity_ = Find("velocity");
+    depth_ = Find("depth");
+    normals_ = Find("normals");
+    for (const Entry& e : entries_)
+    {
+        const SurfaceSpec& spec = e.identifier->Spec();
+        for (uint8_t i = 0; i < spec.signalCount; ++i)
+        {
+            sharedCallSignals_ = sharedCallSignals_ || spec.signals[i].id == SignalId::SharesCallWithEdge;
+        }
     }
     // Second pass, after every identifier has a stable address in
     // entries_: resolve each spec.extentFrom name to the identifier it
@@ -185,6 +198,169 @@ void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
     {
         DumpBarrierProfiles();
     }
+    if (normals_ != nullptr && (frame == 600 || frame == kProfileDumpFrame))
+    {
+        DumpBatchStats(frame);
+    }
+}
+
+void SurfaceRegistry::OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept
+{
+    if (barriers == nullptr)
+    {
+        return;
+    }
+
+    // SignalId::SharesCallWithEdge's input, for every profiled resource: which
+    // of its trigger edges shared this call with another resource's trigger
+    // edge, by type. The two trigger types are disjoint (their before-states
+    // differ), so a transition is at most one of them.
+    if (sharedCallSignals_)
+    {
+        constexpr TriggerEdge kEdges[kTriggerEdgeCount] = {TriggerEdge::RenderTargetToShaderResource,
+                                                            TriggerEdge::DepthWriteToReadable};
+        uint64_t perEdge[kTriggerEdgeCount] = {};
+        for (UINT i = 0; i < count; ++i)
+        {
+            if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+            {
+                continue;
+            }
+            for (int e = 0; e < kTriggerEdgeCount; ++e)
+            {
+                perEdge[e] += IsTriggerEdgeFor(kEdges[e], static_cast<int>(barriers[i].Transition.StateBefore),
+                                               static_cast<int>(barriers[i].Transition.StateAfter))
+                                  ? 1
+                                  : 0;
+            }
+        }
+        if (perEdge[0] + perEdge[1] >= 2) // a lone edge shares its call with nothing
+        {
+            for (UINT i = 0; i < count; ++i)
+            {
+                if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+                {
+                    continue;
+                }
+                const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
+                for (int own = 0; own < kTriggerEdgeCount; ++own)
+                {
+                    if (!IsTriggerEdgeFor(kEdges[own], static_cast<int>(t.StateBefore), static_cast<int>(t.StateAfter)))
+                    {
+                        continue;
+                    }
+                    for (int other = 0; other < kTriggerEdgeCount; ++other)
+                    {
+                        if (perEdge[other] - (own == other ? 1 : 0) > 0)
+                        {
+                            profileStore_.RecordSharedCall(t.pResource, kEdges[own], kEdges[other]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (normals_ == nullptr || velocity_ == nullptr || depth_ == nullptr)
+    {
+        return;
+    }
+    // Only once both anchors are known: before that "not in the same call as
+    // velocity's edge" would just mean velocity was not selected yet.
+    ID3D12Resource* const velocity = velocity_->Selected();
+    ID3D12Resource* const depth = depth_->Selected();
+    if (velocity == nullptr || depth == nullptr)
+    {
+        return;
+    }
+
+    bool velocityEdge = false;
+    bool depthEdge = false;
+    uint64_t rtToSrv = 0;
+    for (UINT i = 0; i < count; ++i)
+    {
+        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        {
+            continue;
+        }
+        const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
+        const int before = static_cast<int>(t.StateBefore);
+        const int after = static_cast<int>(t.StateAfter);
+        if (IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, before, after))
+        {
+            ++rtToSrv;
+            velocityEdge = velocityEdge || t.pResource == velocity;
+        }
+        if (t.pResource == depth && IsTriggerEdgeFor(TriggerEdge::DepthWriteToReadable, before, after))
+        {
+            depthEdge = true;
+        }
+    }
+    if (rtToSrv == 0)
+    {
+        return; // the common case: nothing here a normals candidate could be part of
+    }
+
+    for (UINT i = 0; i < count; ++i)
+    {
+        if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        {
+            continue;
+        }
+        const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
+        if (!IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, static_cast<int>(t.StateBefore),
+                              static_cast<int>(t.StateAfter)) ||
+            !normals_->IsShortlisted(t.pResource))
+        {
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(batchMutex_);
+        BatchStats& s = batchStats_[t.pResource];
+        ++s.edges;
+        s.withVelocityEdge += (velocityEdge && t.pResource != velocity) ? 1 : 0;
+        s.withDepthEdge += depthEdge ? 1 : 0;
+        s.otherRtToSrv += rtToSrv - 1;
+        s.maxOtherRtToSrv = std::max<uint64_t>(s.maxOtherRtToSrv, rtToSrv - 1);
+    }
+}
+
+void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
+{
+    std::lock_guard<std::mutex> lock(batchMutex_);
+    Log("normals-diag: frame " + std::to_string(frame) + " - per normals-shortlisted resource, what shared its "
+        "RT->SRV ResourceBarrier call (plan sec 3.2 #1; counted only once velocity and depth were both selected). "
+        "Measured on Skyrunner: GBufferA shares one RT->SRV call a frame with scene depth; a same-format "
+        "post-process target never does. sameCallAsAnyDepthEdge is what SignalId::SharesCallWithEdge scores.");
+    // The signal's own input, over the resource's whole life, for comparison
+    // with the selected-depth-only tally beside it.
+    const auto anyDepth = [](const BarrierProfile& p, bool known) -> std::string
+    {
+        const int rt = static_cast<int>(TriggerEdge::RenderTargetToShaderResource);
+        const int depth = static_cast<int>(TriggerEdge::DepthWriteToReadable);
+        if (!known || p.triggerEdgeCountByEdge[rt] == 0)
+        {
+            return " sameCallAsAnyDepthEdge=-";
+        }
+        return " sameCallAsAnyDepthEdge=" +
+               std::to_string(p.triggerEdgesSharingCallWith[rt][depth] * 100 / p.triggerEdgeCountByEdge[rt]) + "%";
+    };
+    for (const auto& [resource, s] : batchStats_)
+    {
+        BarrierProfile p;
+        const bool known = profileStore_.Get(resource, &p);
+        const auto pct = [&](uint64_t n) { return s.edges ? std::to_string(n * 100 / s.edges) + "%" : "-"; };
+        char avg[32];
+        snprintf(avg, sizeof(avg), "%.2f", s.edges ? static_cast<double>(s.otherRtToSrv) / s.edges : 0.0);
+        Log("normals-diag:   " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
+            (known ? " " + std::to_string(p.width) + "x" + std::to_string(p.height) + " fmt=" + std::to_string(p.format) +
+                         " flags=" + std::to_string(p.flags)
+                   : std::string(" (no profile)")) +
+            (resource == velocity_->Selected() ? " [velocity's]" : "") + " | rtToSrvEdges=" + std::to_string(s.edges) +
+            " sameCallAsVelocityEdge=" + pct(s.withVelocityEdge) + " sameCallAsDepthEdge=" +
+            pct(s.withDepthEdge) + anyDepth(p, known) + " avgOtherRtToSrvInCall=" + avg +
+            " maxOtherRtToSrvInCall=" + std::to_string(s.maxOtherRtToSrv));
+    }
+    FlushLogs();
 }
 
 void SurfaceRegistry::NoteBackBufferSize(uint64_t width, uint32_t height) noexcept

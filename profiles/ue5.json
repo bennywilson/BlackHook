@@ -227,15 +227,27 @@
           // Every structurally-accepted format counts in full, like depth.
           "format_score_gate": 0,
 
-          // What should separate GBufferA from the other scene-extent render
-          // targets that also go RT -> SRV every frame (HDR scene colour,
-          // GBufferB-E): plain RT flags (scene colour is usually RT|UAV), and
-          // never written by compute. Unverified on a live title - Phase 10's
-          // whole point is to read the survivors' evidence and revise these.
+          // What separates GBufferA from the other scene-extent render targets
+          // that also go RT -> SRV every frame:
+          //   - plain RT flags, never written by compute: separates it from
+          //     HDR scene colour (RT|UAV). Holds on Skyrunner.
+          //   - NOT enough on Skyrunner, which has a second R10G10B10A2,
+          //     RT-only target at scene extent (most likely a post-process
+          //     output): the two tied 10-10, AMBIGUOUS, on two separate runs.
+          //   - shares_call_with_edge (depth): measured on Skyrunner with
+          //     MV_SURFACES=normals' normals-diag log - GBufferA becomes
+          //     readable in the SAME ResourceBarrier call as scene depth once
+          //     a frame (one of its two RT -> SRV edges, i.e. 50%), because
+          //     the passes that read normals read depth too; the same-format
+          //     decoy never does (0%). Evidence from ONE title, so it is
+          //     scored, not a gate, and min_percent sits well below the 50%
+          //     seen - the ambiguity guard still covers a title where it
+          //     does not separate.
           "signals": [
             { "signal": "exact_required_flags",          "weight": 3 },
             { "signal": "never_enters_unordered_access", "weight": 2 },
-            { "signal": "never_takes_uav_barrier",       "weight": 1 }
+            { "signal": "never_takes_uav_barrier",       "weight": 1 },
+            { "signal": "shares_call_with_edge", "edge": "depth_write_to_readable", "min_percent": 25, "weight": 3 }
           ],
 
           "ambiguity": { "rule": "score_margin", "margin": 2 },

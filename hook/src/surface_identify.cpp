@@ -224,6 +224,16 @@ bool BarrierProfileStore::Get(ID3D12Resource* resource, BarrierProfile* out) con
     return true;
 }
 
+void BarrierProfileStore::RecordSharedCall(ID3D12Resource* resource, TriggerEdge own, TriggerEdge other) noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = profiles_.find(resource);
+    if (it != profiles_.end())
+    {
+        ++it->second.triggerEdgesSharingCallWith[static_cast<int>(own)][static_cast<int>(other)];
+    }
+}
+
 void BarrierProfileStore::ResetMeasurement() noexcept
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -600,7 +610,7 @@ int SurfaceIdentifier::CollectSignals(
 
     struct Evaluated
     {
-        const char* name;
+        std::string name;
         int weight;
         bool present;
     };
@@ -610,7 +620,7 @@ int SurfaceIdentifier::CollectSignals(
     for (uint8_t i = 0; i < spec_.signalCount; ++i)
     {
         const SignalWeight& sw = spec_.signals[i];
-        const char* name = "";
+        std::string name;
         bool present = false;
         switch (sw.id)
         {
@@ -642,6 +652,19 @@ int SurfaceIdentifier::CollectSignals(
                 name = "no state-continuity violations";
                 present = p.alternationViolations == 0;
                 break;
+            case SignalId::SharesCallWithEdge:
+            {
+                const uint64_t shared =
+                    p.triggerEdgesSharingCallWith[static_cast<int>(spec_.trigger)][static_cast<int>(sw.edge)];
+                const uint64_t percent = triggerEdgeCount > 0 ? shared * 100 / triggerEdgeCount : 0;
+                name = std::string("shares a ResourceBarrier call with a ") +
+                       (sw.edge == TriggerEdge::DepthWriteToReadable ? "DEPTH_WRITE->readable"
+                                                                      : "RENDER_TARGET->shader-resource") +
+                       " edge on >= " + std::to_string(sw.minPercent) + "% of its edges (measured " +
+                       std::to_string(percent) + "%)";
+                present = triggerEdgeCount > 0 && percent >= static_cast<uint64_t>(sw.minPercent);
+                break;
+            }
         }
         evaluated[n++] = {name, sw.weight, present};
     }
@@ -1036,6 +1059,19 @@ void SurfaceIdentifier::MarkCandidate(ID3D12Resource* resource, const D3D12_RESO
     auto& entry = candidates_[resource];
     entry.resource = resource; // ComPtr::operator= AddRefs
     entry.desc = desc;
+}
+
+bool SurfaceIdentifier::IsShortlisted(ID3D12Resource* resource) noexcept
+{
+    std::lock_guard<std::mutex> lock(shortlistMutex_);
+    for (const ComPtr<ID3D12Resource>& held : shortlist_)
+    {
+        if (held.Get() == resource)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SurfaceIdentifier::ForgetKnownSource(ID3D12Resource* resource) noexcept

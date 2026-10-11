@@ -138,12 +138,22 @@ enum class SignalId : uint8_t
     NeverEntersUnorderedAccess,
     StrictTwoEventsPerFrame,
     NoContinuityViolations,
+    // At least `minPercent` of this resource's trigger edges arrive in the
+    // same ResourceBarrier call as a `edge`-type transition on some OTHER
+    // resource. Phase 10's normals discriminator, measured on Skyrunner:
+    // GBufferA becomes readable together with scene depth once a frame (the
+    // passes that read normals - SSAO, SSR, lighting - read depth too); a
+    // post-process target of the same format never does.
+    SharesCallWithEdge,
 };
 
 struct SignalWeight
 {
     SignalId id;
     int weight;
+    // SharesCallWithEdge only.
+    TriggerEdge edge = TriggerEdge::RenderTargetToShaderResource;
+    int minPercent = 0;
 };
 
 enum class AmbiguityRule : uint8_t
@@ -242,6 +252,11 @@ struct BarrierProfile
     uint64_t triggerEdgeCountByEdge[kTriggerEdgeCount]{};
     uint64_t reverseEdgeCountByEdge[kTriggerEdgeCount]{};
     int lastReadableStateByEdge[kTriggerEdgeCount] = {-1, -1};
+    // [own][other]: this resource's `own`-type trigger edges that arrived in
+    // the same ResourceBarrier call as an `other`-type edge on a different
+    // resource. Fed by SurfaceRegistry::OnBarrierBatch, and only while some
+    // registered spec uses SignalId::SharesCallWithEdge (zero otherwise).
+    uint64_t triggerEdgesSharingCallWith[kTriggerEdgeCount][kTriggerEdgeCount]{};
     uint64_t uavBarriers = 0;
     bool sawUnorderedAccess = false;
     int lastAfter = -1;
@@ -282,6 +297,10 @@ public:
     bool RecordTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter) noexcept;
 
     void RecordUav(ID3D12Resource* resource) noexcept;
+
+    // One `own`-type trigger edge of `resource` shared its ResourceBarrier
+    // call with an `other`-type edge on a different resource.
+    void RecordSharedCall(ID3D12Resource* resource, TriggerEdge own, TriggerEdge other) noexcept;
 
     // Copies out the current profile, if one exists.
     bool Get(ID3D12Resource* resource, BarrierProfile* out) const noexcept;
@@ -433,6 +452,10 @@ public:
     // answer" is true by construction rather than by remembering to call
     // ForgetAllCandidates from the right place.
     bool IsCandidate(ID3D12Resource* resource) const noexcept;
+    // True if `resource` passed this identifier's structural gate and is
+    // being watched (the shortlist). For SurfaceRegistry::OnBarrierBatch's
+    // diagnostic; nothing decides on it.
+    bool IsShortlisted(ID3D12Resource* resource) noexcept;
     // Re-checks that a candidate still has the desc it was accepted with,
     // dropping (and logging) it if not. Call before doing anything that
     // depends on its layout or its assumed resource state.
