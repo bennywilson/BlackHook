@@ -77,7 +77,11 @@ constexpr int kMaxSurfaces = 8;
 constexpr int kSurfaceVelocity = 0;
 constexpr int kSurfaceDepth = 1;
 constexpr int kSurfaceColor = 2;
-constexpr int kSurfaceCount = 3;
+// Optional (docs/REFACTOR_PLAN.md Phase 10): only captured when MV_SURFACES=
+// normals registered its identifier, and never required - a frame without it
+// is still complete.
+constexpr int kSurfaceNormals = 3;
+constexpr int kSurfaceCount = 4;
 static_assert(kSurfaceCount <= kMaxSurfaces, "surface count outgrew the fixed array");
 
 // Whether a surface's identity is FOUND (structural + behavioural search) or
@@ -133,6 +137,7 @@ constexpr SurfaceSpec kSurfaceSpecs[kSurfaceCount] = {
      SourceKind::Identified,
      KnownSource::None},
     {"back buffer", "color", "", SourceKind::KnownByConstruction, KnownSource::SwapChainBackBuffer},
+    {"normals", "normals", "", SourceKind::Identified, KnownSource::None},
 };
 
 // How well the fence covers a surface's copy.
@@ -1004,6 +1009,7 @@ constexpr StaticSurfaceFacts kStaticFacts[kSurfaceCount] = {
     {"render_target_to_shader_resource", "first_in_frame", "vel_%05d.bin"},
     {"depth_write_to_readable", "last_before_surface", "depth_%05d.bin"},
     {"present_back_buffer", "first_in_frame", "color_%05d.bin"},
+    {"render_target_to_shader_resource", "first_in_frame", "normals_%05d.bin"},
 };
 
 std::string ProcessBaseName()
@@ -1116,8 +1122,24 @@ std::string BuildManifest()
             j += std::string("      \"reason\": ") +
                  (DepthCaptureEnabled() ? "\"never_identified\"" : "\"capture_disabled\"") + ",\n";
         }
-        j += "      \"required\": " + std::string((i != kSurfaceDepth || layout.known) ? "true" : "false") +
-             ",\n";
+        if (!layout.known && i == kSurfaceNormals)
+        {
+            // A first-class state, not a log line (docs/REFACTOR_PLAN.md sec
+            // 4.1): a consumer can tell "off" from "on but never found".
+            const SurfaceProfile* profile = ActiveSurfaceProfile();
+            const bool inProfile = profile != nullptr && profile->hasNormals;
+            const bool enabled = inProfile && profile->normals.enabled;
+            j += std::string("      \"reason\": ") + (enabled ? "\"never_identified\"" : "\"not_enabled\"") + ",\n";
+            j += "      \"detail\": " +
+                 JsonString(enabled    ? "enabled via MV_SURFACES=normals, but no resource was identified - see the "
+                                         "'normals:' lines in mv_hook.log"
+                            : inProfile ? "spec exists in profile " + profile->name +
+                                              " but enabled=false; no identification was attempted"
+                                        : std::string("the active profile has no normals spec")) +
+                 ",\n";
+        }
+        const bool required = i == kSurfaceVelocity || i == kSurfaceColor || (i == kSurfaceDepth && layout.known);
+        j += "      \"required\": " + std::string(required ? "true" : "false") + ",\n";
         if (i == kSurfaceColor)
         {
             j += "      \"source\": { \"kind\": \"known_by_construction\", \"mechanism\": "
@@ -1130,6 +1152,14 @@ std::string BuildManifest()
         j += std::string("      \"trigger\": ") + JsonString(facts.trigger) + ",\n";
         j += std::string("      \"arbitration\": ") + JsonString(facts.arbitration) + ",\n";
         j += std::string("      \"file_pattern\": ") + JsonString(facts.filePattern);
+        if (i == kSurfaceNormals)
+        {
+            // Octahedral vs direct, and whether it differs 5.2 -> 5.7, is
+            // unverified (sec 3.2 #6). Saying "unknown" is what lets
+            // mvtools.py refuse to decode instead of producing a plausible
+            // normal field from a guess.
+            j += ",\n      \"encoding\": { \"kind\": \"unknown\" }";
+        }
         if (i == kSurfaceVelocity)
         {
             j += ",\n      \"coverage\": { \"strong\": " +
@@ -1672,6 +1702,65 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 }
 
+void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* normals, int stateAfter)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || normals == nullptr)
+    {
+        return;
+    }
+    if (g_originalResourceBarrier == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!EnsureDevice(cmdList))
+    {
+        return;
+    }
+
+    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
+    Slot* slot = AcquireSlotForFrame(frame);
+    // first_in_frame, one copy: the first RT -> SRV edge is the base pass
+    // finishing GBufferA. No slot means the frame is skipped anyway (the
+    // velocity path logs that).
+    if (slot == nullptr || slot->surfaces[kSurfaceNormals].present)
+    {
+        return;
+    }
+
+    const D3D12_RESOURCE_DESC desc = normals->GetDesc();
+    if (!DumpLayoutAccepts(kSurfaceNormals, desc))
+    {
+        return;
+    }
+    SurfaceCapture& surface = slot->surfaces[kSurfaceNormals];
+    const bool firstUse = surface.readback == nullptr;
+    if (!EnsureReadback(surface, kSurfaceNormals, desc))
+    {
+        return;
+    }
+    if (firstUse)
+    {
+        SnapshotDumpLayout(kSurfaceNormals, surface);
+    }
+
+    RecordCopyToReadback(
+        cmdList,
+        normals,
+        surface.readback.Get(),
+        surface.footprints,
+        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
+        g_originalResourceBarrier);
+    // On the game's list like depth, and like depth not graded for fence
+    // coverage yet (docs/REFACTOR_PLAN.md finding 1.2) - the manifest says so.
+    surface.recordedList = ComIdentity(cmdList);
+    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
+    ++surface.copies;
+    surface.present = true;
+}
+
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
 {
     // Cheap early-out: runs on the render thread for every submission; nothing
@@ -1928,12 +2017,9 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         return;
     }
-    // Known-source exclusion (docs/REFACTOR_PLAN.md sec 3.3): a resource
-    // obtained through this exact API contract is never eligible for any
-    // identifier's search, no matter what its descriptor looks like. Fed
-    // every Present, not just the first - ResizeBuffers/fullscreen
-    // transitions can hand back a different set of buffer pointers.
-    mv::GetSurfaceRegistry().NoteKnownSourceResource(backBuffer.Get());
+    // Known-source exclusion is fed by d3d12_hook.cpp's NoteKnownSources on
+    // every Present, burst or not - it used to be fed only here, which only
+    // ran mid-burst (see that function for what that broke).
 
     // Same every-frame revalidation as velocity: a resize or fullscreen
     // transition recreates swapchain buffers at a new size, and stale

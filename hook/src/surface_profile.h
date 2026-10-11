@@ -12,7 +12,8 @@
 // names a further file whose profiles are added on top (same name replaces).
 // Which profile runs: MV_PROFILE, else "ue<major>.<minor>-generic" from
 // MV_ENGINE_VERSION, else the file's default_profile. MV_IDENTIFY_FRAMES then
-// overrides velocity's settle_frames for this run (logged).
+// overrides velocity's settle_frames for this run, and MV_SURFACES=normals
+// enables the optional normals surface (both logged as overrides).
 //
 // Every failure - malformed JSON, an unknown or missing field, an
 // out-of-range value, a named profile that does not exist - is logged and
@@ -32,6 +33,10 @@ struct SurfaceProfile
     std::string overrides;  // per-run env overrides applied on top, e.g. MV_IDENTIFY_FRAMES; "" if none
     SurfaceSpec velocity{};
     SurfaceSpec depth{};
+    // Optional (Phase 10). Meaningful only when hasNormals; registered only
+    // when also normals.enabled - off by default, MV_SURFACES=normals opts in.
+    bool hasNormals = false;
+    SurfaceSpec normals{};
 };
 
 // Called once, from InstallD3D12Hooks, before any identifier is registered.

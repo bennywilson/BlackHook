@@ -16,6 +16,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace mv
 {
@@ -334,6 +335,17 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
     // --- lifecycle ---------------------------------------------------------
     spec.reopenClearsShortlist = f.Bool("reopen_clears_shortlist");
 
+    // Optional; absent == enabled.
+    spec.enabled = true;
+    if (const json* enabled = f.Optional("enabled"))
+    {
+        if (!enabled->is_boolean())
+        {
+            Fail(f.Path("enabled") + ": expected true or false");
+        }
+        spec.enabled = enabled->get<bool>();
+    }
+
     f.RejectUnknown();
     return spec;
 }
@@ -523,10 +535,25 @@ void Load()
     }
     const json& surfacesJson = profile.Required("surfaces");
     Fields surfaces(surfacesJson, profile.Path("surfaces"));
-    // This build has exactly two identifiers to configure. normals arrives in
-    // Phase 10; until then naming it is a mistake worth hearing about.
+    // velocity and depth are required and always on: every dump is keyed off
+    // velocity, and depth's extent link and burst atomicity assume it.
+    // normals (Phase 10) is optional in a profile and off unless opted into.
+    // Any other surface name is a mistake worth hearing about.
     g_profile.velocity = ParseSurface(surfaces.Required("velocity"), "velocity", surfaces.Path("velocity"));
     g_profile.depth = ParseSurface(surfaces.Required("depth"), "depth", surfaces.Path("depth"));
+    for (const SurfaceSpec* spec : {&g_profile.velocity, &g_profile.depth})
+    {
+        if (!spec->enabled)
+        {
+            Fail(surfaces.Path(spec->name) + ".enabled: " + spec->name + " cannot be disabled");
+        }
+    }
+    g_profile.hasNormals = false;
+    if (const json* normals = surfaces.Optional("normals"))
+    {
+        g_profile.normals = ParseSurface(*normals, "normals", surfaces.Path("normals"));
+        g_profile.hasNormals = true;
+    }
     surfaces.RejectUnknown();
     profile.RejectUnknown();
 
@@ -549,7 +576,39 @@ void Load()
         g_profile.overrides = "velocity.settle_frames=" + std::to_string(frames) + " (MV_IDENTIFY_FRAMES)";
     }
 
-    for (const SurfaceSpec* spec : {&g_profile.velocity, &g_profile.depth})
+    // MV_SURFACES: comma-separated optional surfaces to switch on for this
+    // run (docs/REFACTOR_PLAN.md Phase 10: "opt in with MV_SURFACES=normals").
+    // Only optional surfaces may be named - velocity and depth are always on -
+    // and a name this profile has no spec for is an error, not a no-op.
+    std::istringstream optIn(EnvVar("MV_SURFACES"));
+    std::string surface;
+    while (std::getline(optIn, surface, ','))
+    {
+        if (surface.empty())
+        {
+            continue;
+        }
+        if (surface != "normals")
+        {
+            Fail("MV_SURFACES names '" + surface + "' - only optional surfaces can be opted into (normals)");
+        }
+        if (!g_profile.hasNormals)
+        {
+            Fail("MV_SURFACES=normals, but " + path + " has no normals spec");
+        }
+        if (!g_profile.normals.enabled)
+        {
+            g_profile.normals.enabled = true;
+            g_profile.overrides += (g_profile.overrides.empty() ? "" : "; ") + std::string("normals.enabled=true (MV_SURFACES)");
+        }
+    }
+
+    std::vector<const SurfaceSpec*> all = {&g_profile.velocity, &g_profile.depth};
+    if (g_profile.hasNormals)
+    {
+        all.push_back(&g_profile.normals);
+    }
+    for (const SurfaceSpec* spec : all)
     {
         if (spec->extentFrom != nullptr && std::string(spec->extentFrom) != "velocity" &&
             std::string(spec->extentFrom) != "depth")
@@ -576,6 +635,11 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
             ")");
         Log("profile:   " + Summary(g_profile.velocity));
         Log("profile:   " + Summary(g_profile.depth));
+        if (g_profile.hasNormals)
+        {
+            Log("profile:   " + Summary(g_profile.normals) +
+                (g_profile.normals.enabled ? "" : " [DISABLED - opt in with MV_SURFACES=normals]"));
+        }
         if (!g_profile.overrides.empty())
         {
             Log("profile:   override: " + g_profile.overrides);

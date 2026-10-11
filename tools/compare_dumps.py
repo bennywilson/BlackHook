@@ -159,8 +159,25 @@ def diff_metadata(before, after):
         return problems, varying
     if not isinstance(before_meta, dict) or not isinstance(after_meta, dict):
         return problems, varying
+    # A surface entry with present:false describes data that does not exist -
+    # e.g. normals, which a newer hook lists as "not_enabled" and an older one
+    # does not list at all. Neither side has blobs for it, so it is not dump
+    # content; shown, not compared. A PRESENT surface is compared in full.
+    for side, meta in (("before", before_meta), ("after", after_meta)):
+        for name, surface in list(meta.get("surfaces", {}).items()):
+            if isinstance(surface, dict) and not surface.get("present", False):
+                varying.append(f"  surfaces.{name}: not present in {side} "
+                               f"({surface.get('reason', 'no reason given')}) - not compared")
+    def absent(meta, key):
+        parts = key.split(".")
+        if len(parts) < 2 or parts[0] != "surfaces":
+            return False
+        surface = meta.get("surfaces", {}).get(parts[1])
+        return surface is None or (isinstance(surface, dict) and not surface.get("present", False))
     b_flat, a_flat = flatten(before_meta), flatten(after_meta)
     for key in sorted(set(b_flat) | set(a_flat)):
+        if absent(before_meta, key) and absent(after_meta, key):
+            continue
         b, a = b_flat.get(key), a_flat.get(key)
         if b != a:
             (varying if key in RUN_VARYING else problems).append(f"  {key}: {b!r} -> {a!r}")

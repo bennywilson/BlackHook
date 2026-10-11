@@ -78,6 +78,14 @@ value) disables identification for the session and says why in
 `mv_hook.log`; there is no built-in fallback. `manifest.json` records which
 profile a dump was captured under.
 
+**Normals (experimental, off by default).** `MV_SURFACES=normals` (or
+`Invoke-MvCapture.ps1 -Surfaces normals`) also searches for UE5's GBufferA and
+captures it as `normals_NNNNN.bin`. Its encoding is unverified, so the
+manifest says `"encoding": {"kind": "unknown"}` and `mvtools.decode_normals`
+refuses. On Skyrunner it currently refuses to pick (AMBIGUOUS: a post-process
+target of the same format ties with GBufferA) - read the `normals:` lines in
+`mv_hook.log` before trusting any normals blob.
+
 ## Results
 
 Everything below is already in `results/` and reproducible without a running

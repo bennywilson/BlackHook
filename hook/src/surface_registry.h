@@ -128,6 +128,7 @@ public:
 
     // MutualExclusionChecker
     bool TryClaim(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept override;
+    const char* HeldByOther(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept override;
 
 private:
     struct Entry

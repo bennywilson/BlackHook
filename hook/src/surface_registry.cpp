@@ -209,7 +209,23 @@ void SurfaceRegistry::NoteBackBufferSize(uint64_t width, uint32_t height) noexce
 
 void SurfaceRegistry::NoteKnownSourceResource(ID3D12Resource* resource) noexcept
 {
-    knownSources_.Note(resource);
+    if (!knownSources_.Note(resource))
+    {
+        return; // already known - the per-Present common case
+    }
+    // Newly known: purge it from any search that shortlisted it first.
+    for (Entry& e : entries_)
+    {
+        if (e.identifier->ForgetKnownSource(resource))
+        {
+            // Selected a back buffer: wrong by definition (sec 3.1 - it is
+            // colour's, by API contract). Should be unreachable now that
+            // sources are noted every Present, but if it happens, say so and
+            // search again rather than keep capturing it as something else.
+            ReopenCascade(e.identifier->Spec().name, ReopenReason::DescriptorChanged,
+                          "the selected resource is a swapchain back buffer (known by construction)");
+        }
+    }
 }
 
 void SurfaceRegistry::CollectCascade(Entry* root, std::vector<Entry*>* out) noexcept
@@ -269,6 +285,11 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
 
 bool SurfaceRegistry::TryClaim(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept
 {
+    return HeldByOther(resource, claimant) == nullptr;
+}
+
+const char* SurfaceRegistry::HeldByOther(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept
+{
     for (Entry& e : entries_)
     {
         if (e.identifier == claimant)
@@ -277,10 +298,10 @@ bool SurfaceRegistry::TryClaim(ID3D12Resource* resource, const SurfaceIdentifier
         }
         if (e.identifier->IsCandidate(resource))
         {
-            return false;
+            return e.identifier->Spec().name;
         }
     }
-    return true;
+    return nullptr;
 }
 
 bool SurfaceRegistry::IsAnyCandidate(ID3D12Resource* resource) const noexcept

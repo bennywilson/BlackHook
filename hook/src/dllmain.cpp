@@ -21,6 +21,11 @@ extern "C" __declspec(dllexport) void* MvIdentifiedDepthResource() {
     return mv::GetSurfaceRegistry().Selected("depth");
 }
 
+// nullptr also when normals is not enabled (MV_SURFACES=normals) at all.
+extern "C" __declspec(dllexport) void* MvIdentifiedNormalsResource() {
+    return mv::GetSurfaceRegistry().Selected("normals");
+}
+
 // The profile identification is running under, or "" if none loaded - so the
 // harness can tell "searched under the profile I asked for and found nothing"
 // apart from "never searched because the profile failed to load".

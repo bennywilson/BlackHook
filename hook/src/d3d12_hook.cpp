@@ -222,10 +222,41 @@ void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t 
     }
 }
 
+// Known-source exclusion (docs/REFACTOR_PLAN.md sec 3.3), fed from here on
+// EVERY Present - not from capture.cpp, which only reached it mid-burst. Until
+// Phase 10 nothing noticed: no surface had a format matching the back buffer.
+// Normals does (R8G8B8A8_UNORM), so outside a burst its structural shortlist
+// was holding references to the swapchain's buffers - which hung process exit
+// (flip-model teardown with outstanding buffer refs) and would make a real
+// game's ResizeBuffers fail. All buffers, not just the current one: a buffer
+// can take a barrier before it is first presented, and the registry purges a
+// newly-noted one from any shortlist that got there first.
+void NoteKnownSources(IDXGISwapChain* const swapChain)
+{
+    if (!swapChain)
+    {
+        return;
+    }
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swapChain->GetDesc(&desc)))
+    {
+        return;
+    }
+    for (UINT i = 0; i < desc.BufferCount; ++i)
+    {
+        Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+        if (SUCCEEDED(swapChain->GetBuffer(i, IID_PPV_ARGS(&buffer))) && buffer)
+        {
+            mv::GetSurfaceRegistry().NoteKnownSourceResource(buffer.Get());
+        }
+    }
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
     mv::SetFrameIndex(frame);
+    NoteKnownSources(swapChain);
     NoteBackBufferSizeIfNeeded(swapChain, frame);
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
@@ -241,6 +272,7 @@ HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DX
 {
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
     mv::SetFrameIndex(frame);
+    NoteKnownSources(swapChain);
     NoteBackBufferSizeIfNeeded(swapChain, frame);
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
@@ -360,7 +392,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 // here reaches capture.cpp via the registry's
                 // ReopenObserver (wired in InstallD3D12Hooks below), not a
                 // return value - see SurfaceRegistry::SetReopenObserver.
-                constexpr int kMaxTriggers = 4; // generous for today's 2 identifiers
+                constexpr int kMaxTriggers = 4; // one per identifier, at most 3 today
                 mv::SurfaceTrigger triggers[kMaxTriggers];
                 const int triggerCount = registry.OnBarrierTransition(resource, frame, stateBefore, stateAfter, triggers, kMaxTriggers);
                 for (int t = 0; t < triggerCount; ++t)
@@ -388,6 +420,13 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                         // here rather than at Present, scene depth is a
                         // transient placed resource too.
                         mv::OnDepthReadable(cmdList, trig.resource, trig.stateAfter);
+                    }
+                    else if (std::strcmp(trig.identifier->Spec().name, "normals") == 0)
+                    {
+                        // GBufferA's RT -> shader-resource edge: same moment
+                        // and same reason as velocity's. Only reachable when
+                        // MV_SURFACES=normals registered the identifier.
+                        mv::OnNormalsReadable(cmdList, trig.resource, trig.stateAfter);
                     }
                 }
                 break;
@@ -723,6 +762,12 @@ bool InstallD3D12Hooks()
     {
         mv::GetSurfaceRegistry().Register(mv::MakeVelocityIdentifier(profile->velocity));
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
+        // Optional, after velocity (its extent source). A plain identifier -
+        // the plan found no behaviour in it that needs a subclass (sec 2.4).
+        if (profile->hasNormals && profile->normals.enabled)
+        {
+            mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->normals));
+        }
     }
     mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
     mv::GetSurfaceRegistry().Configure();

@@ -40,6 +40,12 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
 // buffer, so the last one in the frame is what lands.
 void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter);
 
+// Called from the ResourceBarrier hook on GBufferA's RENDER_TARGET ->
+// shader-resource edge, when MV_SURFACES=normals registered the normals
+// identifier. One copy per frame (the first edge). Optional: a frame without
+// it is still written.
+void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* normals, int stateAfter);
+
 // Called from the Present hooks *before* chaining to the real Present, while
 // the back buffer still holds the finished frame. Pairs the back buffer with
 // the velocity copy recorded earlier in the same frame, submits, and drains
@@ -50,7 +56,8 @@ void OnPresent(IDXGISwapChain* swapChain);
 // ::NoteBackBufferSize reports that `surfaceName`'s search reopened. Ends
 // the current burst (docs/REFACTOR_PLAN.md finding 1.14) if that surface is
 // required for it and a burst is in progress; a no-op otherwise. `surfaceName`
-// matches a SurfaceSpec::name - "velocity" or "depth" today.
+// matches a SurfaceSpec::name - "velocity", "depth" or "normals" (never
+// required, so its reopen never ends a burst).
 void NotifySurfaceReopened(const char* surfaceName);
 
 // Current present index, used to pair velocity and colour within one frame.

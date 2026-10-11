@@ -183,6 +183,67 @@
 
           // Reopen keeps the shortlist and only resets counters.
           "reopen_clears_shortlist": false
+        },
+
+        // UE5's GBufferA (world-space normal, SV_Target0 of the base pass) -
+        // docs/REFACTOR_PLAN.md sec 3.2 and Phase 10. OFF by default: opt in
+        // with MV_SURFACES=normals. Not required, so frames without it are
+        // still complete. Its six open questions (sec 3.2) can only be closed
+        // on a live title: read the "normals:" and mutual-exclusion lines in
+        // mv_hook.log before trusting a single byte of it.
+        "normals": {
+          "log_prefix": "normals",
+
+          // Candidates to verify, not facts: GBufferA's format follows
+          // r.GBufferFormat, and these scores mean "most likely first". The
+          // R16G16B16A16_UNORM entry COLLIDES with velocity's top format; the
+          // registry's mutual exclusion keeps velocity's own buffer out of
+          // this search (it is excluded before ranking, not just at claim).
+          "formats": [
+            { "format": "R10G10B10A2_UNORM",  "score": 4, "description": "R10G10B10A2_UNORM (PF_A2B10G10R10 - UE5 default GBufferA)" },
+            { "format": "R16G16B16A16_FLOAT", "score": 3, "description": "R16G16B16A16_FLOAT (PF_FloatRGBA - high-precision GBuffer)" },
+            { "format": "R16G16B16A16_UNORM", "score": 2, "description": "R16G16B16A16_UNORM (PF_A16B16G16R16 - collides with velocity)" },
+            { "format": "R8G8B8A8_UNORM",     "score": 1, "description": "R8G8B8A8_UNORM (low-precision GBuffer)" }
+          ],
+
+          // A render target that shaders read. No UAV requirement either way:
+          // "GBufferA has no UAV" is the kind of cross-title claim this
+          // project has been burned by (Skyrunner's velocity DOES enter
+          // UNORDERED_ACCESS), so it is scored evidence below, not a gate.
+          "required_flags": ["ALLOW_RENDER_TARGET"],
+          "forbidden_flags": ["DENY_SHADER_RESOURCE"],
+
+          // Bound to the scene extent through velocity, like depth. This is
+          // also what keeps the back buffer out when DRS makes the two
+          // extents differ; known-source exclusion covers it when they don't.
+          "min_width": 0,
+          "min_height": 0,
+          "max_back_buffer_multiple": 0,
+          "extent_from": "velocity",
+
+          "trigger": "render_target_to_shader_resource",
+          "min_frames_observed": 30,
+          "settle_frames": 60,
+          // Every structurally-accepted format counts in full, like depth.
+          "format_score_gate": 0,
+
+          // What should separate GBufferA from the other scene-extent render
+          // targets that also go RT -> SRV every frame (HDR scene colour,
+          // GBufferB-E): plain RT flags (scene colour is usually RT|UAV), and
+          // never written by compute. Unverified on a live title - Phase 10's
+          // whole point is to read the survivors' evidence and revise these.
+          "signals": [
+            { "signal": "exact_required_flags",          "weight": 3 },
+            { "signal": "never_enters_unordered_access", "weight": 2 },
+            { "signal": "never_takes_uav_barrier",       "weight": 1 }
+          ],
+
+          "ambiguity": { "rule": "score_margin", "margin": 2 },
+
+          // A dependent of velocity, like depth: reopen keeps the shortlist.
+          "reopen_clears_shortlist": false,
+
+          "enabled": false
         }
       }
     },

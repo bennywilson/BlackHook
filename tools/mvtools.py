@@ -92,7 +92,7 @@ def _parse_planes(layout_obj):
 @dataclass(frozen=True)
 class IdentifiedSurface:
     """A surface whose identity came from the structural+behavioural search
-    (velocity, depth today).
+    (velocity, depth, and - when MV_SURFACES=normals - normals).
 
     Deliberately has no .score/.margin/.signals/.survivors attributes: the
     hook does not track that state anywhere queryable yet (see the commit
@@ -118,6 +118,8 @@ class IdentifiedSurface:
     coverage: Optional[dict] = None       # velocity: {"strong","weak","none"}
     coverage_note: Optional[str] = None   # depth: "not evaluated - ..."
     reason: Optional[str] = None          # set only when not present
+    detail: Optional[str] = None          # normals: why not present, in words
+    encoding: Optional[dict] = None       # normals: {"kind": "unknown"} until verified
 
     # Subresource 0 / plane 0 is the top mip / first plane, which is what
     # every offline tool actually reads (matches WriteMetadata's own comment
@@ -203,6 +205,8 @@ def _parse_surface(name, obj, manifest):
         coverage=obj.get("coverage"),
         coverage_note=obj.get("coverage_note"),
         reason=obj.get("reason"),
+        detail=obj.get("detail"),
+        encoding=obj.get("encoding"),
         **common)
 
 
@@ -343,6 +347,29 @@ def load_dump(dump_dir, *, allow_unsealed=False):
     dump = Dump(dump_dir, manifest, surfaces, unusable)
     dump.migrated_from = migrated_from
     return dump
+
+
+def decode_normals(dump, capture_index):
+    """World-space normals for one captured frame - REFUSES, by design.
+
+    The hook captures GBufferA's bytes (MV_SURFACES=normals), but how UE packs
+    the normal into them (octahedral vs direct, and whether that changed
+    between 5.2 and 5.7) has not been verified against engine source or a
+    live capture - docs/REFACTOR_PLAN.md sec 3.2 #6. The manifest says so
+    ("encoding": {"kind": "unknown"}), and decoding anyway would produce a
+    plausible normal field from a guess: the failure mode this project has
+    paid for twice (README: the format-enum bug, the missing sqrt).
+
+    When the encoding is established, the hook should write it into the
+    manifest and this function should decode exactly that kind and refuse
+    every other.
+    """
+    surface = dump.surface("normals")  # raises if not captured, with the manifest's reason
+    kind = (surface.encoding or {}).get("kind", "unknown")
+    raise ValueError(
+        f"refusing to decode normals (frame {capture_index}): manifest encoding is '{kind}', and this "
+        f"mvtools.py knows no verified normals encoding. The raw bytes are in "
+        f"{surface.file_pattern % capture_index} if you need them for investigation.")
 
 
 def _rows(path, width, height, row_pitch, bytes_per_pixel):

@@ -208,6 +208,12 @@ struct SurfaceSpec
     // rescans). depth: false (reopen keeps them, only resets counters - see
     // the long comment this preserves, originally on ReopenDepthIdentification).
     bool reopenClearsShortlist;
+
+    // An enabled:false surface is never registered: no identification, no
+    // capture, and the manifest says "not_enabled". Velocity and depth must
+    // be enabled; normals ships disabled and is opted into with
+    // MV_SURFACES=normals (surface_profile.h).
+    bool enabled;
 };
 
 // Raw, identifier-agnostic per-resource barrier bookkeeping. Owned by
@@ -331,11 +337,15 @@ class KnownSourceSet
 public:
     static constexpr int kMaxKnownSources = 8;
 
-    void Note(ID3D12Resource* resource) noexcept;
+    // True if `resource` was not already in the set - the caller must then
+    // purge it from anything that shortlisted it before it was known. Evicts
+    // round-robin when full (see the definition).
+    bool Note(ID3D12Resource* resource) noexcept;
     bool Contains(ID3D12Resource* resource) const noexcept;
 
 private:
     std::atomic<ID3D12Resource*> resources_[kMaxKnownSources]{};
+    std::atomic<unsigned> nextEviction_{0};
 };
 
 class SurfaceIdentifier;
@@ -354,6 +364,15 @@ public:
     // true if no OTHER registered identifier already holds `resource` as a
     // candidate.
     virtual bool TryClaim(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept = 0;
+
+    // The name of the OTHER identifier holding `resource` as a candidate, or
+    // nullptr. Decide() uses this to drop such a resource BEFORE ranking: it
+    // cannot be this surface, so it must not compete - otherwise it either
+    // wins and the claim is refused forever (Searching, never Selected), or
+    // ties and makes a perfectly separable choice look AMBIGUOUS. This is the
+    // normals-vs-velocity case: both trigger on RENDER_TARGET -> shader-
+    // resource, and velocity's own buffer is structurally a normals candidate.
+    virtual const char* HeldByOther(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept = 0;
 };
 
 class SurfaceIdentifier
@@ -422,6 +441,13 @@ public:
     // SetMutualExclusion) - refused, and logged, if another identifier
     // already holds it.
     void MarkCandidate(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
+
+    // `resource` has just become known by construction (a swapchain back
+    // buffer). Drops it - and our reference to it - from this identifier's
+    // shortlist and candidate set, in case it was shortlisted before it was
+    // known. Returns true if it was this identifier's SELECTED resource,
+    // which the caller must treat as a wrong identification and reopen.
+    bool ForgetKnownSource(ID3D12Resource* resource) noexcept;
 
     // Starts the search again from scratch. `detail` is folded into the log
     // line the same way ReopenIdentification's `reason` string was. Does

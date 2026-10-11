@@ -257,27 +257,32 @@ size_t BarrierProfileStore::Size() const noexcept
 // KnownSourceSet
 // ---------------------------------------------------------------------------
 
-void KnownSourceSet::Note(ID3D12Resource* resource) noexcept
+bool KnownSourceSet::Note(ID3D12Resource* resource) noexcept
 {
     if (resource == nullptr || Contains(resource))
     {
-        return;
+        return false;
     }
     for (auto& slot : resources_)
     {
         ID3D12Resource* expected = nullptr;
         if (slot.compare_exchange_strong(expected, resource, std::memory_order_acq_rel))
         {
-            return;
+            return true;
         }
         if (expected == resource)
         {
-            return; // raced with another Note() of the same pointer
+            return false; // raced with another Note() of the same pointer
         }
     }
-    // All slots full - back buffers are a handful, so this means something
-    // is wrong upstream; silently dropping is safer than growing unbounded
-    // on a hot-ish path (this runs once per Present).
+    // Full. Every ResizeBuffers hands back a fresh set of buffer pointers, so
+    // this fills after a few resizes - and refusing new entries (as this used
+    // to) would leave the CURRENT back buffers searchable, with any shortlist
+    // holding them breaking the game's next ResizeBuffers. Evict round-robin
+    // instead: the oldest entries belong to buffers a resize already freed.
+    const unsigned victim = nextEviction_.fetch_add(1, std::memory_order_relaxed) % kMaxKnownSources;
+    resources_[victim].store(resource, std::memory_order_release);
+    return true;
 }
 
 bool KnownSourceSet::Contains(ID3D12Resource* resource) const noexcept
@@ -724,6 +729,18 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
             continue;
         }
 
+        // Mutual exclusion, applied before ranking - see
+        // MutualExclusionChecker::HeldByOther for why not only at claim time.
+        if (mutualExclusion_ != nullptr)
+        {
+            if (const char* holder = mutualExclusion_->HeldByOther(resource, this))
+            {
+                Log(std::string(spec_.logPrefix) + ": excluded " + DescLine(resource, desc) + " - already held by " +
+                    holder + " (mutual exclusion: one resource, one surface)");
+                continue;
+            }
+        }
+
         if (extentSource_ != nullptr)
         {
             if (!hasExtent)
@@ -1019,6 +1036,29 @@ void SurfaceIdentifier::MarkCandidate(ID3D12Resource* resource, const D3D12_RESO
     auto& entry = candidates_[resource];
     entry.resource = resource; // ComPtr::operator= AddRefs
     entry.desc = desc;
+}
+
+bool SurfaceIdentifier::ForgetKnownSource(ID3D12Resource* resource) noexcept
+{
+    bool dropped = false;
+    {
+        std::lock_guard<std::mutex> lock(shortlistMutex_);
+        const auto it = std::remove_if(
+            shortlist_.begin(), shortlist_.end(), [resource](const ComPtr<ID3D12Resource>& held) { return held.Get() == resource; });
+        dropped = it != shortlist_.end();
+        shortlist_.erase(it, shortlist_.end());
+    }
+    {
+        std::unique_lock lock(candidateMutex_);
+        dropped = candidates_.erase(resource) != 0 || dropped;
+    }
+    if (dropped)
+    {
+        Log(std::string(spec_.logPrefix) + ": dropped " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
+            " from the shortlist - it is a swapchain back buffer (known by construction), noted after it was "
+            "shortlisted. No search may hold one.");
+    }
+    return SelectedRaw() == resource;
 }
 
 void SurfaceIdentifier::ForgetAllCandidates() noexcept

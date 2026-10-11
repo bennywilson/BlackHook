@@ -67,7 +67,12 @@
 //
 // USAGE
 //   mv_testhost.exe [--hook <dll>] [--frames N] [--no-gbv] [--ambiguous]
-//                   [--pipeline oxi|skyrunner] [--phase9-negative]
+//                   [--pipeline oxi|skyrunner] [--phase9-negative] [--normals]
+//
+// `--normals` (Phase 10) adds a GBufferA look-alike, sets MV_SURFACES=normals,
+// and asserts normals selects it - with SceneVelocity, which passes the
+// normals gates too, kept out by mutual exclusion - and that every captured
+// frame carries a normals blob. Without it, no normals blob may appear.
 //   mv_testhost.exe --wpo-encode-test <output_dir>
 //
 // Set MV_AUTOCAPTURE=1 in the environment to have the hook start a capture
@@ -160,7 +165,9 @@ struct LookAlike {
     UINT64 width;
     UINT height;
     Behaviour behaviour;
-    bool shouldBeSelected;
+    bool shouldBeSelected;          // as velocity
+    D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    bool shouldBeNormals = false;   // --normals: the one normals must select
 
     ComPtr<ID3D12Heap> heap;
     ComPtr<ID3D12Resource> resource;
@@ -279,6 +286,8 @@ int main(int argc, char** argv) {
     bool phase8Tests = false;
     // docs/REFACTOR_PLAN.md Phase 9's negative test - see the file header.
     bool phase9Negative = false;
+    // Phase 10: add a GBufferA look-alike and opt into the normals surface.
+    bool normals = false;
     // Which shape of velocity pass to model. "oxi" is the strict 2-cycle this
     // project was developed against; "skyrunner" is the 5-transition,
     // UNORDERED_ACCESS-touching pass measured on a third-party UE 5.2 title.
@@ -305,6 +314,8 @@ int main(int argc, char** argv) {
             phase8Tests = true;
         } else if (arg == "--phase9-negative") {
             phase9Negative = true;
+        } else if (arg == "--normals") {
+            normals = true;
         }
     }
 
@@ -333,6 +344,11 @@ int main(int argc, char** argv) {
         SetEnvironmentVariableA("MV_PROFILE", kNegativeProfile);
         printf("[testhost] Phase 9 negative test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
                "identification must find NO candidate and must not fall back\n", kNegativeProfile);
+    }
+    if (normals) {
+        SetEnvironmentVariableA("MV_SURFACES", "normals");
+        printf("[testhost] MV_SURFACES=normals: a GBufferA look-alike joins the line-up and must be the one "
+               "normals selects\n");
     }
     // Every path below that expects identification to select nothing.
     const bool expectNothingSelected = ambiguous || phase9Negative;
@@ -445,6 +461,25 @@ int main(int argc, char** argv) {
          kVelocityFormat, kVelocityWidth, kVelocityHeight, Behaviour::ExtraPass, false},
     };
 
+    if (normals) {
+        // UE5's GBufferA: the default r.GBufferFormat's R10G10B10A2, a plain
+        // render target (no UAV), finished by the base pass - so its RT -> SRV
+        // edge comes BEFORE velocity's, hence the front of the line-up.
+        //
+        // What makes this a real test rather than a format lookup: SceneVelocity
+        // itself (R16G16B16A16_UNORM, RT, RT->SRV every frame) passes the
+        // normals structural and behaviour gates too - the collision the plan
+        // names. Only mutual exclusion keeps it out, and the HDR pool target
+        // (R16G16B16A16_FLOAT, also a normals format) and the twin must lose
+        // on evidence. Velocity's own gate rejects this one: no UAV flag.
+        LookAlike gbufferA{"GBufferA", "normals: R10G10B10A2, RT only, base-pass RT->SRV once a frame",
+                           DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::Velocity,
+                           false};
+        gbufferA.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        gbufferA.shouldBeNormals = true;
+        lineUp.insert(lineUp.begin(), gbufferA);
+    }
+
     if (pipeline == "skyrunner") {
         // Drop the "twin, read twice" decoy for this pipeline, and note WHY,
         // because the reason is a finding rather than a convenience.
@@ -512,7 +547,7 @@ int main(int argc, char** argv) {
         desc.Format = target.format;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.Flags = target.flags;
 
         const D3D12_RESOURCE_ALLOCATION_INFO alloc = device->GetResourceAllocationInfo(0, 1, &desc);
         D3D12_HEAP_DESC heapDesc{};
@@ -1011,6 +1046,54 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Phase 10: did normals pick GBufferA, and was velocity kept out? ---
+    bool normalsIdentificationPassed = true;
+    if (normals && hookModule != nullptr) {
+        using IdentifiedFn = void* (*)();
+        using StringFn = const char* (*)();
+        auto identifiedNormals = reinterpret_cast<IdentifiedFn>(
+            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedNormalsResource")));
+        auto logDirectory = reinterpret_cast<StringFn>(
+            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvLogDirectory")));
+        void* picked = identifiedNormals != nullptr ? identifiedNormals() : nullptr;
+        const LookAlike* expected = nullptr;
+        printf("\n[testhost] ==== normals identification ====\n");
+        for (const LookAlike& target : lineUp) {
+            if (target.shouldBeNormals) {
+                expected = &target;
+            }
+            const bool isPicked = picked == static_cast<void*>(target.resource.Get());
+            printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
+                   isPicked ? "<== SELECTED as normals" : "");
+        }
+        if (expectNothingSelected) {
+            // Normals takes its extent from velocity, which selected nothing.
+            normalsIdentificationPassed = picked == nullptr;
+            printf("[testhost] %s\n", normalsIdentificationPassed
+                                          ? "PASS - no normals selected, because velocity was never identified"
+                                          : "FAIL - normals selected with no velocity extent to key off");
+        } else {
+            // The collision case must actually have been exercised: velocity's
+            // own buffer reached normals' ranking and was excluded as held.
+            bool excludedVelocity = false;
+            if (logDirectory != nullptr) {
+                std::ifstream in(std::string(logDirectory()) + "mv_hook.log", std::ios::binary);
+                const std::string log((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                const size_t start = log.rfind("profile: using '");
+                excludedVelocity = start != std::string::npos &&
+                                   log.find("already held by velocity", start) != std::string::npos;
+            }
+            const bool pickedRight = expected != nullptr && picked == static_cast<void*>(expected->resource.Get());
+            normalsIdentificationPassed = pickedRight && excludedVelocity;
+            printf("[testhost]   velocity's buffer excluded from the normals ranking as held: %s\n",
+                   excludedVelocity ? "yes" : "NO");
+            printf("[testhost] %s\n",
+                   normalsIdentificationPassed
+                       ? "PASS - normals selected GBufferA, with SceneVelocity kept out by mutual exclusion"
+                       : "FAIL - normals identification (see the lines above, and the 'normals:' lines in the log)");
+        }
+    }
+
     // ---- docs/REFACTOR_PLAN.md Phase 8's three required behaviour tests -
     // written to exercise SurfaceRegistry's postconditions, not just
     // identification correctness.
@@ -1329,9 +1412,26 @@ int main(int argc, char** argv) {
             };
             const int velocities = count("vel_*.bin");
             const int depths = count("depth_*.bin");
+            const int normalsFrames = count("normals_*.bin");
             printf("\n[testhost] ==== dump contents ====\n");
             printf("[testhost]   velocity frames: %d\n", velocities);
             printf("[testhost]   depth frames:    %d\n", depths);
+            printf("[testhost]   normals frames:  %d\n", normalsFrames);
+            // Kept apart from dumpContentsPassed, which the branches below
+            // assign outright; combined after them.
+            bool normalsDumpOk = true;
+            if (!normals && normalsFrames != 0) {
+                // Off by default: one normals blob means the opt-in leaked.
+                printf("[testhost] FAIL - normals was captured without MV_SURFACES=normals\n");
+                normalsDumpOk = false;
+            } else if (normals && !expectNothingSelected && normalsFrames != velocities) {
+                // GBufferA takes its edge before velocity every frame, so a
+                // frame with velocity but no normals means a missed copy.
+                printf("[testhost] FAIL - %d velocity frames but %d normals frames\n", velocities, normalsFrames);
+                normalsDumpOk = false;
+            } else if (normals && !expectNothingSelected) {
+                printf("[testhost] PASS - every captured frame also has normals\n");
+            }
             if (expectNothingSelected) {
                 // Identification selects nothing in this mode, so capturing
                 // NOTHING is the correct outcome and an empty dump is the
@@ -1360,6 +1460,7 @@ int main(int argc, char** argv) {
                 printf("[testhost] FAIL - the dump is missing one of the per-frame artefacts\n");
                 dumpContentsPassed = false;
             }
+            dumpContentsPassed = dumpContentsPassed && normalsDumpOk;
         }
     }
 
@@ -1374,6 +1475,10 @@ int main(int argc, char** argv) {
                                                         : "FAIL - depth identification");
     printf("[testhost] %s\n", dumpContentsPassed ? "PASS - dump contents"
                                                  : "FAIL - dump contents");
+    if (normals) {
+        printf("[testhost] %s\n", normalsIdentificationPassed ? "PASS - normals identification"
+                                                              : "FAIL - normals identification");
+    }
     if (phase8Tests) {
         printf("[testhost] %s\n", resizeTestPassed ? "PASS - Phase 8 test 1 (resize stops capture until reidentified)"
                                                      : "FAIL - Phase 8 test 1 (resize stops capture until reidentified)");
@@ -1389,6 +1494,7 @@ int main(int argc, char** argv) {
     DestroyWindow(hwnd);
     const int exitCode =
         (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed &&
+         normalsIdentificationPassed &&
          (!phase8Tests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
             ? 0
             : 1;
