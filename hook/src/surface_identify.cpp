@@ -598,6 +598,8 @@ bool SurfaceIdentifier::OnTransition(
     if (isTracked && isTrigger)
     {
         lastEdgeFrame_.store(frame, std::memory_order_relaxed);
+        // The RIVAL-line cap is per stall episode: re-arm it when the pass resumes.
+        rivalReports_.store(0, std::memory_order_relaxed);
         if (silenceReported_.exchange(false))
         {
             Log(std::string(spec_.logPrefix) + ": the pass has RESUMED on frame " + std::to_string(frame) +
