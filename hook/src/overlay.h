@@ -10,21 +10,39 @@
 namespace mv
 {
 
-// Draws the extracted SceneVelocity buffer into the game's back buffer at
-// Present. F7 cycles through:
+// Draws extracted surfaces into the game's back buffer at Present. F7 cycles
+// through (MV_OVERLAY=<n> picks the starting mode):
 //
 //   0  Normal            - chained straight through, zero GPU cost
 //   1  SceneVelocity     - the stored channels mapped straight to RGB, the
 //                          same picture the engine's own
 //                          "visualizetexture SceneVelocity" draws
 //   2  Over gameplay     - the same, composited over the live frame
+//   3  GBuffer grid      - 2x2: frame   | depth (log-scaled, last edge before velocity)
+//                               normals | specular (metallic/spec/rough)
+//                          Raw channels, no decode. A quadrant whose surface
+//                          was not refreshed this frame gets a red border;
+//                          normals/specular need MV_SURFACES to be identified.
 //
 enum class OverlayMode
 {
     Off = 0,
     Velocity = 1,
     VelocityOverGameplay = 2,
-    Count = 3
+    GBufferGrid = 3,
+    Count = 4
+};
+
+// The surfaces the overlay keeps a GPU-side copy of. Depth, normals and
+// specular are the grid's other three quadrants; velocity feeds modes 1-2 and
+// paces depth's copy (see OverlayCaptureSurface).
+enum class OverlaySurface
+{
+    Velocity = 0,
+    Depth = 1,
+    Normals = 2,
+    Specular = 3,
+    Count = 4
 };
 
 // Called from the Present hooks before chaining through, while the back buffer
@@ -32,12 +50,16 @@ enum class OverlayMode
 // being drawn actually belongs to this frame.
 void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint64_t frame);
 
-// Records a copy of the velocity buffer into the overlay's own SRV-able
-// texture. Called at the barrier where the source is known to hold valid
-// contents as it is a transient resource.
-// `frame` stamps the copy so OverlayOnPresent knows if its valid for this frame
-void OverlayCaptureVelocity(
-    ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source, D3D12_RESOURCE_STATES stateBefore, uint64_t frame);
+// Records a copy of a surface into the overlay's own SRV-able texture for it.
+// Called at the surface's trigger edge, where the source is known to hold
+// valid contents (they are transient resources). The first edge of a frame
+// wins - except depth, which keeps re-copying until velocity has been copied
+// that frame (its first edge can be a partial pass). A no-op unless the
+// current mode needs that surface. `frame` stamps the copy so
+// OverlayOnPresent knows if it is this frame's.
+void OverlayCaptureSurface(
+    OverlaySurface surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+    D3D12_RESOURCE_STATES stateBefore, uint64_t frame);
 
 // The overlay records its own barriers and submissions; they must go through
 // the original function pointers, not our hooks, so they do not re-enter

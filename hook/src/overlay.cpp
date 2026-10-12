@@ -22,10 +22,12 @@ namespace
 // skipped for that frame rather than waiting.
 constexpr UINT kFrames = 3;
 
-// Slots in the SRV heap, matching t0/t1/t2 in the overlay shader.
+// Slots in the SRV heap, matching t0..t4 in the overlay shader: the scene
+// snapshot, then one per OverlaySurface in enum order.
 constexpr UINT kSrvSceneColor = 0;
-constexpr UINT kSrvVelocity = 1;
-constexpr UINT kSrvCount = 2;
+constexpr UINT kSrvFirstSurface = 1;
+constexpr UINT kSurfaceCount = static_cast<UINT>(OverlaySurface::Count);
+constexpr UINT kSrvCount = kSrvFirstSurface + kSurfaceCount;
 
 // Opacity of the velocity colours when composited over the live frame.
 constexpr float kOverGameplayBlend = 0.75f;
@@ -34,16 +36,85 @@ constexpr float kOverGameplayBlend = 0.75f;
 const char* kShaderSource = R"HLSL(
 Texture2D<float4> SceneColor : register(t0);
 Texture2D<float4> Velocity   : register(t1);
+Texture2D<float>  Depth      : register(t2); // plane 0 only (depth, not stencil)
+Texture2D<float4> Normals    : register(t3);
+Texture2D<float4> Specular   : register(t4);
 SamplerState Samp            : register(s0);
 
 cbuffer Params : register(b0)
 {
-    float2 VelocityRes;     // velocity texture dimensions, in pixels
-    float  Mode;            // 1 = velocity only, 2 = over gameplay
+    float4 StaleBySurface;  // 1 = not refreshed this frame: x velocity, y depth, z normals, w specular
+    float  Mode;            // 1 = velocity only, 2 = over gameplay, 3 = GBuffer grid
     float  Blend;           // opacity when composited over gameplay
-    float  Stale;           // 1 = the velocity texture was not refreshed for this frame
-    float3 Pad;
+    float2 VelocityRes;     // velocity texture dimensions, in pixels
 };
+#define Stale StaleBySurface.x
+
+// Point fetch at `uv` from a texture of any size; a null SRV (surface never
+// copied) reports 0x0 and reads as black.
+float4 FetchAt(Texture2D<float4> t, float2 uv)
+{
+    uint w, h;
+    t.GetDimensions(w, h);
+    if (w == 0 || h == 0) return 0.0.xxxx;
+    int2 p = min(int2(uv * float2(w, h)), int2(w - 1, h - 1));
+    return t.Load(int3(p, 0));
+}
+
+float FetchDepth(float2 uv)
+{
+    uint w, h;
+    Depth.GetDimensions(w, h);
+    if (w == 0 || h == 0) return 0.0;
+    int2 p = min(int2(uv * float2(w, h)), int2(w - 1, h - 1));
+    return Depth.Load(int3(p, 0));
+}
+
+// 2x2: frame | depth / normals | specular. Raw channels, no decode - the
+// same views as tools' contact sheets, live.
+float4 GBufferGrid(float2 uv)
+{
+    float2 cell = floor(uv * 2.0);
+    float2 local = frac(uv * 2.0);
+    int index = (int)(cell.y * 2.0 + cell.x);
+    float stale = index == 0 ? 0.0 // the frame snapshot is taken every Present
+                : index == 1 ? StaleBySurface.y
+                : index == 2 ? StaleBySurface.z
+                             : StaleBySurface.w;
+
+    // Quadrant frame: red when that surface was not refreshed this frame,
+    // otherwise a dark separator.
+    float2 edge = min(local, 1.0 - local);
+    if (min(edge.x, edge.y) < 0.004)
+    {
+        return float4(stale > 0.5 ? float3(0.75, 0.0, 0.0) : 0.08.xxx, 1.0);
+    }
+
+    float3 c = 0.0.xxx;
+    if (index == 0)
+    {
+        // The game's own finished frame (the snapshot taken before drawing).
+        c = SceneColor.SampleLevel(Samp, local, 0).rgb;
+    }
+    else if (index == 1)
+    {
+        // Reversed Z: 1 at the near plane, falling towards 0 with distance -
+        // nearly everything is a tiny number, so log-scale it. 12 stops: on
+        // Skyrunner, scene depth spans log2 -11..-1 (median -6), so this puts
+        // the median mid-grey and keeps distant terrain visible. 0 (sky) black.
+        float d = FetchDepth(local);
+        c = d > 0.0 ? saturate((log2(d) + 12.0) / 12.0).xxx : 0.0.xxx;
+    }
+    else if (index == 2)
+    {
+        c = FetchAt(Normals, local).rgb;
+    }
+    else
+    {
+        c = FetchAt(Specular, local).rgb; // R metallic, G specular, B roughness
+    }
+    return float4(c, 1.0);
+}
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -59,6 +130,11 @@ VSOut VSMain(uint id : SV_VertexID)
 
 float4 PSMain(VSOut i) : SV_Target
 {
+    if (Mode > 2.5)
+    {
+        return GBufferGrid(i.uv);
+    }
+
     float3 scene = SceneColor.SampleLevel(Samp, i.uv, 0).rgb;
 
     // The velocity texture holds whatever was last copied into it, and the copy
@@ -130,10 +206,19 @@ UINT64 g_nextFenceValue = 1;
 UINT g_frame = 0;
 FrameResources g_frames[kFrames];
 
-// Which presented frame g_velocityTex's contents were copied on, and whether
-// anything has been copied into it at all.
-uint64_t g_velocityCopyFrame = 0;
-bool g_velocityCopyValid = false;
+// One GPU-side copy per OverlaySurface: the texture, the desc it was created
+// from (CopyResource requires identical layouts, so a resolution change -
+// dynamic resolution scaling, a window resize - recreates it rather than
+// removing the device), and which presented frame its contents are from.
+struct SourceCopy
+{
+    ComPtr<ID3D12Resource> tex;
+    D3D12_RESOURCE_DESC desc{};
+    uint64_t copyFrame = 0;
+    bool valid = false;
+};
+SourceCopy g_sources[kSurfaceCount];
+const char* const kSurfaceNames[kSurfaceCount] = {"velocity", "depth", "normals", "specular"};
 
 // A copy recorded during frame N is stamped N, and OverlayOnPresent for frame N
 // runs before the frame counter advances, so the expected age is 0. One frame of
@@ -153,17 +238,10 @@ uint64_t g_freshnessWindow = 0;
 constexpr uint64_t kFreshnessLogInterval = 300;
 
 ComPtr<ID3D12Resource> g_sceneColorTex;
-ComPtr<ID3D12Resource> g_velocityTex;
 
-// The descs those two were created from. CopyResource requires source and
-// destination to be fully compatible, so a resolution change - dynamic
-// resolution scaling on the velocity buffer, a window resize on the back
-// buffer - turns the copy below into device removal rather than a wrong
-// picture. Both are therefore compared every frame instead of sized once.
+// The desc the scene snapshot was created from - compared every frame, like
+// SourceCopy::desc, because a window resize changes it.
 D3D12_RESOURCE_DESC g_sceneColorDesc{};
-D3D12_RESOURCE_DESC g_velocityDesc{};
-UINT g_velocityWidth = 0;
-UINT g_velocityHeight = 0;
 
 bool SameLayout(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b)
 {
@@ -196,6 +274,26 @@ void CreateNullSrv(UINT index)
     g_device->CreateShaderResourceView(nullptr, &desc, SrvCpu(index));
 }
 
+// The format a shader reads a resource of `format` through. Typeless and
+// depth formats have no SRV of their own: depth/stencil reads plane 0 (depth)
+// as a float, and UE's typeless 8-bit GBuffers are read as UNORM.
+// UNKNOWN = no readable view (e.g. a typed D32 depth); the slot stays null.
+DXGI_FORMAT SrvFormatFor(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_UNKNOWN;
+        default: return format;
+    }
+}
+
 void CreateSrvFor(ID3D12Resource* resource, DXGI_FORMAT format, UINT index)
 {
     D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
@@ -207,15 +305,17 @@ void CreateSrvFor(ID3D12Resource* resource, DXGI_FORMAT format, UINT index)
 }
 
 // Creates a texture matching a source resource's layout so CopyResource can be
-// used directly. Deliberately drops the source's RENDER_TARGET/DEPTH_STENCIL
-// flags: this copy is only ever read.
+// used directly. Drops RENDER_TARGET: this copy is only ever read. Keeps
+// ALLOW_DEPTH_STENCIL, though - D3D12 copies depth-stencil data only between
+// depth-stencil resources - which is harmless for reading since
+// DENY_SHADER_RESOURCE stays off.
 bool CreateMatchingTexture(const D3D12_RESOURCE_DESC& sourceDesc, ComPtr<ID3D12Resource>& out)
 {
     D3D12_HEAP_PROPERTIES heapProps{};
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     D3D12_RESOURCE_DESC desc = sourceDesc;
-    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    desc.Flags = sourceDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
     return SUCCEEDED(g_device->CreateCommittedResource(
@@ -473,6 +573,25 @@ void StartOverlayHotkeyThread()
     {
         return;
     }
+    // MV_OVERLAY=<mode>: start in that mode instead of off - for a session
+    // that wants the grid from the first frame, and for mv_testhost, which
+    // has no one to press F7.
+    char initial[8]{};
+    const DWORD length = GetEnvironmentVariableA("MV_OVERLAY", initial, sizeof(initial));
+    if (length > 0 && length < sizeof(initial))
+    {
+        const int mode = atoi(initial);
+        if (mode > 0 && mode < static_cast<int>(OverlayMode::Count))
+        {
+            g_mode.store(mode);
+            Log("overlay: starting in mode " + std::to_string(mode) + " (MV_OVERLAY)");
+        }
+        else
+        {
+            Log(std::string("overlay: MV_OVERLAY='") + initial + "' is not a mode 1.." +
+                std::to_string(static_cast<int>(OverlayMode::Count) - 1) + " - ignored, starting off");
+        }
+    }
     g_hotkeyThread = std::thread(
         []
         {
@@ -488,16 +607,17 @@ void StartOverlayHotkeyThread()
                     // These previously still listed the removed flow-coloured
                     // view, so mode 1 logged itself as "flow colours" while
                     // actually drawing the raw channel mapping.
-                    static_assert(static_cast<int>(OverlayMode::Count) == 3, "kNames is out of sync with OverlayMode");
+                    static_assert(static_cast<int>(OverlayMode::Count) == 4, "kNames is out of sync with OverlayMode");
                     static const char* kNames[] = {
-                        "normal", "SceneVelocity (raw channels, engine view)", "SceneVelocity over gameplay"};
+                        "normal", "SceneVelocity (raw channels, engine view)", "SceneVelocity over gameplay",
+                        "GBuffer grid (frame | depth / normals | specular)"};
                     Log(std::string("overlay: mode -> ") + kNames[next]);
                 }
                 wasDown = isDown;
                 Sleep(30);
             }
         });
-    Log("overlay: hotkey thread started (F7 = cycle SceneVelocity views)");
+    Log("overlay: hotkey thread started (F7 = cycle: off, SceneVelocity, over gameplay, GBuffer grid)");
 }
 
 void StopOverlayHotkeyThread()
@@ -512,10 +632,16 @@ void StopOverlayHotkeyThread()
     g_hotkeyThread.detach();
 }
 
-void OverlayCaptureVelocity(
-    ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source, D3D12_RESOURCE_STATES stateBefore, uint64_t frame)
+void OverlayCaptureSurface(
+    OverlaySurface surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+    D3D12_RESOURCE_STATES stateBefore, uint64_t frame)
 {
-    if (g_mode.load(std::memory_order_relaxed) == 0 || cmdList == nullptr || source == nullptr)
+    const int mode = g_mode.load(std::memory_order_relaxed);
+    // Only copy what the current mode draws: velocity for every mode, the
+    // rest for the grid alone. Off costs one load and a branch.
+    const bool wanted = mode != 0 && (surface == OverlaySurface::Velocity ||
+                                      mode == static_cast<int>(OverlayMode::GBufferGrid));
+    if (!wanted || cmdList == nullptr || source == nullptr)
     {
         return;
     }
@@ -526,46 +652,70 @@ void OverlayCaptureVelocity(
         return;
     }
 
-    ComPtr<ID3D12Resource>& dest = g_velocityTex;
-    const D3D12_RESOURCE_DESC desc = source->GetDesc();
-
-    // Recreate whenever the source layout changes, not just on the first call.
-    if (dest == nullptr || !SameLayout(g_velocityDesc, desc))
+    const UINT index = static_cast<UINT>(surface);
+    SourceCopy& copy = g_sources[index];
+    if (surface == OverlaySurface::Depth)
     {
-        if (dest != nullptr)
+        // Depth takes several edges a frame, and the FIRST is not the scene:
+        // on Skyrunner it held only the first-person weapon. Same rule as
+        // capture.cpp's OnDepthReadable: keep re-copying until velocity has
+        // been copied this frame, so the last depth BEFORE velocity - the
+        // depth the frame was rendered against - is what is drawn.
+        const SourceCopy& velocity = g_sources[static_cast<UINT>(OverlaySurface::Velocity)];
+        if (copy.valid && copy.copyFrame == frame && velocity.valid && velocity.copyFrame == frame)
         {
-            Log("overlay: velocity layout changed " + std::to_string(g_velocityDesc.Width) + "x" +
-                std::to_string(g_velocityDesc.Height) + " -> " + std::to_string(desc.Width) + "x" +
-                std::to_string(desc.Height) + "; recreating copy texture");
-            WaitForOverlayIdle();
-            dest.Reset();
-        }
-        if (!CreateMatchingTexture(desc, dest))
-        {
-            Log("overlay: failed to create velocity copy texture");
             return;
         }
-
-        g_velocityDesc = desc;
-        g_velocityWidth = static_cast<UINT>(desc.Width);
-        g_velocityHeight = desc.Height;
-        CreateSrvFor(dest.Get(), desc.Format, kSrvVelocity);
-        Log("overlay: velocity copy texture created " + std::to_string(g_velocityWidth) + "x" +
-            std::to_string(g_velocityHeight) + " fmt=" + std::to_string(static_cast<int>(desc.Format)));
+    }
+    else if (copy.valid && copy.copyFrame == frame)
+    {
+        // First edge of the frame wins - the base pass finishing the target.
+        return;
     }
 
-    Transition(cmdList, dest.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_RESOURCE_DESC desc = source->GetDesc();
+    const DXGI_FORMAT srvFormat = SrvFormatFor(desc.Format);
+    if (srvFormat == DXGI_FORMAT_UNKNOWN)
+    {
+        return; // no shader-readable view of this format - the quadrant stays black
+    }
+
+    // Recreate whenever the source layout changes, not just on the first call.
+    if (copy.tex == nullptr || !SameLayout(copy.desc, desc))
+    {
+        if (copy.tex != nullptr)
+        {
+            Log(std::string("overlay: ") + kSurfaceNames[index] + " layout changed " + std::to_string(copy.desc.Width) +
+                "x" + std::to_string(copy.desc.Height) + " -> " + std::to_string(desc.Width) + "x" +
+                std::to_string(desc.Height) + "; recreating copy texture");
+            WaitForOverlayIdle();
+            copy.tex.Reset();
+        }
+        if (!CreateMatchingTexture(desc, copy.tex))
+        {
+            Log(std::string("overlay: failed to create ") + kSurfaceNames[index] + " copy texture");
+            return;
+        }
+        copy.desc = desc;
+        CreateSrvFor(copy.tex.Get(), srvFormat, kSrvFirstSurface + index);
+        Log(std::string("overlay: ") + kSurfaceNames[index] + " copy texture created " +
+            std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
+            " fmt=" + std::to_string(static_cast<int>(desc.Format)) +
+            " (read as " + std::to_string(static_cast<int>(srvFormat)) + ")");
+    }
+
+    Transition(cmdList, copy.tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(cmdList, source, stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     // Identical descs, so a whole-resource copy handles every plane and mip w/o
     // per-subresource book keeping
-    cmdList->CopyResource(dest.Get(), source);
+    cmdList->CopyResource(copy.tex.Get(), source);
 
     Transition(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, stateBefore);
-    Transition(cmdList, dest.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(cmdList, copy.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    g_velocityCopyFrame = frame;
-    g_velocityCopyValid = true;
+    copy.copyFrame = frame;
+    copy.valid = true;
 }
 
 void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint64_t frame)
@@ -602,7 +752,10 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         Log("overlay: back buffer format changed, reinitialising");
         WaitForOverlayIdle();
         g_sceneColorTex.Reset();
-        g_velocityTex.Reset();
+        for (SourceCopy& copy : g_sources)
+        {
+            copy = SourceCopy{};
+        }
         g_pipelineState.Reset();
         g_rootSignature.Reset();
         g_srvHeap.Reset();
@@ -653,9 +806,17 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     // Is the velocity texture actually this frame's? Computed before the slot
     // check below so the freshness counters measure the game, not hook's own frame
     // pacing
+    const SourceCopy& velocity = g_sources[static_cast<UINT>(OverlaySurface::Velocity)];
     const uint64_t copyAge =
-        (g_velocityCopyValid && frame >= g_velocityCopyFrame) ? (frame - g_velocityCopyFrame) : UINT64_MAX;
-    const bool stale = !g_velocityCopyValid || copyAge > kMaxAcceptableCopyAge;
+        (velocity.valid && frame >= velocity.copyFrame) ? (frame - velocity.copyFrame) : UINT64_MAX;
+    const bool stale = !velocity.valid || copyAge > kMaxAcceptableCopyAge;
+    // The same test per grid quadrant.
+    float staleBySurface[kSurfaceCount];
+    for (UINT s = 0; s < kSurfaceCount; ++s)
+    {
+        const SourceCopy& c = g_sources[s];
+        staleBySurface[s] = (!c.valid || frame < c.copyFrame || frame - c.copyFrame > kMaxAcceptableCopyAge) ? 1.0f : 0.0f;
+    }
 
     if (stale)
     {
@@ -731,15 +892,16 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     list->SetPipelineState(g_pipelineState.Get());
     list->SetGraphicsRootDescriptorTable(0, g_srvHeap->GetGPUDescriptorHandleForHeapStart());
 
+    // Layout matches the shader's cbuffer Params.
     const float constants[8] = {
-        static_cast<float>(g_velocityWidth ? g_velocityWidth : 1),
-        static_cast<float>(g_velocityHeight ? g_velocityHeight : 1),
+        staleBySurface[0],
+        staleBySurface[1],
+        staleBySurface[2],
+        staleBySurface[3],
         static_cast<float>(mode),
         kOverGameplayBlend,
-        stale ? 1.0f : 0.0f,
-        0.0f,
-        0.0f,
-        0.0f,
+        static_cast<float>(velocity.desc.Width ? velocity.desc.Width : 1),
+        static_cast<float>(velocity.desc.Height ? velocity.desc.Height : 1),
     };
     list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
 

@@ -409,8 +409,8 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                         // Same moment, same validity argument - the live
                         // overlay samples a GPU-side copy taken here rather
                         // than anything read back to the CPU.
-                        mv::OverlayCaptureVelocity(
-                            cmdList, trig.resource, static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
+                        mv::OverlayCaptureSurface(mv::OverlaySurface::Velocity, cmdList, trig.resource,
+                                                  static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
                     }
                     else if (std::strcmp(trig.identifier->Spec().name, "depth") == 0)
                     {
@@ -419,6 +419,10 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                         // here rather than at Present, scene depth is a
                         // transient placed resource too.
                         mv::OnDepthReadable(cmdList, trig.resource, trig.stateAfter);
+                        // The overlay's GBuffer grid (F7 / MV_OVERLAY=3); a
+                        // no-op in every other mode.
+                        mv::OverlayCaptureSurface(mv::OverlaySurface::Depth, cmdList, trig.resource,
+                                                  static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
                     }
                     else
                     {
@@ -428,6 +432,14 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                         // MV_SURFACES registered.
                         mv::OnOptionalSurfaceReadable(
                             trig.identifier->Spec().name, cmdList, trig.resource, trig.stateAfter);
+                        const char* name = trig.identifier->Spec().name;
+                        if (std::strcmp(name, "normals") == 0 || std::strcmp(name, "specular") == 0)
+                        {
+                            mv::OverlayCaptureSurface(
+                                std::strcmp(name, "normals") == 0 ? mv::OverlaySurface::Normals
+                                                                  : mv::OverlaySurface::Specular,
+                                cmdList, trig.resource, static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
+                        }
                     }
                 }
                 break;
