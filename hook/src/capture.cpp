@@ -1445,7 +1445,7 @@ void StartCaptureHotkeyThread()
             while (!g_hotkeyStop.load(std::memory_order_relaxed))
             {
                 const bool isDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-                if (isDown && !wasDown && g_framesRemaining.load() == 0)
+                if (isDown && !wasDown && g_framesRemaining.load() <= 0)
                 {
                     ArmBurst();
                     Log("capture: F8 pressed, capturing " + std::to_string(kCaptureFrames) +
@@ -2172,6 +2172,13 @@ void OnPresent(IDXGISwapChain* swapChain)
     }
     if (slot == nullptr || g_device == nullptr || g_queue == nullptr)
     {
+        return;
+    }
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0)
+    {
+        // The burst ended mid-frame. Submitting would drive the count below zero
+        // (F8 then never re-arms) and write a frame after the manifest sealed.
+        slot->state = SlotState::Free;
         return;
     }
     if (!slot->surfaces[kSurfaceVelocity].present)
