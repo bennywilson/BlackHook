@@ -59,9 +59,9 @@
     (the hook log says so) rather than falling back.
 
 .PARAMETER Surfaces
-    Optional surfaces to capture as well, comma-separated - today only
-    "normals" (UE5's GBufferA; docs/REFACTOR_PLAN.md Phase 10). Experimental:
-    read the "normals:" lines in the hook log before trusting the result.
+    Optional surfaces to capture as well, comma-separated: "normals" (UE5's
+    GBufferA) and "specular" (GBufferB - experimental, still being
+    identified). Read their lines in the hook log before trusting the result.
 
 .PARAMETER DumpDir
     Where captures go. Defaults to a fresh timestamped directory under the
@@ -96,7 +96,7 @@ param(
 
     [string] $EngineVersion,
     [string] $SurfaceProfile,
-    [string] $Surfaces,
+    [string[]] $Surfaces, # -Surfaces normals,specular arrives as an array
     [string] $DumpDir,
     [string] $Hook,
     [string] $RenderProcess = '*-Win64-Shipping',
@@ -323,7 +323,7 @@ if (-not $AttachOnly) {
     $env:MV_DUMP_DIR       = $DumpDir
     $env:MV_ENGINE_VERSION = $resolvedVersion
     if ($SurfaceProfile) { $env:MV_PROFILE       = $SurfaceProfile } else { Remove-Item Env:\MV_PROFILE       -ErrorAction SilentlyContinue }
-    if ($Surfaces)       { $env:MV_SURFACES      = $Surfaces }       else { Remove-Item Env:\MV_SURFACES      -ErrorAction SilentlyContinue }
+    if ($Surfaces)       { $env:MV_SURFACES      = $Surfaces -join ',' } else { Remove-Item Env:\MV_SURFACES      -ErrorAction SilentlyContinue }
     if ($AutoCapture)   { $env:MV_AUTOCAPTURE   = '1' } else { Remove-Item Env:\MV_AUTOCAPTURE   -ErrorAction SilentlyContinue }
     if ($NoCaptureDepth) { $env:MV_CAPTURE_DEPTH = '0' } else { Remove-Item Env:\MV_CAPTURE_DEPTH -ErrorAction SilentlyContinue }
 

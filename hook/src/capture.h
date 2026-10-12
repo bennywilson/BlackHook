@@ -40,11 +40,19 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
 // buffer, so the last one in the frame is what lands.
 void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter);
 
-// Called from the ResourceBarrier hook on GBufferA's RENDER_TARGET ->
-// shader-resource edge, when MV_SURFACES=normals registered the normals
-// identifier. One copy per frame (the first edge). Optional: a frame without
-// it is still written.
-void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* normals, int stateAfter);
+// Called from the ResourceBarrier hook on an optional surface's trigger edge
+// ("normals" = GBufferA, "specular" = GBufferB), when MV_SURFACES registered
+// its identifier. One copy per frame (the first edge). Optional: a frame
+// without it is still written. Unknown names are ignored.
+void OnOptionalSurfaceReadable(
+    const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter);
+
+// DIAGNOSTIC: with MV_SNAPSHOT=<surface>, copies one frame of each of that
+// surface's scene-extent candidates to snapshot_<surface>_<ptr>_*.bin in the
+// dump directory (see capture.cpp). A no-op otherwise. Wired as the
+// registry's CandidateEdgeObserver.
+void SnapshotCandidate(
+    const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter);
 
 // Called from the Present hooks *before* chaining to the real Present, while
 // the back buffer still holds the finished frame. Pairs the back buffer with

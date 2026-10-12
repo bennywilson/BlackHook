@@ -26,6 +26,12 @@ extern "C" __declspec(dllexport) void* MvIdentifiedNormalsResource() {
     return mv::GetSurfaceRegistry().Selected("normals");
 }
 
+// Any surface by name ("specular", ...): nullptr while searching, ambiguous,
+// or not registered.
+extern "C" __declspec(dllexport) void* MvIdentifiedSurface(const char* name) {
+    return name != nullptr ? mv::GetSurfaceRegistry().Selected(name) : nullptr;
+}
+
 // The profile identification is running under, or "" if none loaded - so the
 // harness can tell "searched under the profile I asked for and found nothing"
 // apart from "never searched because the profile failed to load".

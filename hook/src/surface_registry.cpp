@@ -70,7 +70,14 @@ void SurfaceRegistry::Configure() noexcept
     }
     velocity_ = Find("velocity");
     depth_ = Find("depth");
-    normals_ = Find("normals");
+    optionals_.clear();
+    for (const Entry& e : entries_)
+    {
+        if (e.identifier != velocity_ && e.identifier != depth_)
+        {
+            optionals_.push_back(e.identifier);
+        }
+    }
     for (const Entry& e : entries_)
     {
         const SurfaceSpec& spec = e.identifier->Spec();
@@ -198,13 +205,14 @@ void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
     {
         DumpBarrierProfiles();
     }
-    if (normals_ != nullptr && (frame == 600 || frame == kProfileDumpFrame))
+    if (!optionals_.empty() && (frame == 600 || frame == kProfileDumpFrame))
     {
         DumpBatchStats(frame);
     }
 }
 
-void SurfaceRegistry::OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept
+void SurfaceRegistry::OnBarrierBatch(
+    ID3D12GraphicsCommandList* cmdList, const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept
 {
     if (barriers == nullptr)
     {
@@ -261,22 +269,22 @@ void SurfaceRegistry::OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UIN
         }
     }
 
-    if (normals_ == nullptr || velocity_ == nullptr || depth_ == nullptr)
+    if (optionals_.empty() || velocity_ == nullptr || depth_ == nullptr)
     {
         return;
     }
     // Only once both anchors are known: before that "not in the same call as
     // velocity's edge" would just mean velocity was not selected yet.
-    ID3D12Resource* const velocity = velocity_->Selected();
-    ID3D12Resource* const depth = depth_->Selected();
-    if (velocity == nullptr || depth == nullptr)
+    if (velocity_->Selected() == nullptr || depth_->Selected() == nullptr)
     {
         return;
     }
 
-    bool velocityEdge = false;
-    bool depthEdge = false;
+    // Which registered surfaces had one of THEIR tracked resources (selected
+    // or rival-adopted) take THEIR trigger edge in this call - and which
+    // resource it was, so a candidate is never counted as sharing with itself.
     uint64_t rtToSrv = 0;
+    ID3D12Resource* trackedIn[kMaxBatchSurfaces] = {};
     for (UINT i = 0; i < count; ++i)
     {
         if (barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
@@ -286,19 +294,20 @@ void SurfaceRegistry::OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UIN
         const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
         const int before = static_cast<int>(t.StateBefore);
         const int after = static_cast<int>(t.StateAfter);
-        if (IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, before, after))
+        rtToSrv += IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, before, after) ? 1 : 0;
+        for (size_t e = 0; e < entries_.size() && e < kMaxBatchSurfaces; ++e)
         {
-            ++rtToSrv;
-            velocityEdge = velocityEdge || t.pResource == velocity;
-        }
-        if (t.pResource == depth && IsTriggerEdgeFor(TriggerEdge::DepthWriteToReadable, before, after))
-        {
-            depthEdge = true;
+            SurfaceIdentifier* id = entries_[e].identifier;
+            if (trackedIn[e] == nullptr && IsTriggerEdgeFor(id->Spec().trigger, before, after) &&
+                (t.pResource == id->Selected() || id->IsCandidate(t.pResource)))
+            {
+                trackedIn[e] = t.pResource;
+            }
         }
     }
     if (rtToSrv == 0)
     {
-        return; // the common case: nothing here a normals candidate could be part of
+        return; // the common case: nothing here an optional surface's candidate could be part of
     }
 
     for (UINT i = 0; i < count; ++i)
@@ -309,56 +318,96 @@ void SurfaceRegistry::OnBarrierBatch(const D3D12_RESOURCE_BARRIER* barriers, UIN
         }
         const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
         if (!IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, static_cast<int>(t.StateBefore),
-                              static_cast<int>(t.StateAfter)) ||
-            !normals_->IsShortlisted(t.pResource))
+                              static_cast<int>(t.StateAfter)))
         {
             continue;
         }
-        std::lock_guard<std::mutex> lock(batchMutex_);
-        BatchStats& s = batchStats_[t.pResource];
-        ++s.edges;
-        s.withVelocityEdge += (velocityEdge && t.pResource != velocity) ? 1 : 0;
-        s.withDepthEdge += depthEdge ? 1 : 0;
-        s.otherRtToSrv += rtToSrv - 1;
-        s.maxOtherRtToSrv = std::max<uint64_t>(s.maxOtherRtToSrv, rtToSrv - 1);
+        for (SurfaceIdentifier* optional : optionals_)
+        {
+            if (!optional->IsShortlisted(t.pResource))
+            {
+                continue;
+            }
+            if (candidateEdgeObserver_ != nullptr)
+            {
+                UINT64 width = 0;
+                UINT height = 0;
+                const D3D12_RESOURCE_DESC desc = t.pResource->GetDesc();
+                if (velocity_->Extent(&width, &height) && desc.Width == width && desc.Height == height)
+                {
+                    candidateEdgeObserver_(optional->Spec().name, cmdList, t.pResource, static_cast<int>(t.StateAfter));
+                }
+            }
+            std::lock_guard<std::mutex> lock(batchMutex_);
+            BatchStats& s = batchStats_[{optional, t.pResource}];
+            ++s.edges;
+            for (size_t e = 0; e < entries_.size() && e < kMaxBatchSurfaces; ++e)
+            {
+                s.withSurface[e] += (trackedIn[e] != nullptr && trackedIn[e] != t.pResource) ? 1 : 0;
+            }
+            s.otherRtToSrv += rtToSrv - 1;
+            s.maxOtherRtToSrv = std::max<uint64_t>(s.maxOtherRtToSrv, rtToSrv - 1);
+        }
     }
 }
 
 void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
 {
     std::lock_guard<std::mutex> lock(batchMutex_);
-    Log("normals-diag: frame " + std::to_string(frame) + " - per normals-shortlisted resource, what shared its "
-        "RT->SRV ResourceBarrier call (plan sec 3.2 #1; counted only once velocity and depth were both selected). "
-        "Measured on Skyrunner: GBufferA shares one RT->SRV call a frame with scene depth; a same-format "
-        "post-process target never does. sameCallAsAnyDepthEdge is what SignalId::SharesCallWithEdge scores.");
-    // The signal's own input, over the resource's whole life, for comparison
-    // with the selected-depth-only tally beside it.
+    // The signal's own input, over the resource's whole life.
     const auto anyDepth = [](const BarrierProfile& p, bool known) -> std::string
     {
         const int rt = static_cast<int>(TriggerEdge::RenderTargetToShaderResource);
         const int depth = static_cast<int>(TriggerEdge::DepthWriteToReadable);
         if (!known || p.triggerEdgeCountByEdge[rt] == 0)
         {
-            return " sameCallAsAnyDepthEdge=-";
+            return "anyDepth=-";
         }
-        return " sameCallAsAnyDepthEdge=" +
+        return "anyDepth=" +
                std::to_string(p.triggerEdgesSharingCallWith[rt][depth] * 100 / p.triggerEdgeCountByEdge[rt]) + "%";
     };
-    for (const auto& [resource, s] : batchStats_)
+    for (SurfaceIdentifier* optional : optionals_)
     {
-        BarrierProfile p;
-        const bool known = profileStore_.Get(resource, &p);
-        const auto pct = [&](uint64_t n) { return s.edges ? std::to_string(n * 100 / s.edges) + "%" : "-"; };
-        char avg[32];
-        snprintf(avg, sizeof(avg), "%.2f", s.edges ? static_cast<double>(s.otherRtToSrv) / s.edges : 0.0);
-        Log("normals-diag:   " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
-            (known ? " " + std::to_string(p.width) + "x" + std::to_string(p.height) + " fmt=" + std::to_string(p.format) +
-                         " flags=" + std::to_string(p.flags)
-                   : std::string(" (no profile)")) +
-            (resource == velocity_->Selected() ? " [velocity's]" : "") + " | rtToSrvEdges=" + std::to_string(s.edges) +
-            " sameCallAsVelocityEdge=" + pct(s.withVelocityEdge) + " sameCallAsDepthEdge=" +
-            pct(s.withDepthEdge) + anyDepth(p, known) + " avgOtherRtToSrvInCall=" + avg +
-            " maxOtherRtToSrvInCall=" + std::to_string(s.maxOtherRtToSrv));
+        const std::string prefix = std::string(optional->Spec().name) + "-diag:";
+        Log(prefix + " frame " + std::to_string(frame) + " - per " + optional->Spec().name +
+            "-shortlisted resource, what shared its RT->SRV ResourceBarrier call: each other surface's TRACKED "
+            "resources (selected or rival-adopted) taking their own trigger edge, any depth edge, and the count of "
+            "other RT->SRV transitions. Counted only once velocity and depth were both selected. On Skyrunner, "
+            "GBufferA was told from a same-format post-process target by anyDepth (50% vs 0%).");
+        for (const auto& [key, s] : batchStats_)
+        {
+            if (key.first != optional)
+            {
+                continue;
+            }
+            ID3D12Resource* resource = key.second;
+            BarrierProfile p;
+            const bool known = profileStore_.Get(resource, &p);
+            const auto pct = [&](uint64_t n) { return s.edges ? std::to_string(n * 100 / s.edges) + "%" : "-"; };
+            std::string shares;
+            std::string heldBy;
+            for (size_t e = 0; e < entries_.size() && e < kMaxBatchSurfaces; ++e)
+            {
+                SurfaceIdentifier* id = entries_[e].identifier;
+                if (id == optional)
+                {
+                    continue;
+                }
+                shares += std::string(id->Spec().name) + "=" + pct(s.withSurface[e]) + " ";
+                if (resource == id->Selected() || id->IsCandidate(resource))
+                {
+                    heldBy += std::string(" [") + id->Spec().name + "'s]";
+                }
+            }
+            char avg[32];
+            snprintf(avg, sizeof(avg), "%.2f", s.edges ? static_cast<double>(s.otherRtToSrv) / s.edges : 0.0);
+            Log(prefix + "   " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
+                (known ? " " + std::to_string(p.width) + "x" + std::to_string(p.height) + " fmt=" +
+                             std::to_string(p.format) + " flags=" + std::to_string(p.flags)
+                       : std::string(" (no profile)")) +
+                heldBy + " | rtToSrvEdges=" + std::to_string(s.edges) + " sameCallAs: " + shares + anyDepth(p, known) +
+                " | avgOtherRtToSrvInCall=" + avg + " max=" + std::to_string(s.maxOtherRtToSrv));
+        }
     }
     FlushLogs();
 }

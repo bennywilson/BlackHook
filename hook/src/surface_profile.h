@@ -12,8 +12,8 @@
 // names a further file whose profiles are added on top (same name replaces).
 // Which profile runs: MV_PROFILE, else "ue<major>.<minor>-generic" from
 // MV_ENGINE_VERSION, else the file's default_profile. MV_IDENTIFY_FRAMES then
-// overrides velocity's settle_frames for this run, and MV_SURFACES=normals
-// enables the optional normals surface (both logged as overrides).
+// overrides velocity's settle_frames for this run, and MV_SURFACES=normals,
+// specular enables optional surfaces (both logged as overrides).
 //
 // Every failure - malformed JSON, an unknown or missing field, an
 // out-of-range value, a named profile that does not exist - is logged and
@@ -33,10 +33,23 @@ struct SurfaceProfile
     std::string overrides;  // per-run env overrides applied on top, e.g. MV_IDENTIFY_FRAMES; "" if none
     SurfaceSpec velocity{};
     SurfaceSpec depth{};
-    // Optional (Phase 10). Meaningful only when hasNormals; registered only
-    // when also normals.enabled - off by default, MV_SURFACES=normals opts in.
-    bool hasNormals = false;
-    SurfaceSpec normals{};
+
+    // Optional surfaces (Phase 10), one slot per kOptionalSurfaceNames entry,
+    // in that order. A slot is `present` when the profile has a spec for it;
+    // it is registered only when also spec.enabled - off by default,
+    // MV_SURFACES=<name>[,<name>] opts in. Fixed array: identifiers keep a
+    // reference to their spec, so slots must never move.
+    static constexpr const char* kOptionalSurfaceNames[] = {"normals", "specular"};
+    static constexpr int kOptionalSurfaceCount = 2;
+    struct OptionalSurface
+    {
+        bool present = false;
+        SurfaceSpec spec{};
+    };
+    OptionalSurface optional[kOptionalSurfaceCount]{};
+
+    // The named optional surface's spec, or nullptr if this profile has none.
+    const SurfaceSpec* Optional(const char* surfaceName) const noexcept;
 };
 
 // Called once, from InstallD3D12Hooks, before any identifier is registered.

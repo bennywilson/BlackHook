@@ -420,12 +420,14 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                         // transient placed resource too.
                         mv::OnDepthReadable(cmdList, trig.resource, trig.stateAfter);
                     }
-                    else if (std::strcmp(trig.identifier->Spec().name, "normals") == 0)
+                    else
                     {
-                        // GBufferA's RT -> shader-resource edge: same moment
-                        // and same reason as velocity's. Only reachable when
-                        // MV_SURFACES=normals registered the identifier.
-                        mv::OnNormalsReadable(cmdList, trig.resource, trig.stateAfter);
+                        // An optional surface (normals = GBufferA, specular =
+                        // GBufferB): RT -> shader-resource, same moment and
+                        // same reason as velocity's. Only reachable for those
+                        // MV_SURFACES registered.
+                        mv::OnOptionalSurfaceReadable(
+                            trig.identifier->Spec().name, cmdList, trig.resource, trig.stateAfter);
                     }
                 }
                 break;
@@ -455,7 +457,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
     // (plan sec 3.2 #1). One branch unless MV_SURFACES=normals.
     if (registry.WantsBarrierBatches())
     {
-        registry.OnBarrierBatch(barriers, numBarriers);
+        registry.OnBarrierBatch(cmdList, barriers, numBarriers);
     }
 }
 
@@ -771,13 +773,18 @@ bool InstallD3D12Hooks()
         // to own until Phase 10 found normals needed it too.
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->velocity));
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
-        // Optional, after velocity (its extent source).
-        if (profile->hasNormals && profile->normals.enabled)
+        // Optional surfaces, after velocity (their extent source), each only
+        // if its spec exists and MV_SURFACES enabled it.
+        for (const mv::SurfaceProfile::OptionalSurface& optional : profile->optional)
         {
-            mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->normals));
+            if (optional.present && optional.spec.enabled)
+            {
+                mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(optional.spec));
+            }
         }
     }
     mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
+    mv::GetSurfaceRegistry().SetCandidateEdgeObserver(&mv::SnapshotCandidate); // no-op unless MV_SNAPSHOT
     mv::GetSurfaceRegistry().Configure();
 
     if (ok)

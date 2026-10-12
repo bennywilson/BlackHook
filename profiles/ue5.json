@@ -278,6 +278,74 @@
           "reopen_clears_shortlist": false,
 
           "enabled": false
+        },
+
+        // UE5's GBufferB: metallic, specular, roughness (RGB) and the shading
+        // model ID (A). OFF by default: opt in with MV_SURFACES=specular
+        // (or normals,specular). Not required. Channel packing is unverified
+        // against engine source, so the manifest says encoding "unknown".
+        //
+        // How it was found (Skyrunner, UE 5.2): every 8-bit scene-extent
+        // render target is B8G8R8A8_TYPELESS (UE views its 8-bit GBuffers as
+        // sRGB or linear) - 7-9 of them take an RT -> SRV edge each frame and
+        // tie 10-10 on format, flags and extent. MV_SNAPSHOT=specular copied
+        // one frame of each to disk, and the pixels named GBufferB beyond
+        // doubt: R = metallic (non-zero only on the character's armour),
+        // G = specular (~constant), B = roughness, and A holding exactly 5
+        // values (0,33,34,37,38 - shading-model ID plus a flag bit), which
+        // only GBufferB stores. GBufferC (base colour + AO) and a mostly empty
+        // GBufferD/E were its neighbours.
+        //
+        // The barrier evidence that then separates it, in two sessions:
+        // GBufferB becomes readable in the SAME ResourceBarrier call as scene
+        // depth on 100% of its edges; every other candidate on 0% (GBufferC and
+        // D/E go in calls of three render targets, no depth). The same signal
+        // as normals, stronger: GBufferA shares with depth on 50%.
+        "specular": {
+          "log_prefix": "specular",
+
+          "formats": [
+            { "format": "B8G8R8A8_TYPELESS", "score": 4, "description": "B8G8R8A8_TYPELESS (PF_B8G8R8A8, viewed linear/sRGB - UE 8-bit GBuffer)" },
+            { "format": "B8G8R8A8_UNORM",    "score": 3, "description": "B8G8R8A8_UNORM (PF_B8G8R8A8, typed)" },
+            { "format": "R8G8B8A8_TYPELESS", "score": 2, "description": "R8G8B8A8_TYPELESS" },
+            { "format": "R8G8B8A8_UNORM",    "score": 1, "description": "R8G8B8A8_UNORM" }
+          ],
+          "required_flags": ["ALLOW_RENDER_TARGET"],
+          "forbidden_flags": ["DENY_SHADER_RESOURCE"],
+
+          "min_width": 0,
+          "min_height": 0,
+          "max_back_buffer_multiple": 0,
+          "extent_from": "velocity",
+
+          "trigger": "render_target_to_shader_resource",
+          "min_frames_observed": 30,
+          "settle_frames": 60,
+          "format_score_gate": 0,
+
+          "signals": [
+            { "signal": "exact_required_flags",          "weight": 3 },
+            { "signal": "never_enters_unordered_access", "weight": 2 },
+            { "signal": "never_takes_uav_barrier",       "weight": 1 },
+            // Measured 100% vs 0% - see above. One title, so scored, not a gate.
+            { "signal": "shares_call_with_edge", "edge": "depth_write_to_readable", "min_percent": 50, "weight": 3 }
+          ],
+
+          "ambiguity": { "rule": "score_margin", "margin": 2 },
+
+          // As normals: UE reallocates its scene textures; a rival must be an
+          // exact-descriptor copy carrying the same depth-call evidence.
+          "rival": {
+            "stall_frames": 3,
+            "frames_before_adopt": 8,
+            "max_adoptions": 64,
+            "max_reports": 40,
+            "same_descriptor": true
+          },
+
+          "reopen_clears_shortlist": false,
+
+          "enabled": false
         }
       }
     },

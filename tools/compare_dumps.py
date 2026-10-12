@@ -43,6 +43,7 @@ SURFACES = [
     ("depth", "depth"),
     ("color", "color"),
     ("normals", "normals"),
+    ("specular", "specular"),
 ]
 
 

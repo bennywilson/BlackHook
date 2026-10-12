@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iterator>
@@ -62,6 +63,13 @@ constexpr Named<DXGI_FORMAT> kFormats[] = {
     {"R10G10B10A2_UNORM", DXGI_FORMAT_R10G10B10A2_UNORM},
     {"R8G8B8A8_UNORM", DXGI_FORMAT_R8G8B8A8_UNORM},
     {"B8G8R8A8_UNORM", DXGI_FORMAT_B8G8R8A8_UNORM},
+    // UE creates its 8-bit GBuffers TYPELESS (so it can view them as sRGB or
+    // linear): on Skyrunner every 8-bit scene-extent render target is
+    // B8G8R8A8_TYPELESS (90).
+    {"B8G8R8A8_TYPELESS", DXGI_FORMAT_B8G8R8A8_TYPELESS},
+    {"B8G8R8A8_UNORM_SRGB", DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
+    {"R8G8B8A8_TYPELESS", DXGI_FORMAT_R8G8B8A8_TYPELESS},
+    {"R8G8B8A8_UNORM_SRGB", DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},
     {"R16G16_FLOAT", DXGI_FORMAT_R16G16_FLOAT},
     {"R16G16_UNORM", DXGI_FORMAT_R16G16_UNORM},
     {"R16G16_UINT", DXGI_FORMAT_R16G16_UINT},
@@ -568,11 +576,15 @@ void Load()
             Fail(surfaces.Path(spec->name) + ".enabled: " + spec->name + " cannot be disabled");
         }
     }
-    g_profile.hasNormals = false;
-    if (const json* normals = surfaces.Optional("normals"))
+    for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
     {
-        g_profile.normals = ParseSurface(*normals, "normals", surfaces.Path("normals"));
-        g_profile.hasNormals = true;
+        const char* optionalName = SurfaceProfile::kOptionalSurfaceNames[i];
+        g_profile.optional[i] = SurfaceProfile::OptionalSurface{};
+        if (const json* spec = surfaces.Optional(optionalName))
+        {
+            g_profile.optional[i].spec = ParseSurface(*spec, optionalName, surfaces.Path(optionalName));
+            g_profile.optional[i].present = true;
+        }
     }
     surfaces.RejectUnknown();
     profile.RejectUnknown();
@@ -608,25 +620,38 @@ void Load()
         {
             continue;
         }
-        if (surface != "normals")
+        SurfaceProfile::OptionalSurface* target = nullptr;
+        std::string known;
+        for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
         {
-            Fail("MV_SURFACES names '" + surface + "' - only optional surfaces can be opted into (normals)");
+            known += (known.empty() ? "" : ", ") + std::string(SurfaceProfile::kOptionalSurfaceNames[i]);
+            if (surface == SurfaceProfile::kOptionalSurfaceNames[i])
+            {
+                target = &g_profile.optional[i];
+            }
         }
-        if (!g_profile.hasNormals)
+        if (target == nullptr)
         {
-            Fail("MV_SURFACES=normals, but " + path + " has no normals spec");
+            Fail("MV_SURFACES names '" + surface + "' - only optional surfaces can be opted into (" + known + ")");
         }
-        if (!g_profile.normals.enabled)
+        if (!target->present)
         {
-            g_profile.normals.enabled = true;
-            g_profile.overrides += (g_profile.overrides.empty() ? "" : "; ") + std::string("normals.enabled=true (MV_SURFACES)");
+            Fail("MV_SURFACES=" + surface + ", but " + path + " has no " + surface + " spec");
+        }
+        if (!target->spec.enabled)
+        {
+            target->spec.enabled = true;
+            g_profile.overrides += (g_profile.overrides.empty() ? "" : "; ") + surface + ".enabled=true (MV_SURFACES)";
         }
     }
 
     std::vector<const SurfaceSpec*> all = {&g_profile.velocity, &g_profile.depth};
-    if (g_profile.hasNormals)
+    for (const SurfaceProfile::OptionalSurface& optional : g_profile.optional)
     {
-        all.push_back(&g_profile.normals);
+        if (optional.present)
+        {
+            all.push_back(&optional.spec);
+        }
     }
     for (const SurfaceSpec* spec : all)
     {
@@ -655,10 +680,15 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
             ")");
         Log("profile:   " + Summary(g_profile.velocity));
         Log("profile:   " + Summary(g_profile.depth));
-        if (g_profile.hasNormals)
+        for (const SurfaceProfile::OptionalSurface& optional : g_profile.optional)
         {
-            Log("profile:   " + Summary(g_profile.normals) +
-                (g_profile.normals.enabled ? "" : " [DISABLED - opt in with MV_SURFACES=normals]"));
+            if (optional.present)
+            {
+                Log("profile:   " + Summary(optional.spec) +
+                    (optional.spec.enabled ? ""
+                                           : std::string(" [DISABLED - opt in with MV_SURFACES=") + optional.spec.name +
+                                                 "]"));
+            }
         }
         if (!g_profile.overrides.empty())
         {
@@ -675,6 +705,18 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
     catch (...)
     {
         Log("profile: FAILED with an unknown exception. Surface identification is DISABLED for this session.");
+    }
+    return nullptr;
+}
+
+const SurfaceSpec* SurfaceProfile::Optional(const char* surfaceName) const noexcept
+{
+    for (int i = 0; i < kOptionalSurfaceCount; ++i)
+    {
+        if (optional[i].present && std::strcmp(kOptionalSurfaceNames[i], surfaceName) == 0)
+        {
+            return &optional[i].spec;
+        }
     }
     return nullptr;
 }

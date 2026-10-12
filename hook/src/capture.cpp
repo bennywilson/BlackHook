@@ -12,6 +12,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -77,11 +78,16 @@ constexpr int kMaxSurfaces = 8;
 constexpr int kSurfaceVelocity = 0;
 constexpr int kSurfaceDepth = 1;
 constexpr int kSurfaceColor = 2;
-// Optional (docs/REFACTOR_PLAN.md Phase 10): only captured when MV_SURFACES=
-// normals registered its identifier, and never required - a frame without it
-// is still complete.
-constexpr int kSurfaceNormals = 3;
-constexpr int kSurfaceCount = 4;
+// Optional surfaces (docs/REFACTOR_PLAN.md Phase 10): every index from
+// kFirstOptionalSurface on. Each is captured only when MV_SURFACES named it
+// (registering its identifier), is never required - a frame without it is
+// still complete - and shares one capture path (OnOptionalSurfaceReadable).
+// Adding one is an entry here, in kSurfaceSpecs/kStaticFacts, and in
+// surface_profile.cpp's kOptionalSurfaces - nothing else.
+constexpr int kSurfaceNormals = 3;  // GBufferA
+constexpr int kSurfaceSpecular = 4; // GBufferB: metallic, specular, roughness, shading model
+constexpr int kFirstOptionalSurface = kSurfaceNormals;
+constexpr int kSurfaceCount = 5;
 static_assert(kSurfaceCount <= kMaxSurfaces, "surface count outgrew the fixed array");
 
 // Whether a surface's identity is FOUND (structural + behavioural search) or
@@ -138,6 +144,7 @@ constexpr SurfaceSpec kSurfaceSpecs[kSurfaceCount] = {
      KnownSource::None},
     {"back buffer", "color", "", SourceKind::KnownByConstruction, KnownSource::SwapChainBackBuffer},
     {"normals", "normals", "", SourceKind::Identified, KnownSource::None},
+    {"specular", "specular", "", SourceKind::Identified, KnownSource::None},
 };
 
 // How well the fence covers a surface's copy.
@@ -1010,6 +1017,7 @@ constexpr StaticSurfaceFacts kStaticFacts[kSurfaceCount] = {
     {"depth_write_to_readable", "last_before_surface", "depth_%05d.bin"},
     {"present_back_buffer", "first_in_frame", "color_%05d.bin"},
     {"render_target_to_shader_resource", "first_in_frame", "normals_%05d.bin"},
+    {"render_target_to_shader_resource", "first_in_frame", "specular_%05d.bin"},
 };
 
 std::string ProcessBaseName()
@@ -1122,20 +1130,22 @@ std::string BuildManifest()
             j += std::string("      \"reason\": ") +
                  (DepthCaptureEnabled() ? "\"never_identified\"" : "\"capture_disabled\"") + ",\n";
         }
-        if (!layout.known && i == kSurfaceNormals)
+        if (!layout.known && i >= kFirstOptionalSurface)
         {
             // A first-class state, not a log line (docs/REFACTOR_PLAN.md sec
             // 4.1): a consumer can tell "off" from "on but never found".
+            const std::string name = kSurfaceSpecs[i].name;
             const SurfaceProfile* profile = ActiveSurfaceProfile();
-            const bool inProfile = profile != nullptr && profile->hasNormals;
-            const bool enabled = inProfile && profile->normals.enabled;
+            // auto: this file has its own TU-local SurfaceSpec (capture-side facts).
+            const auto* spec = profile != nullptr ? profile->Optional(name.c_str()) : nullptr;
+            const bool enabled = spec != nullptr && spec->enabled;
             j += std::string("      \"reason\": ") + (enabled ? "\"never_identified\"" : "\"not_enabled\"") + ",\n";
             j += "      \"detail\": " +
-                 JsonString(enabled    ? "enabled via MV_SURFACES=normals, but no resource was identified - see the "
-                                         "'normals:' lines in mv_hook.log"
-                            : inProfile ? "spec exists in profile " + profile->name +
-                                              " but enabled=false; no identification was attempted"
-                                        : std::string("the active profile has no normals spec")) +
+                 JsonString(enabled ? "enabled via MV_SURFACES=" + name + ", but no resource was identified - see the '" +
+                                          name + ":' lines in mv_hook.log"
+                            : spec != nullptr ? "spec exists in profile " + profile->name +
+                                                    " but enabled=false; no identification was attempted"
+                                              : "the active profile has no " + name + " spec") +
                  ",\n";
         }
         const bool required = i == kSurfaceVelocity || i == kSurfaceColor || (i == kSurfaceDepth && layout.known);
@@ -1152,12 +1162,13 @@ std::string BuildManifest()
         j += std::string("      \"trigger\": ") + JsonString(facts.trigger) + ",\n";
         j += std::string("      \"arbitration\": ") + JsonString(facts.arbitration) + ",\n";
         j += std::string("      \"file_pattern\": ") + JsonString(facts.filePattern);
-        if (i == kSurfaceNormals)
+        if (i >= kFirstOptionalSurface)
         {
-            // Octahedral vs direct, and whether it differs 5.2 -> 5.7, is
-            // unverified (sec 3.2 #6). Saying "unknown" is what lets
-            // mvtools.py refuse to decode instead of producing a plausible
-            // normal field from a guess.
+            // Unverified against engine source for every optional surface
+            // (normals: octahedral vs direct, sec 3.2 #6; specular: GBufferB
+            // channel packing). Saying "unknown" is what lets mvtools.py
+            // refuse to decode instead of producing a plausible field from a
+            // guess.
             j += ",\n      \"encoding\": { \"kind\": \"unknown\" }";
         }
         if (i == kSurfaceVelocity)
@@ -1702,39 +1713,56 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 }
 
-// DIAGNOSTIC (Phase 10): why burst frames end up without normals. On
-// Skyrunner only 641 of 2111 burst frames carried normals, in long stretches,
-// with no slot contention and no reopen. Two candidate causes, told apart
-// here:
-//   - frame attribution: copies are tagged with the Present count; GBufferA's
-//     first edge comes early (base pass), so if UE records frame N+1 before
-//     Present(N), that edge lands on frame N's slot - after velocity, where
-//     normals is already copied - and is skipped (or worse, copied into N).
-//   - the selected pointer stops taking edges (transient reallocation): no
-//     normals trigger is tagged with that frame at all.
+// DIAGNOSTIC (Phase 10), per optional surface: why burst frames end up
+// without it. Built for normals on Skyrunner (641 of 2111 frames), where it
+// separated the two candidate causes:
+//   - frame attribution: copies are tagged with the Present count; an early
+//     edge (base pass) for frame N+1 recorded before Present(N) lands on frame
+//     N's slot after velocity - "afterVelocity*" below.
+//   - the selected pointer stops taking edges (another allocation took over):
+//     no trigger is tagged with that frame at all - "framesNoTrigger". This
+//     was the answer; rival adoption fixed it.
 // Guarded by g_mutex (both writers hold it). Reset when a burst arms; summary
 // logged at "burst recorded".
-struct NormalsDiag
+struct OptionalDiag
 {
-    uint64_t triggers = 0;            // OnNormalsReadable calls during a burst
+    uint64_t triggers = 0;            // OnOptionalSurfaceReadable calls during a burst
     uint64_t copied = 0;              // ...that recorded a copy
     uint64_t copiedAfterVelocity = 0; // ...of which, into a slot velocity had already filled (suspect: next frame's edge)
     uint64_t noSlot = 0;              // ...skipped, no slot
-    uint64_t secondEdge = 0;          // ...skipped, normals already copied, velocity not yet (expected: 2 edges a frame)
-    uint64_t afterVelocityDup = 0;    // ...skipped, normals AND velocity already in the slot (frame-skew signature)
-    uint64_t framesWithout = 0;       // submitted burst frames with no normals copy
-    uint64_t framesNoTrigger = 0;     // ...of which, not one normals trigger was tagged with that frame
+    uint64_t secondEdge = 0;          // ...skipped, already copied, velocity not yet (expected with >1 edge a frame)
+    uint64_t afterVelocityDup = 0;    // ...skipped, it AND velocity already in the slot (frame-skew signature)
+    uint64_t framesWithout = 0;       // submitted burst frames without this surface
+    uint64_t framesNoTrigger = 0;     // ...of which, not one trigger was tagged with that frame
     uint64_t lastTriggerFrame = ~0ull;
 };
-NormalsDiag g_normalsDiag;
+OptionalDiag g_optionalDiag[kSurfaceCount];
 
-void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* normals, int stateAfter)
+int OptionalSurfaceIndex(const char* name)
 {
-    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || normals == nullptr)
+    for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
+    {
+        if (std::strcmp(kSurfaceSpecs[i].name, name) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void OnOptionalSurfaceReadable(
+    const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || resource == nullptr)
     {
         return;
     }
     if (g_originalResourceBarrier == nullptr)
+    {
+        return;
+    }
+    const int index = surfaceName != nullptr ? OptionalSurfaceIndex(surfaceName) : -1;
+    if (index < 0)
     {
         return;
     }
@@ -1748,59 +1776,61 @@ void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* norma
 
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     Slot* slot = AcquireSlotForFrame(frame);
-    ++g_normalsDiag.triggers;
-    g_normalsDiag.lastTriggerFrame = frame;
+    OptionalDiag& diag = g_optionalDiag[index];
+    const std::string name = kSurfaceSpecs[index].name;
+    ++diag.triggers;
+    diag.lastTriggerFrame = frame;
     // first_in_frame, one copy: the first RT -> SRV edge is the base pass
-    // finishing GBufferA. No slot means the frame is skipped anyway (the
-    // velocity path logs that).
+    // finishing the GBuffer target. No slot means the frame is skipped anyway
+    // (the velocity path logs that).
     if (slot == nullptr)
     {
-        ++g_normalsDiag.noSlot;
+        ++diag.noSlot;
         return;
     }
     const bool velocityAlready = slot->surfaces[kSurfaceVelocity].present;
-    if (slot->surfaces[kSurfaceNormals].present)
+    if (slot->surfaces[index].present)
     {
         if (velocityAlready)
         {
-            if (++g_normalsDiag.afterVelocityDup <= 3)
+            if (++diag.afterVelocityDup <= 3)
             {
-                Log("capture: normals-diag: frame " + std::to_string(frame) +
-                    " - a normals edge arrived after this frame's velocity AND normals were both recorded (frame-skew "
-                    "signature: it likely belongs to the next frame)");
+                Log("capture: " + name + "-diag: frame " + std::to_string(frame) + " - a " + name +
+                    " edge arrived after this frame's velocity AND " + name +
+                    " were both recorded (frame-skew signature: it likely belongs to the next frame)");
             }
         }
         else
         {
-            ++g_normalsDiag.secondEdge;
+            ++diag.secondEdge;
         }
         return;
     }
-    if (velocityAlready && ++g_normalsDiag.copiedAfterVelocity <= 3)
+    if (velocityAlready && ++diag.copiedAfterVelocity <= 3)
     {
-        Log("capture: normals-diag: frame " + std::to_string(frame) +
-            " - first normals copy for this frame arrived AFTER its velocity copy (may be the next frame's GBufferA)");
+        Log("capture: " + name + "-diag: frame " + std::to_string(frame) + " - first " + name +
+            " copy for this frame arrived AFTER its velocity copy (may be the next frame's)");
     }
 
-    const D3D12_RESOURCE_DESC desc = normals->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceNormals, desc))
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if (!DumpLayoutAccepts(index, desc))
     {
         return;
     }
-    SurfaceCapture& surface = slot->surfaces[kSurfaceNormals];
+    SurfaceCapture& surface = slot->surfaces[index];
     const bool firstUse = surface.readback == nullptr;
-    if (!EnsureReadback(surface, kSurfaceNormals, desc))
+    if (!EnsureReadback(surface, index, desc))
     {
         return;
     }
     if (firstUse)
     {
-        SnapshotDumpLayout(kSurfaceNormals, surface);
+        SnapshotDumpLayout(index, surface);
     }
 
     RecordCopyToReadback(
         cmdList,
-        normals,
+        resource,
         surface.readback.Get(),
         surface.footprints,
         static_cast<D3D12_RESOURCE_STATES>(stateAfter),
@@ -1811,7 +1841,7 @@ void OnNormalsReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* norma
     surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
     ++surface.copies;
     surface.present = true;
-    ++g_normalsDiag.copied;
+    ++diag.copied;
 }
 
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
@@ -1896,6 +1926,129 @@ void NotifySurfaceReopened(const char* surfaceName)
         "dump homogeneous - press F8 again once the search has settled.");
 }
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (Phase 10): MV_SNAPSHOT=<surface>. Copies ONE frame of each
+// resource that surface has shortlisted at the scene extent - at its own
+// RT -> SRV edge, exactly as a capture would - and writes it as
+// snapshot_<surface>_<ptr>_<w>x<h>_fmt<f>_pitch<p>.bin in the dump
+// directory. For telling candidates apart by their pixels when every
+// barrier-level signal ties them (specular on Skyrunner: GBufferB vs
+// GBufferC and five more B8G8R8A8_TYPELESS targets). It identifies nothing
+// and changes no selection. Copies are recorded on the game's command list;
+// the fence is signalled on the game's queue at a LATER Present, by which
+// time that list has been submitted. Guarded by g_mutex.
+// ---------------------------------------------------------------------------
+namespace
+{
+
+struct Snapshot
+{
+    std::string surface;
+    ID3D12Resource* source = nullptr; // identity only (for the filename); not dereferenced after recording
+    D3D12_RESOURCE_DESC desc{};
+    ComPtr<ID3D12Resource> readback;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+    UINT64 bytes = 0;
+    unsigned long long frame = 0;
+    UINT64 fence = 0;
+};
+std::vector<Snapshot> g_snapshots;
+std::vector<ID3D12Resource*> g_snapshotTaken;
+constexpr size_t kMaxSnapshots = 32;
+
+const std::string& SnapshotSurface()
+{
+    static const std::string surface = []
+    {
+        char value[64]{};
+        const DWORD length = GetEnvironmentVariableA("MV_SNAPSHOT", value, sizeof(value));
+        return (length > 0 && length < sizeof(value)) ? std::string(value, length) : std::string();
+    }();
+    return surface;
+}
+
+// Caller must hold g_mutex.
+void ProcessSnapshots()
+{
+    if (g_snapshots.empty() || g_queue == nullptr || g_fence == nullptr)
+    {
+        return;
+    }
+    const unsigned long long now = g_frameIndex.load(std::memory_order_relaxed);
+    for (auto it = g_snapshots.begin(); it != g_snapshots.end();)
+    {
+        Snapshot& s = *it;
+        if (s.fence == 0)
+        {
+            if (now > s.frame && SUCCEEDED(g_queue->Signal(g_fence.Get(), g_nextFenceValue)))
+            {
+                s.fence = g_nextFenceValue++;
+            }
+            ++it;
+            continue;
+        }
+        if (g_fence->GetCompletedValue() < s.fence)
+        {
+            ++it;
+            continue;
+        }
+        std::vector<uint8_t> data;
+        if (MapOut(s.readback.Get(), s.bytes, data))
+        {
+            char name[160]{};
+            sprintf_s(name, "snapshot_%s_%llu_%llux%u_fmt%d_pitch%u.bin", s.surface.c_str(),
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s.source)), s.desc.Width,
+                      s.desc.Height, static_cast<int>(s.desc.Format), s.footprints[0].Footprint.RowPitch);
+            EnqueueWrite(DumpDir() + name, std::move(data));
+            Log(std::string("capture: snapshot written - ") + name + " (copied on frame " + std::to_string(s.frame) +
+                ")");
+        }
+        it = g_snapshots.erase(it);
+    }
+}
+
+} // namespace
+
+void SnapshotCandidate(const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource,
+                       int stateAfter)
+{
+    if (SnapshotSurface().empty() || surfaceName == nullptr || SnapshotSurface() != surfaceName ||
+        cmdList == nullptr || resource == nullptr || g_originalResourceBarrier == nullptr)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_snapshotTaken.size() >= kMaxSnapshots ||
+        std::find(g_snapshotTaken.begin(), g_snapshotTaken.end(), resource) != g_snapshotTaken.end() ||
+        !EnsureDevice(cmdList))
+    {
+        return;
+    }
+    g_snapshotTaken.push_back(resource);
+
+    Snapshot s;
+    s.surface = surfaceName;
+    s.source = resource;
+    s.desc = resource->GetDesc();
+    s.frame = g_frameIndex.load(std::memory_order_relaxed);
+    const UINT subresources = SubresourceCountFor(g_device.Get(), s.desc);
+    s.footprints.resize(subresources);
+    g_device->GetCopyableFootprints(&s.desc, 0, subresources, 0, s.footprints.data(), nullptr, nullptr, &s.bytes);
+    if (!CreateReadbackBuffer(g_device.Get(), s.bytes, s.readback))
+    {
+        Log("capture: snapshot readback creation failed - skipping one candidate");
+        return;
+    }
+    RecordCopyToReadback(
+        cmdList, resource, s.readback.Get(), s.footprints, static_cast<D3D12_RESOURCE_STATES>(stateAfter),
+        g_originalResourceBarrier);
+    Log(std::string("capture: snapshot recorded - ") + surfaceName + " candidate " +
+        std::to_string(reinterpret_cast<uintptr_t>(resource)) + " " + DescToString(s.desc) + " on frame " +
+        std::to_string(s.frame) + " (" + std::to_string(g_snapshotTaken.size()) + "/" + std::to_string(kMaxSnapshots) +
+        ")");
+    g_snapshots.push_back(std::move(s));
+}
+
 void OnPresent(IDXGISwapChain* swapChain)
 {
     if (swapChain == nullptr || g_originalExecuteCommandLists == nullptr)
@@ -1905,6 +2058,8 @@ void OnPresent(IDXGISwapChain* swapChain)
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
+    ProcessSnapshots(); // diagnostic; nothing to do unless MV_SNAPSHOT recorded copies
+
     // An armed burst begins here, at a frame boundary, so the first captured
     // frame is one whose recording was watched from the start.
     if (g_burstArmed.exchange(false, std::memory_order_relaxed))
@@ -1913,7 +2068,10 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.store(kBurstPresentBudget);
         g_burstEndReason.store(BurstEndReason::NotEnded, std::memory_order_relaxed);
         g_manifestDirty.store(true, std::memory_order_relaxed);
-        g_normalsDiag = NormalsDiag{};
+        for (OptionalDiag& d : g_optionalDiag)
+        {
+            d = OptionalDiag{};
+        }
         // Frozen once, here, not re-read live per frame - see the field
         // comment (finding 1.14).
         g_depthRequiredForBurst.store(
@@ -2188,12 +2346,16 @@ void OnPresent(IDXGISwapChain* swapChain)
     slot->captureIndex = g_captureCounter.fetch_add(1);
     slot->state = SlotState::Submitted;
 
-    if (GetSurfaceRegistry().Find("normals") != nullptr && !slot->surfaces[kSurfaceNormals].present)
+    for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
     {
-        ++g_normalsDiag.framesWithout;
-        if (g_normalsDiag.lastTriggerFrame == ~0ull || g_normalsDiag.lastTriggerFrame < slot->frameIndex)
+        if (GetSurfaceRegistry().Find(kSurfaceSpecs[i].name) != nullptr && !slot->surfaces[i].present)
         {
-            ++g_normalsDiag.framesNoTrigger;
+            OptionalDiag& d = g_optionalDiag[i];
+            ++d.framesWithout;
+            if (d.lastTriggerFrame == ~0ull || d.lastTriggerFrame < slot->frameIndex)
+            {
+                ++d.framesNoTrigger;
+            }
         }
     }
 
@@ -2211,15 +2373,21 @@ void OnPresent(IDXGISwapChain* swapChain)
         // necessarily on disk yet. Only ShutdownCapture guarantees that.
         Log("capture: burst recorded, " + std::to_string(g_captureCounter.load()) + " frames; writes still draining (" +
             std::to_string(g_droppedWrites.load()) + " dropped)");
-        if (GetSurfaceRegistry().Find("normals") != nullptr)
+        for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
         {
-            const NormalsDiag& d = g_normalsDiag;
-            Log("capture: normals-diag: burst summary - triggers=" + std::to_string(d.triggers) +
+            if (GetSurfaceRegistry().Find(kSurfaceSpecs[i].name) == nullptr)
+            {
+                continue;
+            }
+            const std::string name = kSurfaceSpecs[i].name;
+            const OptionalDiag& d = g_optionalDiag[i];
+            Log("capture: " + name + "-diag: burst summary - triggers=" + std::to_string(d.triggers) +
                 " copied=" + std::to_string(d.copied) + " (of which after velocity: " +
                 std::to_string(d.copiedAfterVelocity) + ") skipped: noSlot=" + std::to_string(d.noSlot) +
                 " secondEdge=" + std::to_string(d.secondEdge) + " afterVelocityDup=" +
-                std::to_string(d.afterVelocityDup) + " | frames without normals=" + std::to_string(d.framesWithout) +
-                " (no trigger tagged with that frame at all: " + std::to_string(d.framesNoTrigger) +
+                std::to_string(d.afterVelocityDup) + " | frames without " + name + "=" +
+                std::to_string(d.framesWithout) + " (no trigger tagged with that frame at all: " +
+                std::to_string(d.framesNoTrigger) +
                 "). Many afterVelocity* = frame attribution; framesNoTrigger ~ framesWithout = the selected "
                 "resource stopped taking edges.");
         }

@@ -180,6 +180,10 @@ struct LookAlike {
     // that take turns (see velocityAllocationActive) - 1 is selected, 2 and 3
     // adopted as rivals, then 2 again for longer than the silence threshold.
     int velocityAllocation = 0;
+    // A TYPELESS resource (UE's 8-bit GBuffers) needs a typed format for its
+    // RTV and clear value; UNKNOWN means "same as format".
+    DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+    bool shouldBeSpecular = false; // --specular: the one specular must select
 
     ComPtr<ID3D12Heap> heap;
     ComPtr<ID3D12Resource> resource;
@@ -303,6 +307,8 @@ int main(int argc, char** argv) {
     // Phase 10 follow-up: SceneVelocity rotating through three allocations,
     // the way Skyrunner's does. See velocityAllocationActive.
     bool velocityRealloc = false;
+    // GBufferB (specular) and GBufferC look-alikes, MV_SURFACES gains specular.
+    bool specular = false;
     // Which shape of velocity pass to model. "oxi" is the strict 2-cycle this
     // project was developed against; "skyrunner" is the 5-transition,
     // UNORDERED_ACCESS-touching pass measured on a third-party UE 5.2 title.
@@ -333,6 +339,8 @@ int main(int argc, char** argv) {
             normals = true;
         } else if (arg == "--velocity-realloc") {
             velocityRealloc = true;
+        } else if (arg == "--specular") {
+            specular = true;
         }
     }
 
@@ -362,10 +370,11 @@ int main(int argc, char** argv) {
         printf("[testhost] Phase 9 negative test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
                "identification must find NO candidate and must not fall back\n", kNegativeProfile);
     }
-    if (normals) {
-        SetEnvironmentVariableA("MV_SURFACES", "normals");
-        printf("[testhost] MV_SURFACES=normals: a GBufferA look-alike joins the line-up and must be the one "
-               "normals selects\n");
+    if (normals || specular) {
+        const char* surfaces = normals && specular ? "normals,specular" : normals ? "normals" : "specular";
+        SetEnvironmentVariableA("MV_SURFACES", surfaces);
+        printf("[testhost] MV_SURFACES=%s: GBuffer look-alikes join the line-up and must be the ones selected\n",
+               surfaces);
     }
     // Every path below that expects identification to select nothing.
     const bool expectNothingSelected = ambiguous || phase9Negative;
@@ -559,6 +568,28 @@ int main(int argc, char** argv) {
         lineUp.insert(lineUp.begin(), gbufferA);
     }
 
+    if (specular) {
+        // GBufferB and GBufferC as measured on Skyrunner: both B8G8R8A8_TYPELESS,
+        // plain RT, scene extent, one RT -> SRV a frame - identical on every
+        // structural signal, so they tie without more. MV_SNAPSHOT's pixels
+        // showed which was which, and the barrier evidence that then separated
+        // them: GBufferB is readable in the same ResourceBarrier call as scene
+        // depth on every edge; GBufferC never.
+        LookAlike gbufferB{"GBufferB", "specular: B8G8R8A8_TYPELESS, RT only, readable in the same call as depth",
+                           DXGI_FORMAT_B8G8R8A8_TYPELESS, kVelocityWidth, kVelocityHeight,
+                           Behaviour::ReadWithDepth, false};
+        gbufferB.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        gbufferB.viewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        gbufferB.shouldBeSpecular = true;
+        LookAlike gbufferC = gbufferB;
+        gbufferC.name = "GBufferC";
+        gbufferC.why = "specular decoy: identical descriptor (base colour), never batched with depth";
+        gbufferC.behaviour = Behaviour::Velocity;
+        gbufferC.shouldBeSpecular = false;
+        lineUp.insert(lineUp.begin(), gbufferC);
+        lineUp.insert(lineUp.begin(), gbufferB);
+    }
+
     if (pipeline == "skyrunner") {
         // Drop the "twin, read twice" decoy for this pipeline, and note WHY,
         // because the reason is a finding rather than a convenience.
@@ -663,8 +694,9 @@ int main(int argc, char** argv) {
         // Must match the value actually cleared to below, or every frame
         // produces a debug-layer warning about a slow clear and drowns the
         // output we care about.
+        const DXGI_FORMAT viewFormat = target.viewFormat != DXGI_FORMAT_UNKNOWN ? target.viewFormat : target.format;
         D3D12_CLEAR_VALUE clearValue{};
-        clearValue.Format = target.format;
+        clearValue.Format = viewFormat;
         memcpy(clearValue.Color, kVelocityClear, sizeof(kVelocityClear));
         if (!Check(device->CreatePlacedResource(
                        target.heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue,
@@ -673,7 +705,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         target.rtvIndex = kBackBufferCount + static_cast<UINT>(i);
-        device->CreateRenderTargetView(target.resource.Get(), nullptr, rtvAt(target.rtvIndex));
+        if (target.viewFormat != DXGI_FORMAT_UNKNOWN) {
+            D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
+            rtvDesc.Format = target.viewFormat;
+            rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            device->CreateRenderTargetView(target.resource.Get(), &rtvDesc, rtvAt(target.rtvIndex));
+        } else {
+            device->CreateRenderTargetView(target.resource.Get(), nullptr, rtvAt(target.rtvIndex));
+        }
         printf("[testhost] look-alike %zu: %-22s %llux%u fmt=%2d - %s\n", i, target.name, target.width,
                target.height, static_cast<int>(target.format), target.why);
     }
@@ -1296,6 +1335,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Phase 10 follow-up: did specular pick GBufferB over GBufferC? ---
+    bool specularIdentificationPassed = true;
+    if (specular && hookModule != nullptr) {
+        using SurfaceFn = void* (*)(const char*);
+        auto identifiedSurface = reinterpret_cast<SurfaceFn>(
+            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedSurface")));
+        void* picked = identifiedSurface != nullptr ? identifiedSurface("specular") : nullptr;
+        const LookAlike* expected = nullptr;
+        printf("\n[testhost] ==== specular identification ====\n");
+        for (const LookAlike& target : lineUp) {
+            if (target.shouldBeSpecular) {
+                expected = &target;
+            }
+            const bool isPicked = picked == static_cast<void*>(target.resource.Get());
+            if (isPicked || target.format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+                printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
+                       isPicked ? "<== SELECTED as specular" : "");
+            }
+        }
+        if (expectNothingSelected) {
+            specularIdentificationPassed = picked == nullptr;
+            printf("[testhost] %s\n", specularIdentificationPassed
+                                           ? "PASS - no specular selected, because velocity was never identified"
+                                           : "FAIL - specular selected with no velocity extent to key off");
+        } else {
+            specularIdentificationPassed = expected != nullptr && picked == static_cast<void*>(expected->resource.Get());
+            printf("[testhost] %s\n",
+                   specularIdentificationPassed
+                       ? "PASS - specular selected GBufferB over the identical-descriptor GBufferC (depth-call evidence)"
+                       : "FAIL - specular identification (see the 'specular:' lines in the log)");
+        }
+    }
+
     // ---- docs/REFACTOR_PLAN.md Phase 8's three required behaviour tests -
     // written to exercise SurfaceRegistry's postconditions, not just
     // identification correctness.
@@ -1615,6 +1687,7 @@ int main(int argc, char** argv) {
             const int velocities = count("vel_*.bin");
             const int depths = count("depth_*.bin");
             const int normalsFrames = count("normals_*.bin");
+            const int specularFrames = count("specular_*.bin");
             printf("\n[testhost] ==== dump contents ====\n");
             printf("[testhost]   velocity frames: %d\n", velocities);
             printf("[testhost]   depth frames:    %d\n", depths);
@@ -1641,6 +1714,17 @@ int main(int argc, char** argv) {
                 printf("[testhost] PASS - normals on %d of %d captured frames (%d missed: the first rival-adoption "
                        "window, before the 2nd allocation was adopted)\n", normalsFrames, velocities,
                        velocities - normalsFrames);
+            }
+            printf("[testhost]   specular frames: %d\n", specularFrames);
+            if (!specular && specularFrames != 0) {
+                printf("[testhost] FAIL - specular was captured without MV_SURFACES=specular\n");
+                normalsDumpOk = false;
+            } else if (specular && !expectNothingSelected && specularFrames != velocities) {
+                // GBufferB here has one allocation: every frame must carry it.
+                printf("[testhost] FAIL - %d velocity frames but %d specular frames\n", velocities, specularFrames);
+                normalsDumpOk = false;
+            } else if (specular && !expectNothingSelected) {
+                printf("[testhost] PASS - every captured frame also has specular\n");
             }
             if (expectNothingSelected) {
                 // Identification selects nothing in this mode, so capturing
@@ -1689,6 +1773,10 @@ int main(int argc, char** argv) {
         printf("[testhost] %s\n", normalsIdentificationPassed ? "PASS - normals identification"
                                                               : "FAIL - normals identification");
     }
+    if (specular) {
+        printf("[testhost] %s\n", specularIdentificationPassed ? "PASS - specular identification"
+                                                               : "FAIL - specular identification");
+    }
     if (phase8Tests) {
         printf("[testhost] %s\n", resizeTestPassed ? "PASS - Phase 8 test 1 (resize stops capture until reidentified)"
                                                      : "FAIL - Phase 8 test 1 (resize stops capture until reidentified)");
@@ -1704,7 +1792,7 @@ int main(int argc, char** argv) {
     DestroyWindow(hwnd);
     const int exitCode =
         (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed &&
-         normalsIdentificationPassed &&
+         normalsIdentificationPassed && specularIdentificationPassed &&
          (!phase8Tests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
             ? 0
             : 1;
