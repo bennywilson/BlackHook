@@ -340,6 +340,15 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         spec.rivalFramesBeforeAdopt = static_cast<uint64_t>(rival.Int("frames_before_adopt", 1, 100000));
         spec.rivalMaxAdoptions = static_cast<int>(rival.Int("max_adoptions", 0, 100000));
         spec.rivalMaxReports = static_cast<int>(rival.Int("max_reports", 0, 100000));
+        // Optional; absent == false (velocity's long-standing behaviour).
+        if (const json* same = rival.Optional("same_descriptor"))
+        {
+            if (!same->is_boolean())
+            {
+                Fail(rival.Path("same_descriptor") + ": expected true or false");
+            }
+            spec.rivalSameDescriptor = same->get<bool>();
+        }
         rival.RejectUnknown();
     }
 

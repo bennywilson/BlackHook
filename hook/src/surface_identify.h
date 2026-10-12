@@ -207,11 +207,17 @@ struct SurfaceSpec
     AmbiguityRule ambiguityRule;
     int ambiguityMargin; // ScoreMargin: point margin. EdgeCountRatio: percent (150 == 1.5x).
 
-    // --- rival adoption (consumed only by VelocitySurfaceIdentifier) ----
+    // --- rival adoption (OnUnmatchedEdge; all zero == never adopts) ------
     uint64_t rivalStallFrames;
     uint64_t rivalFramesBeforeAdopt;
     int rivalMaxAdoptions;
     int rivalMaxReports;
+    // A rival must have the selected resource's exact format and flags - a
+    // reallocation, nothing else. Normals needs it: on Skyrunner scene colour
+    // (R16G16B16A16_FLOAT, RT|UAV) also shares calls with depth and was
+    // adopted as "GBufferA" without it. Velocity leaves it off (its adoption
+    // has tolerated a format change since before profiles existed).
+    bool rivalSameDescriptor;
 
     // --- lifecycle -----------------------------------------------------
     // velocity: true (reopen throws away the shortlist/profiles and
@@ -398,7 +404,6 @@ class SurfaceIdentifier
 {
 public:
     explicit SurfaceIdentifier(const SurfaceSpec& spec) noexcept;
-    virtual ~SurfaceIdentifier() = default;
 
     SurfaceIdentifier(const SurfaceIdentifier&) = delete;
     SurfaceIdentifier& operator=(const SurfaceIdentifier&) = delete;
@@ -495,63 +500,38 @@ public:
     // threshold.
     uint64_t FramesSinceEdge(uint64_t frame) const noexcept;
 
-    // The only two extension points (docs/REFACTOR_PLAN.md sec 2.3).
+    // Rival adoption - called when some OTHER resource takes this surface's
+    // trigger edge. Returns true to have the caller adopt it as an
+    // additional candidate (via MarkCandidate): the engine moved the pass to
+    // another allocation of the same texture rather than stopping it.
+    //
+    // Used to be velocity's one subclass (VelocitySurfaceIdentifier).
+    // Phase 10 found normals needs the same on Skyrunner - UE's allocator
+    // keeps several physical copies of the scene textures and switches
+    // between them in stretches, and a surface pinned to one pointer only
+    // captures while that copy is in use - so it moved here, switched on by
+    // the spec's "rival" block (absent == never adopts; depth). Its
+    // thresholds were already data. One rule added for the move: when the
+    // selected resource carried a shares_call_with_edge signal, a rival must
+    // carry it too - otherwise normals would adopt the same-format
+    // post-process target that takes its edge every frame (see
+    // RivalHasSelectedEvidence).
+    bool OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame) noexcept;
 
-    // Called when some OTHER resource takes this surface's trigger edge
-    // while the selected one is stalled. Return true to have the caller
-    // adopt it as an additional candidate (via MarkCandidate) - the base
-    // class does not adopt on the subclass's behalf.
-    virtual bool OnUnmatchedEdge(ID3D12Resource* /*resource*/, uint64_t /*frame*/) noexcept
-    {
-        return false;
-    }
-
-protected:
-    // Called once, when a resource is selected.
-    virtual void OnSelected(ID3D12Resource* /*resource*/, const D3D12_RESOURCE_DESC& /*desc*/) noexcept
-    {
-    }
-
-    // Extra resources this identifier is also actively capturing from,
-    // beyond Selected() - currently only VelocitySurfaceIdentifier's
-    // rival-adopted alternate (g_identifiedAlt in the pre-extraction code).
-    virtual bool IsAlsoTracked(ID3D12Resource* /*resource*/) const noexcept
-    {
-        return false;
-    }
-
-    // Called at the end of Reopen(), for state Reopen() itself doesn't know
-    // about - VelocitySurfaceIdentifier clears its adopted alternate here.
-    virtual void OnReopen() noexcept
-    {
-    }
-
-    // Rival-adoption state lives entirely in VelocitySurfaceIdentifier, but
-    // the trigger-edge test and liveness bookkeeping it needs to piggyback
-    // on (matching resource, matching edge, extent) are the base class's, so
-    // subclasses read them through these rather than duplicating the test.
+private:
     ID3D12Resource* SelectedRaw() const noexcept
     {
         return identified_.load(std::memory_order_acquire);
     }
-    uint64_t IdentifiedWidth() const noexcept
-    {
-        return identifiedWidth_.load(std::memory_order_relaxed);
-    }
-    uint32_t IdentifiedHeight() const noexcept
-    {
-        return identifiedHeight_.load(std::memory_order_relaxed);
-    }
-    int IdentifiedFormat() const noexcept
-    {
-        return identifiedFormat_.load(std::memory_order_relaxed);
-    }
     bool StructurallyPlausibleForRival(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) const noexcept;
-
-    // Needed by VelocitySurfaceIdentifier's own log lines (ADOPTED, RIVAL).
     std::string DescLine(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) const noexcept;
 
-private:
+    // The selected resource's shares_call_with_edge evidence, one bit per
+    // spec_.signals index, captured at selection. A rival must match it.
+    bool SharesCallSignalPresent(const BarrierProfile& p, const SignalWeight& sw) const noexcept;
+    // -1: not enough edges observed to judge yet. 0: fails. 1: carries every
+    // shares_call_with_edge signal the selected resource carried.
+    int RivalHasSelectedEvidence(ID3D12Resource* resource) const noexcept;
     struct Survivor
     {
         ID3D12Resource* resource = nullptr;
@@ -602,6 +582,7 @@ private:
     std::atomic<uint64_t> identifiedWidth_{0};
     std::atomic<uint32_t> identifiedHeight_{0};
     std::atomic<int> identifiedFormat_{0};
+    std::atomic<unsigned> identifiedFlags_{0};
 
     mutable std::shared_mutex candidateMutex_;
     std::unordered_map<ID3D12Resource*, Candidate> candidates_;
@@ -612,6 +593,26 @@ private:
     std::atomic<bool> decisionMade_{false};
     std::atomic<uint64_t> decideAtFrame_{0};
     std::atomic<int> attempt_{0};
+
+    // --- rival adoption (see OnUnmatchedEdge) ------------------------------
+    // The SECOND target, when the engine is using two. Originally written up
+    // for velocity as FVelocityRendering::GetFormat returning a different
+    // width because NeedVelocityDepth() changed at runtime - that diagnosis
+    // is WRONG (see DEBUGGING.md, "Correction: it works, and the width story
+    // was wrong") and kept only as a note not to re-propose it. Every
+    // adoption observed has been same width AND same format as the selected
+    // resource: a reallocation to a new address with an identical descriptor.
+    std::atomic<ID3D12Resource*> identifiedAlt_{nullptr};
+    std::atomic<int> rivalReports_{0};
+    std::atomic<uint64_t> rivalRunLength_{0};
+    std::atomic<uint64_t> lastRivalFrame_{0};
+    ID3D12Resource* lastRivalResource_ = nullptr;
+    std::atomic<int> adoptions_{0};
+    std::atomic<bool> adoptLimitReported_{false};
+    std::atomic<bool> evidenceRejectReported_{false};
+    // bit i: spec_.signals[i] (a shares_call_with_edge signal) held for the
+    // selected resource. Written at selection, read from the barrier hook.
+    std::atomic<uint32_t> selectedEvidenceMask_{0};
 };
 
 } // namespace mv

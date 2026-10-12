@@ -14,8 +14,8 @@
 // SurfaceRegistry - docs/REFACTOR_PLAN.md sec 2.5, Phase 8.
 //
 // Owns the identifiers themselves (built by InstallD3D12Hooks from the active
-// profile's specs - a plain SurfaceIdentifier for depth, velocity_identify.h's
-// subclass for velocity's rival adoption), and everything that used to be
+// profile's specs - every one a plain SurfaceIdentifier since Phase 10 moved
+// rival adoption into the base class), and everything that used to be
 // hand-wired across d3d12_hook.cpp and resource_tracking.h because no single
 // file had visibility into every registered identifier at once:
 //

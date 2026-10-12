@@ -20,7 +20,6 @@
 #include "resource_tracking.h"
 #include "surface_profile.h"
 #include "surface_registry.h"
-#include "velocity_identify.h"
 
 #include <cstring>
 
@@ -295,16 +294,16 @@ HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12C
     g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
 }
 
-// SceneVelocity's Identification policy lives in velocity_identify.cpp.
-// The cap on the max distinct resources we call GetDesc() on lives in
-// resource_tracking.cpp, next to the "seen" set it belongs with - see
-// TryTakeIdentifyBudget.
+// Identification policy is data (profiles/ue5.json) run by SurfaceIdentifier
+// (surface_identify.cpp). The cap on the max distinct resources we call
+// GetDesc() on lives in resource_tracking.cpp, next to the "seen" set it
+// belongs with - see TryTakeIdentifyBudget.
 
 // ---------------------------------------------------------------------------
 // Feeding the identifier.
 //
 // Every resource that turns up in a barrier gets its desc read once and
-// handed to velocity_identify, keeping a behaviour profile for all of them.
+// handed to the surface registry, keeping a behaviour profile for all of them.
 //
 // Profiles are keyed on raw pointers with no references, so a recycled
 // address merges two resources' histories - this biases against selecting
@@ -767,10 +766,12 @@ bool InstallD3D12Hooks()
     // no built-in spec to fall back to (surface_profile.h).
     if (const mv::SurfaceProfile* profile = mv::LoadSurfaceProfile())
     {
-        mv::GetSurfaceRegistry().Register(mv::MakeVelocityIdentifier(profile->velocity));
+        // Every surface is a plain SurfaceIdentifier, configured entirely by
+        // its spec - including rival adoption, which velocity's subclass used
+        // to own until Phase 10 found normals needed it too.
+        mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->velocity));
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
-        // Optional, after velocity (its extent source). A plain identifier -
-        // the plan found no behaviour in it that needs a subclass (sec 2.4).
+        // Optional, after velocity (its extent source).
         if (profile->hasNormals && profile->normals.enabled)
         {
             mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->normals));

@@ -92,8 +92,9 @@
           // Top two survivors must differ by at least 2 points.
           "ambiguity": { "rule": "score_margin", "margin": 2 },
 
-          // Optional (absent = never adopt). Consumed only by
-          // VelocitySurfaceIdentifier's rival-adoption state machine.
+          // Optional (absent = never adopt): rival adoption, following the
+          // pass when the engine moves it to another allocation of the same
+          // texture (SurfaceIdentifier::OnUnmatchedEdge).
           "rival": {
             // How long to watch a stall before checking for a rival, and how
             // many consecutive frames a rival must carry the edge before being
@@ -251,6 +252,27 @@
           ],
 
           "ambiguity": { "rule": "score_margin", "margin": 2 },
+
+          // Measured on Skyrunner: UE keeps several physical copies of
+          // GBufferA (as it does of SceneVelocity - velocity adopted 3 in the
+          // same session) and switches between them in stretches. Pinned to
+          // one pointer, normals was captured on only 215-641 of ~1000-2100
+          // burst frames, the rest having no GBufferA edge at all. Same
+          // thresholds as velocity. A rival must also carry the
+          // shares_call_with_edge evidence the selection was made on, or the
+          // same-format post-process target above - which takes its edge
+          // every frame - would be adopted the first time GBufferA moved.
+          // same_descriptor: evidence alone was NOT enough live - scene
+          // colour (R16G16B16A16_FLOAT, RT|UAV) also shares calls with depth
+          // (33%) and was adopted as "GBufferA", which then ended the burst
+          // on a layout change. A reallocation has the identical descriptor.
+          "rival": {
+            "stall_frames": 3,
+            "frames_before_adopt": 8,
+            "max_adoptions": 64,
+            "max_reports": 40,
+            "same_descriptor": true
+          },
 
           // A dependent of velocity, like depth: reopen keeps the shortlist.
           "reopen_clears_shortlist": false,

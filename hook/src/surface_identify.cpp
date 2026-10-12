@@ -579,12 +579,22 @@ void SurfaceIdentifier::ConsiderResource(ID3D12Resource* resource, const D3D12_R
 bool SurfaceIdentifier::OnTransition(
     ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter, bool profiled) noexcept
 {
-    // Liveness of the selected resource (and any rival-adopted alternate),
-    // tracked outside the profile store since the store can be cleared on
-    // reopen and this must keep working across that. Only the trigger edge
-    // counts.
-    const bool isTracked = resource == identified_.load(std::memory_order_acquire) || IsAlsoTracked(resource);
+    // Liveness of the selected resource and EVERY rival-adopted one, tracked
+    // outside the profile store since the store can be cleared on reopen and
+    // this must keep working across that. Only the trigger edge counts.
+    //
+    // "Every", not just the latest (identifiedAlt_): on Skyrunner UE rotates
+    // through 5+ allocations of SceneVelocity and 10+ of GBufferA. An
+    // allocation adopted earlier stays a candidate - so it is still CAPTURED
+    // from - but its edges used to leave this clock alone, and it is never
+    // offered as a rival again (it is already a candidate). Result: velocity
+    // read as "silent" while rendering, and bursts ended with
+    // velocity_pass_silent after 0-1061 frames. The candidate lookup runs only
+    // on trigger edges, a few per frame.
     const bool isTrigger = IsTriggerEdge(stateBefore, stateAfter);
+    const bool isTracked = resource == identified_.load(std::memory_order_acquire) ||
+                           resource == identifiedAlt_.load(std::memory_order_acquire) ||
+                           (isTrigger && identified_.load(std::memory_order_acquire) != nullptr && IsCandidate(resource));
     if (isTracked && isTrigger)
     {
         lastEdgeFrame_.store(frame, std::memory_order_relaxed);
@@ -922,13 +932,25 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
     identifiedWidth_.store(winner.desc.Width, std::memory_order_relaxed);
     identifiedHeight_.store(winner.desc.Height, std::memory_order_relaxed);
     identifiedFormat_.store(static_cast<int>(winner.desc.Format), std::memory_order_relaxed);
+    identifiedFlags_.store(static_cast<unsigned>(winner.desc.Flags), std::memory_order_relaxed);
     // Start the liveness clock from the decision, not from zero - otherwise a
     // decision reached at frame 90 is already "silent" the moment it is made.
     lastEdgeFrame_.store(frame, std::memory_order_relaxed);
     silenceReported_.store(false, std::memory_order_relaxed);
     identified_.store(winner.resource, std::memory_order_release);
     decisionMade_.store(true, std::memory_order_relaxed);
-    OnSelected(winner.resource, winner.desc);
+    rivalReports_.store(0, std::memory_order_relaxed);
+    // The barrier-batch evidence this selection rests on - a rival will have
+    // to show the same (see OnUnmatchedEdge).
+    uint32_t evidenceMask = 0;
+    for (uint8_t i = 0; i < spec_.signalCount; ++i)
+    {
+        if (spec_.signals[i].id == SignalId::SharesCallWithEdge && SharesCallSignalPresent(winner.profile, spec_.signals[i]))
+        {
+            evidenceMask |= 1u << i;
+        }
+    }
+    selectedEvidenceMask_.store(evidenceMask, std::memory_order_relaxed);
     Log(std::string(spec_.logPrefix) + ": SELECTED " + DescLine(winner.resource, winner.desc) +
         " | score=" + std::to_string(winner.score) + " | survivors=" + std::to_string(survivors.size()));
     if (survivors.size() == 1)
@@ -1061,6 +1083,195 @@ void SurfaceIdentifier::MarkCandidate(ID3D12Resource* resource, const D3D12_RESO
     entry.desc = desc;
 }
 
+bool SurfaceIdentifier::SharesCallSignalPresent(const BarrierProfile& p, const SignalWeight& sw) const noexcept
+{
+    const int own = static_cast<int>(spec_.trigger);
+    const uint64_t edges = p.triggerEdgeCountByEdge[own];
+    const uint64_t shared = p.triggerEdgesSharingCallWith[own][static_cast<int>(sw.edge)];
+    return edges > 0 && shared * 100 / edges >= static_cast<uint64_t>(sw.minPercent);
+}
+
+int SurfaceIdentifier::RivalHasSelectedEvidence(ID3D12Resource* resource) const noexcept
+{
+    BarrierProfile p;
+    if (profileStore_ == nullptr || !profileStore_->Get(resource, &p) ||
+        p.triggerEdgeCountByEdge[static_cast<int>(spec_.trigger)] < spec_.rivalFramesBeforeAdopt)
+    {
+        return -1; // too little history to judge either way
+    }
+    const uint32_t mask = selectedEvidenceMask_.load(std::memory_order_relaxed);
+    for (uint8_t i = 0; i < spec_.signalCount; ++i)
+    {
+        if ((mask & (1u << i)) != 0 && !SharesCallSignalPresent(p, spec_.signals[i]))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame) noexcept
+{
+    // No "rival" block in the spec (depth): never adopts.
+    if (spec_.rivalFramesBeforeAdopt == 0)
+    {
+        return false;
+    }
+    // Cheapest checks first: this runs from the barrier hook, on every
+    // trigger edge in the frame.
+    ID3D12Resource* selected = SelectedRaw();
+    if (selected == nullptr || resource == selected || resource == nullptr ||
+        resource == identifiedAlt_.load(std::memory_order_acquire))
+    {
+        return false;
+    }
+    if (FramesSinceEdge(frame) < spec_.rivalStallFrames)
+    {
+        return false;
+    }
+
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+
+    // Judged by the SAME structural filter identification uses.
+    if (!StructurallyPlausibleForRival(resource, desc))
+    {
+        return false;
+    }
+
+    // Same render extent as the established answer - every copy of a scene
+    // texture shares SceneTexturesConfig::Extent, so a same-shaped texture at
+    // a different extent is some other buffer.
+    if (desc.Width != identifiedWidth_.load(std::memory_order_relaxed) ||
+        desc.Height != identifiedHeight_.load(std::memory_order_relaxed))
+    {
+        return false;
+    }
+
+    // rival.same_descriptor: a reallocation has the selected resource's exact
+    // format and flags. Checked before the run below, like the evidence
+    // check, so a different texture taking its edge every frame cannot keep
+    // resetting the real copy's run.
+    if (spec_.rivalSameDescriptor &&
+        (static_cast<int>(desc.Format) != identifiedFormat_.load(std::memory_order_relaxed) ||
+         static_cast<unsigned>(desc.Flags) != identifiedFlags_.load(std::memory_order_relaxed)))
+    {
+        return false;
+    }
+
+    // The evidence that WON the selection must hold for a rival too. Only
+    // shares_call_with_edge is checked: it is the one signal that separated
+    // normals from a same-descriptor decoy (an identical desc passes every
+    // structural test above). A rival with enough history that lacks it is
+    // ignored outright - without touching the run below, so a decoy taking
+    // its edge every frame cannot keep resetting the real copy's run. One
+    // without enough history yet is tracked, and must pass before adoption.
+    // The rival is profiled here if it was not already: it may have
+    // appeared after the identify budget was spent.
+    int evidence = 1;
+    if (selectedEvidenceMask_.load(std::memory_order_relaxed) != 0)
+    {
+        if (profileStore_ != nullptr)
+        {
+            profileStore_->EnsureProfiled(resource, desc);
+        }
+        evidence = RivalHasSelectedEvidence(resource);
+        if (evidence == 0)
+        {
+            if (!evidenceRejectReported_.exchange(true))
+            {
+                Log(std::string(spec_.logPrefix) + ": NOT a rival - " + DescLine(resource, desc) +
+                    " takes the edge while the selected one is stalled, but lacks the barrier-batch evidence the "
+                    "selection was made on (shares_call_with_edge). Same descriptor, different pass. (Logged once.)");
+            }
+            return false;
+        }
+    }
+
+    // Run of CONSECUTIVE frames on which THIS resource carried the edge,
+    // counted once per frame however many barriers that frame contains.
+    // Keyed on the resource as well as the frame: two different rivals
+    // alternating must not add up to a run.
+    const uint64_t previous = lastRivalFrame_.exchange(frame, std::memory_order_relaxed);
+    const bool sameResource = (resource == lastRivalResource_);
+    lastRivalResource_ = resource;
+
+    uint64_t run = rivalRunLength_.load(std::memory_order_relaxed);
+    if (sameResource && frame == previous)
+    {
+        // Same frame, another barrier - already counted.
+    }
+    else if (sameResource && frame == previous + 1)
+    {
+        run += 1;
+        rivalRunLength_.store(run, std::memory_order_relaxed);
+    }
+    else
+    {
+        run = 1;
+        rivalRunLength_.store(run, std::memory_order_relaxed);
+    }
+
+    // Long enough - but a rival still short of evidence keeps accumulating
+    // rather than being adopted on the run alone.
+    if (run >= spec_.rivalFramesBeforeAdopt && evidence == 1)
+    {
+        rivalRunLength_.store(0, std::memory_order_relaxed);
+        if (adoptions_.fetch_add(1, std::memory_order_relaxed) >= spec_.rivalMaxAdoptions)
+        {
+            if (!adoptLimitReported_.exchange(true))
+            {
+                Log(std::string(spec_.logPrefix) + ": a further " + spec_.name +
+                    " target would have been adopted, but the limit of " + std::to_string(spec_.rivalMaxAdoptions) +
+                    " is spent - NOT adopting. Adopting without bound cannot be told apart from adopting the wrong "
+                    "resources, so this stops and says so instead. Restart to reset it.");
+            }
+            return false;
+        }
+
+        const int identifiedFormat = identifiedFormat_.load(std::memory_order_relaxed);
+        identifiedAlt_.store(resource, std::memory_order_release);
+        Log(std::string(spec_.logPrefix) + ": ADOPTED a second " + spec_.name + " target - " +
+            DescLine(resource, desc) + " has taken its trigger edge on " + std::to_string(run) +
+            " consecutive frames while the selected one (fmt=" + std::to_string(identifiedFormat) +
+            ") took none. Same extent, same structural filter" +
+            (static_cast<int>(desc.Format) == identifiedFormat
+                 ? std::string(", same format: a reallocation to a new address with an identical descriptor")
+                 : std::string(", different format: unconfirmed - every prior adoption has been same-format")) +
+            (selectedEvidenceMask_.load(std::memory_order_relaxed) != 0
+                 ? std::string(", and the same barrier-batch evidence")
+                 : std::string()) +
+            ". BOTH are now captured from, whichever takes the edge - the pass moved, it did not stop.");
+        return true;
+    }
+
+    if (rivalReports_.load(std::memory_order_relaxed) >= spec_.rivalMaxReports)
+    {
+        return false;
+    }
+    const int n = rivalReports_.fetch_add(1, std::memory_order_relaxed);
+    if (n >= spec_.rivalMaxReports)
+    {
+        return false;
+    }
+    Log(std::string(spec_.logPrefix) + ": RIVAL " + spec_.name +
+        "-format edge while the identified resource is stalled - ptr=" +
+        std::to_string(reinterpret_cast<uintptr_t>(resource)) + " " + std::to_string(desc.Width) + "x" +
+        std::to_string(desc.Height) + " fmt=" + std::to_string(static_cast<int>(desc.Format)) +
+        " took its trigger edge on frame " + std::to_string(frame) + ", " + std::to_string(FramesSinceEdge(frame)) +
+        " frames into the stall. The identified resource is " +
+        std::to_string(identifiedWidth_.load(std::memory_order_relaxed)) + "x" +
+        std::to_string(identifiedHeight_.load(std::memory_order_relaxed)) + ". If this repeats, the engine moved the " +
+        spec_.name + " pass to another target rather than stopping it.");
+    if (n + 1 == spec_.rivalMaxReports)
+    {
+        Log(std::string(spec_.logPrefix) + ": further rival-edge reports suppressed (cap " +
+            std::to_string(spec_.rivalMaxReports) +
+            " per stall episode, re-armed when the pass resumes). Absence of more lines is the cap, not the absence "
+            "of rivals.");
+    }
+    return false;
+}
+
 bool SurfaceIdentifier::IsShortlisted(ID3D12Resource* resource) noexcept
 {
     std::lock_guard<std::mutex> lock(shortlistMutex_);
@@ -1173,7 +1384,11 @@ void SurfaceIdentifier::Reopen(ReopenReason /*reason*/, const char* detail) noex
     // (see the long comment that used to live here, when that set was
     // process-wide in resource_tracking.h rather than per-identifier).
     ForgetAllCandidates();
-    OnReopen();
+    // Rival-adoption state goes with the answer it was relative to.
+    identifiedAlt_.store(nullptr, std::memory_order_release);
+    rivalRunLength_.store(0, std::memory_order_relaxed);
+    lastRivalResource_ = nullptr;
+    selectedEvidenceMask_.store(0, std::memory_order_relaxed);
 }
 
 bool SurfaceIdentifier::NoteBackBufferSize(uint64_t width, uint32_t height) noexcept

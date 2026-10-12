@@ -172,6 +172,14 @@ struct LookAlike {
     bool shouldBeSelected;          // as velocity
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     bool shouldBeNormals = false;   // --normals: the one normals must select
+    // --normals: 0 = renders every frame. 1/2 = one of two allocations of
+    // GBufferA that take turns in stretches, as measured on Skyrunner (see
+    // gbufferAllocationActive below): 1 first, 2 must be ADOPTED as a rival.
+    int allocation = 0;
+    // --velocity-realloc: 0 = n/a. 1/2/3 = three allocations of SceneVelocity
+    // that take turns (see velocityAllocationActive) - 1 is selected, 2 and 3
+    // adopted as rivals, then 2 again for longer than the silence threshold.
+    int velocityAllocation = 0;
 
     ComPtr<ID3D12Heap> heap;
     ComPtr<ID3D12Resource> resource;
@@ -292,6 +300,9 @@ int main(int argc, char** argv) {
     bool phase9Negative = false;
     // Phase 10: add a GBufferA look-alike and opt into the normals surface.
     bool normals = false;
+    // Phase 10 follow-up: SceneVelocity rotating through three allocations,
+    // the way Skyrunner's does. See velocityAllocationActive.
+    bool velocityRealloc = false;
     // Which shape of velocity pass to model. "oxi" is the strict 2-cycle this
     // project was developed against; "skyrunner" is the 5-transition,
     // UNORDERED_ACCESS-touching pass measured on a third-party UE 5.2 title.
@@ -320,6 +331,8 @@ int main(int argc, char** argv) {
             phase9Negative = true;
         } else if (arg == "--normals") {
             normals = true;
+        } else if (arg == "--velocity-realloc") {
+            velocityRealloc = true;
         }
     }
 
@@ -465,6 +478,33 @@ int main(int argc, char** argv) {
          kVelocityFormat, kVelocityWidth, kVelocityHeight, Behaviour::ExtraPass, false},
     };
 
+    if (velocityRealloc) {
+        // Without the "twin, read twice" decoy: it takes the velocity edge
+        // every frame at the same extent, so its edges interleave with the
+        // new allocation's and keep resetting rival adoption's
+        // consecutive-frame run - nothing is ever adopted. A real limitation
+        // of the run-length rule (it follows one rival at a time), but not one
+        // any measured title has shown; Skyrunner, whose reallocations this
+        // mode models, has no such twin.
+        lineUp.erase(std::remove_if(lineUp.begin(), lineUp.end(),
+                                    [](const LookAlike& t) { return t.behaviour == Behaviour::ExtraPass; }),
+                     lineUp.end());
+        // Two more allocations of SceneVelocity: identical descriptor and
+        // behaviour, different address. They only render after identification
+        // (velocityAllocationActive), so they never compete with it - they are
+        // what rival adoption must follow, and what the silence check must
+        // keep counting once the rival slot has moved on to a newer one.
+        for (int extra = 2; extra <= 3; ++extra) {
+            LookAlike copy = lineUp.front(); // SceneVelocity
+            copy.name = extra == 2 ? "SceneVelocity (2nd alloc)" : "SceneVelocity (3rd alloc)";
+            copy.why = "the same texture reallocated; adopted as a rival";
+            copy.shouldBeSelected = false;
+            copy.velocityAllocation = extra;
+            lineUp.insert(lineUp.begin() + 1, copy);
+        }
+        lineUp.front().velocityAllocation = 1;
+    }
+
     if (normals) {
         // UE5's GBufferA: the default r.GBufferFormat's R10G10B10A2, a plain
         // render target (no UAV), finished by the base pass - so its RT -> SRV
@@ -492,7 +532,30 @@ int main(int argc, char** argv) {
                              DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::Velocity,
                              false};
         postOutput.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        // And a second allocation of GBufferA itself: identical descriptor,
+        // different address, the two taking turns in stretches. On Skyrunner
+        // UE did exactly this (to SceneVelocity too), and normals - pinned to
+        // one pointer - captured only a fraction of the burst. Normals must
+        // adopt this one as a rival; it must NOT adopt the decoy above, which
+        // takes its edge every frame and would be the first thing a naive
+        // rival rule grabbed when GBufferA moved.
+        LookAlike gbufferA2 = gbufferA;
+        gbufferA2.name = "GBufferA (2nd alloc)";
+        gbufferA2.why = "normals: the same texture reallocated; must be adopted as a rival, not selected";
+        gbufferA2.shouldBeNormals = false;
+        gbufferA.allocation = 1;
+        gbufferA2.allocation = 2;
+        // And scene colour as it measured live: also readable in the same
+        // call as depth (so it passes the depth-call evidence), but a
+        // different texture - R16G16B16A16_FLOAT, RT|UAV. On Skyrunner it was
+        // adopted as a GBufferA "rival" until rival.same_descriptor existed,
+        // and the format mismatch then ended the burst.
+        LookAlike sceneColor{"scene colour", "normals rival decoy: shares calls with depth, different descriptor",
+                             DXGI_FORMAT_R16G16B16A16_FLOAT, kVelocityWidth, kVelocityHeight,
+                             Behaviour::ReadWithDepth, false};
+        lineUp.insert(lineUp.begin(), sceneColor);
         lineUp.insert(lineUp.begin(), postOutput);
+        lineUp.insert(lineUp.begin(), gbufferA2);
         lineUp.insert(lineUp.begin(), gbufferA);
     }
 
@@ -812,6 +875,34 @@ int main(int argc, char** argv) {
     // behaviour tests (below, gated on --phase8-tests) can keep driving the
     // exact same render loop past the initial identify-and-capture window -
     // a resize or a reopen only means anything if frames keep coming.
+    // --normals: which allocation of GBufferA renders this frame. Allocation 1
+    // alone until identification has settled (so it is the one selected),
+    // then the two alternate in 30-frame stretches - several switches inside
+    // a 240-frame run, each of which used to cost every frame of the stretch.
+    const int gbufferSwitchStart = identifyFrames + 20;
+    auto gbufferAllocationActive = [&](int allocation, int frame) {
+        const bool second = frame >= gbufferSwitchStart && ((frame - gbufferSwitchStart) / 30) % 2 == 0;
+        return allocation == (second ? 2 : 1);
+    };
+
+    // --velocity-realloc: allocation 1 until identification has settled, then
+    // 2 (adopted), 3 (adopted - the rival slot moves to it), then 2 again for
+    // 500 frames: longer than the 300-frame silence threshold, on an
+    // allocation that is a candidate but no longer the rival slot. Liveness
+    // used to ignore it there and end the burst as velocity_pass_silent.
+    const int velocitySwitchStart = identifyFrames + 20;
+    auto velocityAllocationActive = [&](int allocation, int frame) {
+        int active = 1;
+        if (frame >= velocitySwitchStart + 80) {
+            active = 2;
+        } else if (frame >= velocitySwitchStart + 40) {
+            active = 3;
+        } else if (frame >= velocitySwitchStart) {
+            active = 2;
+        }
+        return allocation == active;
+    };
+
     auto renderFrame = [&](int frame) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -828,6 +919,12 @@ int main(int argc, char** argv) {
         }
 
         for (LookAlike& target : lineUp) {
+            if (target.allocation != 0 && !gbufferAllocationActive(target.allocation, frame)) {
+                continue; // the other allocation of GBufferA is in use this frame
+            }
+            if (target.velocityAllocation != 0 && !velocityAllocationActive(target.velocityAllocation, frame)) {
+                continue; // another allocation of SceneVelocity is in use this frame
+            }
             // Write each look-alike as a render target, so it holds real bytes
             // rather than undefined memory - GPU-based validation objects to
             // reading uninitialised placed-resource memory, and so it should.
@@ -1023,6 +1120,35 @@ int main(int argc, char** argv) {
             } else if (expected != nullptr && picked == static_cast<void*>(expected->resource.Get())) {
                 printf("[testhost] PASS - selected the velocity buffer out of %zu look-alikes, with no "
                        "hardcoded resolution or descriptor\n", lineUp.size());
+                if (velocityRealloc) {
+                    // Both extra allocations adopted, and the pass never
+                    // declared STOPPED while allocation 2 - adopted, but no
+                    // longer the rival slot - carried it for 500 frames.
+                    using StringFn = const char* (*)();
+                    auto logDirectory = reinterpret_cast<StringFn>(
+                        reinterpret_cast<void*>(GetProcAddress(hookModule, "MvLogDirectory")));
+                    int adoptions = 0;
+                    bool stopped = false;
+                    if (logDirectory != nullptr) {
+                        std::ifstream in(std::string(logDirectory()) + "mv_hook.log", std::ios::binary);
+                        std::string line;
+                        while (std::getline(in, line)) {
+                            if (line.find("profile: using '") != std::string::npos) {
+                                adoptions = 0; // appended across runs: count this run only
+                                stopped = false;
+                            }
+                            adoptions += line.find("identify: ADOPTED") != std::string::npos ? 1 : 0;
+                            stopped = stopped || line.find("identify: the pass has STOPPED") != std::string::npos;
+                        }
+                    }
+                    const bool reallocOk = adoptions >= 2 && !stopped;
+                    printf("[testhost]   velocity reallocations adopted: %d (need 2); pass declared STOPPED while "
+                           "an earlier-adopted allocation carried it: %s\n", adoptions, stopped ? "YES" : "no");
+                    printf("[testhost] %s\n", reallocOk ? "PASS - velocity followed three allocations without a "
+                                                          "false silence"
+                                                        : "FAIL - velocity reallocation (see the two lines above)");
+                    identificationPassed = reallocOk;
+                }
             } else {
                 printf("[testhost] FAIL - expected %p (%s), got %p\n",
                        expected != nullptr ? static_cast<void*>(expected->resource.Get()) : nullptr,
@@ -1119,9 +1245,50 @@ int main(int argc, char** argv) {
                                    log.find("already held by velocity", start) != std::string::npos;
             }
             const bool pickedRight = expected != nullptr && picked == static_cast<void*>(expected->resource.Get());
-            normalsIdentificationPassed = pickedRight && excludedVelocity;
+
+            // Rival adoption: the second allocation adopted, the decoy refused.
+            std::string secondAlloc, decoy;
+            for (const LookAlike& target : lineUp) {
+                const std::string ptr = std::to_string(reinterpret_cast<uintptr_t>(target.resource.Get()));
+                if (target.allocation == 2) {
+                    secondAlloc = ptr;
+                } else if (std::string(target.name) == "post-process output") {
+                    decoy = ptr;
+                }
+            }
+            int adoptions = 0;
+            bool adoptedWrong = false;
+            bool refusedDecoy = false;
+            if (logDirectory != nullptr) {
+                std::ifstream in(std::string(logDirectory()) + "mv_hook.log", std::ios::binary);
+                std::string line;
+                bool thisRun = false;
+                while (std::getline(in, line)) {
+                    if (line.find("profile: using '") != std::string::npos) {
+                        thisRun = true; // the log is appended across runs; restart at each run's start
+                        adoptions = 0;
+                        adoptedWrong = refusedDecoy = false;
+                    }
+                    if (!thisRun) {
+                        continue;
+                    }
+                    if (line.find("normals: ADOPTED") != std::string::npos) {
+                        ++adoptions;
+                        adoptedWrong = adoptedWrong || line.find(secondAlloc) == std::string::npos;
+                    }
+                    if (line.find("normals: NOT a rival") != std::string::npos && line.find(decoy) != std::string::npos) {
+                        refusedDecoy = true;
+                    }
+                }
+            }
+            const bool rivalOk = adoptions >= 1 && !adoptedWrong && refusedDecoy;
+            normalsIdentificationPassed = pickedRight && excludedVelocity && rivalOk;
             printf("[testhost]   velocity's buffer excluded from the normals ranking as held: %s\n",
                    excludedVelocity ? "yes" : "NO");
+            printf("[testhost]   GBufferA's 2nd allocation adopted as a rival: %d adoption(s)%s\n", adoptions,
+                   adoptedWrong ? " - AT LEAST ONE OF SOMETHING ELSE" : "");
+            printf("[testhost]   same-format decoy refused as a rival (lacks the depth-call evidence): %s\n",
+                   refusedDecoy ? "yes" : "NO");
             printf("[testhost] %s\n",
                    normalsIdentificationPassed
                        ? "PASS - normals selected GBufferA, with SceneVelocity kept out by mutual exclusion"
@@ -1455,17 +1622,25 @@ int main(int argc, char** argv) {
             // Kept apart from dumpContentsPassed, which the branches below
             // assign outright; combined after them.
             bool normalsDumpOk = true;
+            constexpr int kMaxNormalsMissed = 15;
             if (!normals && normalsFrames != 0) {
                 // Off by default: one normals blob means the opt-in leaked.
                 printf("[testhost] FAIL - normals was captured without MV_SURFACES=normals\n");
                 normalsDumpOk = false;
-            } else if (normals && !expectNothingSelected && normalsFrames != velocities) {
-                // GBufferA takes its edge before velocity every frame, so a
-                // frame with velocity but no normals means a missed copy.
-                printf("[testhost] FAIL - %d velocity frames but %d normals frames\n", velocities, normalsFrames);
+            } else if (normals && !expectNothingSelected &&
+                       (normalsFrames > velocities || velocities - normalsFrames > kMaxNormalsMissed)) {
+                // GBufferA takes its edge before velocity every frame. The
+                // only frames allowed to miss normals are the first
+                // allocation switch, before the rival is adopted (stall +
+                // frames_before_adopt in the profile, plus slack); every
+                // later switch is between two tracked allocations and free.
+                printf("[testhost] FAIL - %d velocity frames but %d normals frames (at most %d may miss, the first "
+                       "rival-adoption window)\n", velocities, normalsFrames, kMaxNormalsMissed);
                 normalsDumpOk = false;
             } else if (normals && !expectNothingSelected) {
-                printf("[testhost] PASS - every captured frame also has normals\n");
+                printf("[testhost] PASS - normals on %d of %d captured frames (%d missed: the first rival-adoption "
+                       "window, before the 2nd allocation was adopted)\n", normalsFrames, velocities,
+                       velocities - normalsFrames);
             }
             if (expectNothingSelected) {
                 // Identification selects nothing in this mode, so capturing

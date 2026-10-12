@@ -82,9 +82,12 @@ profile a dump was captured under.
 `Invoke-MvCapture.ps1 -Surfaces normals`) also searches for UE5's GBufferA and
 captures it as `normals_NNNNN.bin`. Its encoding is unverified, so the
 manifest says `"encoding": {"kind": "unknown"}` and `mvtools.decode_normals`
-refuses. On Skyrunner it currently refuses to pick (AMBIGUOUS: a post-process
-target of the same format ties with GBufferA) - read the `normals:` lines in
-`mv_hook.log` before trusting any normals blob.
+refuses. Verified on one title only (Skyrunner, UE 5.2): GBufferA is told
+apart from a same-format post-process target because it becomes readable in
+the same `ResourceBarrier` call as scene depth, and UE's several allocations
+of it are followed by rival adoption - normals landed on 2087 of 2121 burst
+frames. Read the `normals:` lines in `mv_hook.log` before trusting it on any
+other title.
 
 ## Results
 

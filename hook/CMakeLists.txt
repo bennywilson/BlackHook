@@ -50,7 +50,6 @@ add_library(mv_hook SHARED
   src/surface_identify.cpp
   src/surface_registry.cpp
   src/surface_profile.cpp
-  src/velocity_identify.cpp
   src/capture.cpp
   src/overlay.cpp
 )
