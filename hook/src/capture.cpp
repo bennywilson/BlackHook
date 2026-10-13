@@ -503,6 +503,7 @@ bool g_writerStarted = false;
 bool g_writerStop = false;
 std::thread g_writerThread;
 std::atomic<uint64_t> g_droppedWrites{0};
+std::atomic<uint64_t> g_failedWrites{0}; // writer thread: open/write errors (disk full)
 std::atomic<uint64_t> g_droppedFrames{0};
 // Frames that actually reached the write queue, as opposed to g_captureCounter
 // (which counts slots that reached Submitted - a copy recorded on the GPU,
@@ -510,23 +511,28 @@ std::atomic<uint64_t> g_droppedFrames{0};
 // burst.drained_frames.
 std::atomic<uint64_t> g_drainedFrames{0};
 
-std::string DumpDir()
+// Resolved and created once: it is called per blob, on the render thread.
+// MV_DUMP_DIR overrides it, so testhost's synthetic frames never overwrite a
+// real capture.
+const std::string& DumpDir()
 {
-    // MV_DUMP_DIR overrides the destination, so testhost's synthetic frames
-    // never overwrite a real capture.
-    char override[MAX_PATH]{};
-    if (GetEnvironmentVariableA("MV_DUMP_DIR", override, MAX_PATH) != 0)
+    static const std::string dir = []
     {
-        std::string dir = override;
-        if (!dir.empty() && dir.back() != '\\' && dir.back() != '/')
+        char override[MAX_PATH]{};
+        if (GetEnvironmentVariableA("MV_DUMP_DIR", override, MAX_PATH) == 0)
         {
-            dir += '\\';
+            OutputDir("dumps");
+            return OutputDir("dumps/mv_dump");
         }
-        CreateDirectoryA(dir.c_str(), nullptr);
-        return dir;
-    }
-    OutputDir("dumps");
-    return OutputDir("dumps/mv_dump");
+        std::string d = override;
+        if (!d.empty() && d.back() != '\\' && d.back() != '/')
+        {
+            d += '\\';
+        }
+        CreateDirectoryA(d.c_str(), nullptr);
+        return d;
+    }();
+    return dir;
 }
 
 // MV_CAPTURE_DEPTH=0 disables the depth copy for a session - a bandwidth
@@ -557,6 +563,51 @@ bool DepthCaptureEnabled()
     return enabled;
 }
 
+// Writes one job; false (logged, counted) if the file could not be opened or
+// fully written. A manifest is only renamed into place after a full write.
+bool WriteJobToDisk(const WriteJob& job)
+{
+    HANDLE file = CreateFileA(
+        job.path.c_str(),
+        job.append ? FILE_APPEND_DATA : GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        job.append ? OPEN_ALWAYS : CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    DWORD written = 0;
+    bool ok = file != INVALID_HANDLE_VALUE;
+    if (ok)
+    {
+        if (job.append)
+        {
+            SetFilePointer(file, 0, nullptr, FILE_END);
+        }
+        ok = WriteFile(file, job.data.data(), static_cast<DWORD>(job.data.size()), &written, nullptr) &&
+             written == job.data.size();
+        CloseHandle(file);
+    }
+    if (!ok)
+    {
+        const uint64_t n = g_failedWrites.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 5 || n % 100 == 0)
+        {
+            Log("capture: WRITE FAILED for " + job.path + " (" + std::to_string(written) + " of " +
+                std::to_string(job.data.size()) + " bytes, err=" + std::to_string(GetLastError()) + ") - " +
+                std::to_string(n) + " failed so far. Disk full, or an unwritable MV_DUMP_DIR?");
+        }
+        return false;
+    }
+    if (!job.renameTo.empty() && !MoveFileExA(job.path.c_str(), job.renameTo.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        Log("capture: failed to seal " + job.renameTo + " (rename from " + job.path +
+            ") err=" + std::to_string(GetLastError()) +
+            " - the dump's blobs are all on disk, but nothing names them; delete the stray .tmp "
+            "file and re-seal by pressing F8 again, or note this session's manifest is missing");
+    }
+    return true;
+}
+
 void WriterThread()
 {
     for (;;)
@@ -573,44 +624,17 @@ void WriterThread()
             g_writeQueue.pop_front();
             g_queuedBytes -= job.data.size();
         }
-        HANDLE file = CreateFileA(
-            job.path.c_str(),
-            job.append ? FILE_APPEND_DATA : GENERIC_WRITE,
-            FILE_SHARE_READ,
-            nullptr,
-            job.append ? OPEN_ALWAYS : CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (file == INVALID_HANDLE_VALUE)
-        {
-            Log("capture: failed to open " + job.path + " err=" + std::to_string(GetLastError()));
-            continue;
-        }
-        if (job.append)
-        {
-            SetFilePointer(file, 0, nullptr, FILE_END);
-        }
-        DWORD written = 0;
-        WriteFile(file, job.data.data(), static_cast<DWORD>(job.data.size()), &written, nullptr);
-        CloseHandle(file);
-
-        if (!job.renameTo.empty())
-        {
-            if (!MoveFileExA(job.path.c_str(), job.renameTo.c_str(), MOVEFILE_REPLACE_EXISTING))
-            {
-                Log("capture: failed to seal " + job.renameTo + " (rename from " + job.path +
-                    ") err=" + std::to_string(GetLastError()) +
-                    " - the dump's blobs are all on disk, but nothing names them; delete the stray .tmp "
-                    "file and re-seal by pressing F8 again, or note this session's manifest is missing");
-            }
-        }
+        WriteJobToDisk(job);
 
         // Confirms everything handed over so far is actually on disk - this,
         // not "burst recorded", is the signal it's safe to quit.
         std::lock_guard<std::mutex> lock(g_writeMutex);
         if (g_writeQueue.empty())
         {
-            Log("capture: write queue drained - all captured frames are on disk");
+            const uint64_t failed = g_failedWrites.load(std::memory_order_relaxed);
+            Log(failed == 0 ? std::string("capture: write queue drained - all captured frames are on disk")
+                            : "capture: write queue drained, but " + std::to_string(failed) +
+                                  " write(s) FAILED - see the WRITE FAILED lines");
         }
     }
 }
