@@ -1218,6 +1218,13 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
     if (run >= spec_.rivalFramesBeforeAdopt && evidence == 1)
     {
         rivalRunLength_.store(0, std::memory_order_relaxed);
+        // Checked here, not left to MarkCandidate: a refused claim must not
+        // spend an adoption or become identifiedAlt_ (whose edges keep this
+        // surface's liveness clock running).
+        if (mutualExclusion_ != nullptr && mutualExclusion_->HeldByOther(resource, this) != nullptr)
+        {
+            return false;
+        }
         if (adoptions_.fetch_add(1, std::memory_order_relaxed) >= spec_.rivalMaxAdoptions)
         {
             if (!adoptLimitReported_.exchange(true))
