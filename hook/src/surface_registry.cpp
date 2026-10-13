@@ -1,7 +1,6 @@
 #include "surface_registry.h"
 
 #include "logging.h"
-#include "resource_tracking.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -21,11 +20,56 @@ namespace
 // store, not of one identifier's own map.
 constexpr uint64_t kProfileDumpFrame = 2000;
 
+// Distinct resources GetDesc() is called on (see ConsiderResource). Generous for
+// identification, which completes in the first ~90 frames.
+constexpr int64_t kIdentifyBudget = 8000;
+
 } // namespace
 
-SurfaceRegistry::SurfaceRegistry() noexcept
+SurfaceRegistry::SurfaceRegistry() noexcept : identifyBudget_(kIdentifyBudget)
 {
     entries_.reserve(8); // kMaxSurfaces, capture.cpp's own constant - avoid any reallocation after Configure()
+}
+
+void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
+{
+    if (resource == nullptr)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(seenMutex_);
+        if (!seen_.insert(resource).second)
+        {
+            return;
+        }
+    }
+    if (identifyBudget_.fetch_sub(1, std::memory_order_relaxed) <= 0)
+    {
+        if (!budgetExhaustionReported_.exchange(true))
+        {
+            Log("resource-tracking: identification budget of " + std::to_string(kIdentifyBudget) +
+                " distinct resources is SPENT. No resource created from here on is examined, so a "
+                "texture the engine allocates now can never be found. Identification itself is long "
+                "finished; what is lost is the ability to notice a REPLACEMENT.");
+        }
+        return;
+    }
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    profileStore_.EnsureProfiled(resource, desc);
+    for (Entry& e : entries_)
+    {
+        e.identifier->ConsiderResource(resource, desc);
+    }
+}
+
+void SurfaceRegistry::ForgetAllResourcesSeen() noexcept
+{
+    // Refill first: a reopen with an empty budget would search forever and find nothing.
+    identifyBudget_.store(kIdentifyBudget, std::memory_order_relaxed);
+    budgetExhaustionReported_.store(false, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(seenMutex_);
+    seen_.clear();
 }
 
 void SurfaceRegistry::Register(std::unique_ptr<SurfaceIdentifier> identifier) noexcept
@@ -126,15 +170,6 @@ ID3D12Resource* SurfaceRegistry::Selected(const char* name) noexcept
 {
     SurfaceIdentifier* identifier = Find(name);
     return identifier != nullptr ? identifier->Selected() : nullptr;
-}
-
-void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept
-{
-    profileStore_.EnsureProfiled(resource, desc);
-    for (Entry& e : entries_)
-    {
-        e.identifier->ConsiderResource(resource, desc);
-    }
 }
 
 void SurfaceRegistry::OnUavBarrier(ID3D12Resource* resource) noexcept

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -89,11 +90,18 @@ public:
 
     // ---- barrier-hook entry points --------------------------------------
 
-    // Every resource the barrier hook walks past, once per resource. Seeds
-    // the shared profile store once, then every registered identifier's own
-    // structural gate - replaces d3d12_hook.cpp's TryIdentifyResource
-    // calling NoteResourceDesc/NoteResourceDescForDepth by hand.
-    void ConsiderResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
+    // Every resource the barrier hook walks past. The first time a pointer is
+    // seen (and while the identify budget lasts) its desc is read once, the
+    // shared profile store seeded, and every identifier's structural gate run.
+    //
+    // The budget bounds how many distinct resources GetDesc() is called on: on
+    // a resource met in a barrier it is a considered bet, not proven safe (a
+    // GetDesc() at view creation crashed the game - DEBUGGING.md). UE's
+    // transient allocator hands out fresh resources all session, so it runs
+    // out; that is logged, and a reopen refills it. The seen set holds bare
+    // pointers: a recycled address reads as already seen. Candidates are
+    // ref-held, so that can lose a resource but never act on the wrong one.
+    void ConsiderResource(ID3D12Resource* resource) noexcept;
 
     void OnUavBarrier(ID3D12Resource* resource) noexcept;
 
@@ -180,6 +188,13 @@ private:
     Entry* FindEntry(const SurfaceIdentifier* identifier) noexcept;
     void CollectCascade(Entry* root, std::vector<Entry*>* out) noexcept;
     void DumpBarrierProfiles() noexcept;
+
+    void ForgetAllResourcesSeen() noexcept; // refills the budget too
+
+    std::mutex seenMutex_;
+    std::unordered_set<ID3D12Resource*> seen_;
+    std::atomic<int64_t> identifyBudget_;
+    std::atomic<bool> budgetExhaustionReported_{false};
 
     std::vector<std::unique_ptr<SurfaceIdentifier>> owned_;
     std::vector<Entry> entries_;

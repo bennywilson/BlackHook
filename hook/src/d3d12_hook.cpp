@@ -10,14 +10,11 @@
 
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 
 #include "capture.h"
 #include "logging.h"
 #include "overlay.h"
-#include "resource_tracking.h"
 #include "surface_profile.h"
 #include "surface_registry.h"
 
@@ -63,40 +60,12 @@ namespace
 //      [00-07] Base Interfaces      (IUnknown through ID3D12Pageable)
 //      [08]    ID3D12CommandList    (GetType)
 //      [09]    Close
-//      [25]    SetPipelineState
-//      [26]    ResourceBarrier
-//      [27]    ExecuteBundle
-//      [28]    SetDescriptorHeaps
-//      [29]    SetComputeRootSignature             // Note: compute/graphics pairs altenerate
-//      [30]    SetGraphicsRootSignature
-//      [31]    SetComputeRootDescriptorTable
-//      [32]    SetGraphicsRootDescriptorTable
-//      [33]    SetComputeRoot32BitConstant
-//      [34]    SetGraphicsRoot32BitConstant
-//      [35]    SetComputeRoot32BitConstants
-//      [36]    SetGraphicsRoot32BitConstants
-//      [46]    OMSetRenderTargets
-//      [48]    ClearRenderTargetView
-//
-//  ID3D12Device:
-//      [00-02] IUnknown                  (QueryInterface, AddRef, Release)
-//      [03-06] ID3D12Object              (GetPrivateData, SetPrivateData, ...)
-//      [07]    GetNodeCount
-//      [08]    CreateCommandQueue
-//      [20]    CreateRenderTargetView
-//      [25]    CreateCommittedResource
-//      [27]    CreatePlacedResource
+//      [26]    ResourceBarrier      <-- Target hook
 
-// Vtable indices required by hook
 constexpr size_t kPresentIndex = 8;
 constexpr size_t kPresent1Index = 22;
 constexpr size_t kExecuteCommandListsIndex = 10;
 constexpr size_t kResourceBarrierIndex = 26;
-constexpr size_t kOmSetRenderTargetsIndex = 46;
-constexpr size_t kClearRenderTargetViewIndex = 48;
-constexpr size_t kCreateRenderTargetViewIndex = 20;
-constexpr size_t kCreateCommittedResourceIndex = 25;
-constexpr size_t kCreatePlacedResourceIndex = 27;
 
 // Idiomatic way to hook COM interfaces in C++ using MinHook
 void* VTableEntry(void* instance, size_t index)
@@ -111,40 +80,11 @@ using Present_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using ResourceBarrier_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
-using OMSetRenderTargets_t = void(STDMETHODCALLTYPE*)(
-    ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
-using ClearRenderTargetView_t = void(STDMETHODCALLTYPE*)(
-    ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT[4], UINT, const D3D12_RECT*);
-using CreateRenderTargetView_t = void(STDMETHODCALLTYPE*)(
-    ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
-using CreateCommittedResource_t = HRESULT(STDMETHODCALLTYPE*)(
-    ID3D12Device*,
-    const D3D12_HEAP_PROPERTIES*,
-    D3D12_HEAP_FLAGS,
-    const D3D12_RESOURCE_DESC*,
-    D3D12_RESOURCE_STATES,
-    const D3D12_CLEAR_VALUE*,
-    REFIID,
-    void**);
-using CreatePlacedResource_t = HRESULT(STDMETHODCALLTYPE*)(
-    ID3D12Device*,
-    ID3D12Heap*,
-    UINT64,
-    const D3D12_RESOURCE_DESC*,
-    D3D12_RESOURCE_STATES,
-    const D3D12_CLEAR_VALUE*,
-    REFIID,
-    void**);
 
 Present_t g_originalPresent = nullptr;
 Present1_t g_originalPresent1 = nullptr;
 ExecuteCommandLists_t g_originalExecuteCommandLists = nullptr;
 ResourceBarrier_t g_originalResourceBarrier = nullptr;
-OMSetRenderTargets_t g_originalOMSetRenderTargets = nullptr;
-ClearRenderTargetView_t g_originalClearRenderTargetView = nullptr;
-CreateRenderTargetView_t g_originalCreateRenderTargetView = nullptr;
-CreateCommittedResource_t g_originalCreateCommittedResource = nullptr;
-CreatePlacedResource_t g_originalCreatePlacedResource = nullptr;
 
 // Global frame key: single source of truth for pairing velocity and colour
 // captures across both Present paths. Atomic since multiple threads record
@@ -155,15 +95,6 @@ std::atomic<uint64_t> g_presentCount{0};
 std::atomic<uint64_t> g_present1Count{0};
 std::atomic<uint64_t> g_executeCommandListsCount{0};
 std::atomic<uint64_t> g_resourceBarrierCount{0};
-std::atomic<uint64_t> g_omSetRenderTargetsCount{0};
-std::atomic<uint64_t> g_clearRenderTargetViewCount{0};
-
-// Budget-capped dump of what's bound at each OMSetRenderTargets call
-// (resolved format/dimensions), for manual correlation. Needed because most
-// resources are allocated once before injection, so creation-time hooks
-// only learn a resource's format/dimensions if watching when it was
-// (re)created.
-std::atomic<int64_t> g_rtvDumpBudget{20000};
 
 // Periodic summary of high-frequency hooks
 void LogHeartbeatIfDue()
@@ -181,9 +112,7 @@ void LogHeartbeatIfDue()
             " present=" + std::to_string(g_presentCount.load(std::memory_order_relaxed)) +
             " present1=" + std::to_string(g_present1Count.load(std::memory_order_relaxed)) +
             " executeCommandLists=" + std::to_string(g_executeCommandListsCount.load(std::memory_order_relaxed)) +
-            " resourceBarrier=" + std::to_string(g_resourceBarrierCount.load(std::memory_order_relaxed)) +
-            " omSetRenderTargets=" + std::to_string(g_omSetRenderTargetsCount.load(std::memory_order_relaxed)) +
-            " clearRenderTargetView=" + std::to_string(g_clearRenderTargetViewCount.load(std::memory_order_relaxed)));
+            " resourceBarrier=" + std::to_string(g_resourceBarrierCount.load(std::memory_order_relaxed)));
     }
 }
 
@@ -294,41 +223,6 @@ HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12C
     g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
 }
 
-// Identification policy is data (profiles/ue5.json) run by SurfaceIdentifier
-// (surface_identify.cpp). The cap on the max distinct resources we call
-// GetDesc() on lives in resource_tracking.cpp, next to the "seen" set it
-// belongs with - see TryTakeIdentifyBudget.
-
-// ---------------------------------------------------------------------------
-// Feeding the identifier.
-//
-// Every resource that turns up in a barrier gets its desc read once and
-// handed to the surface registry, keeping a behaviour profile for all of them.
-//
-// Profiles are keyed on raw pointers with no references, so a recycled
-// address merges two resources' histories - this biases against selecting
-// anything, since the merged history looks less like a clean 2-cycle life.
-// The structural shortlist does hold references, so the resource actually
-// acted upon can't be a recycled address.
-void TryIdentifyResource(ID3D12Resource* resource)
-{
-    if (!resource || !TryMarkResourceSeen(resource))
-    {
-        return;
-    }
-    if (!TryTakeIdentifyBudget())
-    {
-        return;
-    }
-    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    // Read once, shared with every registered identifier (SurfaceRegistry::
-    // ConsiderResource) - GetDesc() on a barrier-encountered resource is a
-    // considered bet, not proven-safe (see the budget above and the
-    // CreateRenderTargetView crash in DEBUGGING.md), so it's called once per
-    // resource total, not once per surface.
-    mv::GetSurfaceRegistry().ConsiderResource(resource, desc);
-}
-
 // Re-entrancy guard for the barrier hook.
 //
 // Under the D3D12 debug layer, every ResourceBarrier call reaches this hook
@@ -371,7 +265,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 ID3D12Resource* const resource = barriers[i].Transition.pResource;
                 const int stateBefore = static_cast<int>(barriers[i].Transition.StateBefore);
                 const int stateAfter = static_cast<int>(barriers[i].Transition.StateAfter);
-                TryIdentifyResource(resource);
+                registry.ConsiderResource(resource);
 
                 if (registry.IsAnyCandidate(resource))
                 {
@@ -447,7 +341,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
             case D3D12_RESOURCE_BARRIER_TYPE_UAV:
             {
                 ID3D12Resource* resource = barriers[i].UAV.pResource;
-                TryIdentifyResource(resource);
+                registry.ConsiderResource(resource);
                 registry.OnUavBarrier(resource);
                 if (registry.IsAnyCandidate(resource))
                 {
@@ -471,122 +365,6 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
     {
         registry.OnBarrierBatch(cmdList, barriers, numBarriers);
     }
-}
-
-void STDMETHODCALLTYPE HookOMSetRenderTargets(
-    ID3D12GraphicsCommandList* cmdList,
-    UINT numRenderTargetDescriptors,
-    const D3D12_CPU_DESCRIPTOR_HANDLE* renderTargetDescriptors,
-    BOOL rtsSingleHandleToDescriptorRange,
-    const D3D12_CPU_DESCRIPTOR_HANDLE* depthStencilDescriptor)
-{
-    const uint64_t callIndex = g_omSetRenderTargetsCount.fetch_add(1, std::memory_order_relaxed);
-
-    if (g_rtvDumpBudget.fetch_sub(1, std::memory_order_relaxed) > 0 && renderTargetDescriptors)
-    {
-        const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
-        std::string line = "frame=" + std::to_string(frame) + " call=" + std::to_string(callIndex) +
-                           " numRTs=" + std::to_string(numRenderTargetDescriptors) + " [";
-        for (UINT i = 0; i < numRenderTargetDescriptors; ++i)
-        {
-            ID3D12Resource* resource = GetResourceForRenderTargetView(renderTargetDescriptors[i].ptr);
-            const auto info = resource != nullptr ? GetResourceInfo(resource) : std::nullopt;
-            if (info.has_value())
-            {
-                line += "(slot=" + std::to_string(i) + ",fmt=" + std::to_string(static_cast<int>(info->format)) +
-                        ",w=" + std::to_string(info->width) + ",h=" + std::to_string(info->height) + ") ";
-            }
-            else
-            {
-                line += "(slot=" + std::to_string(i) + ",UNKNOWN) ";
-            }
-        }
-        line += "]";
-        LogTo("rtv_dump", line);
-    }
-
-    g_originalOMSetRenderTargets(
-        cmdList,
-        numRenderTargetDescriptors,
-        renderTargetDescriptors,
-        rtsSingleHandleToDescriptorRange,
-        depthStencilDescriptor);
-}
-
-void STDMETHODCALLTYPE HookClearRenderTargetView(
-    ID3D12GraphicsCommandList* cmdList,
-    D3D12_CPU_DESCRIPTOR_HANDLE renderTargetView,
-    const FLOAT colorRGBA[4],
-    UINT numRects,
-    const D3D12_RECT* rects)
-{
-    g_clearRenderTargetViewCount.fetch_add(1, std::memory_order_relaxed);
-    g_originalClearRenderTargetView(cmdList, renderTargetView, colorRGBA, numRects, rects);
-}
-
-void STDMETHODCALLTYPE HookCreateRenderTargetView(
-    ID3D12Device* device,
-    ID3D12Resource* resource,
-    const D3D12_RENDER_TARGET_VIEW_DESC* desc,
-    D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor)
-{
-    g_originalCreateRenderTargetView(device, resource, desc, destDescriptor);
-    if (resource != nullptr)
-    {
-        RecordRenderTargetView(destDescriptor.ptr, resource);
-        // Deliberately NOT calling resource->GetDesc() here - tried it and
-        // it crashed the game (EXCEPTION_ACCESS_VIOLATION, confirmed via
-        // UE5's crash report). Root cause: view-creation calls don't take a
-        // reference on the resource (a view is just a descriptor-table
-        // entry), so touching the pointer again afterward races whatever the
-        // engine does with its own reference next. Sticking to creation-time
-        // hooks only misses anything allocated before injection, but never
-        // touches a resource outside the window the engine guarantees valid.
-    }
-}
-
-HRESULT STDMETHODCALLTYPE HookCreateCommittedResource(
-    ID3D12Device* device,
-    const D3D12_HEAP_PROPERTIES* heapProperties,
-    D3D12_HEAP_FLAGS heapFlags,
-    const D3D12_RESOURCE_DESC* desc,
-    D3D12_RESOURCE_STATES initialState,
-    const D3D12_CLEAR_VALUE* optimizedClearValue,
-    REFIID riidResource,
-    void** ppvResource)
-{
-    const HRESULT hr = g_originalCreateCommittedResource(
-        device, heapProperties, heapFlags, desc, initialState, optimizedClearValue, riidResource, ppvResource);
-    if (SUCCEEDED(hr) && ppvResource != nullptr && *ppvResource != nullptr && desc != nullptr)
-    {
-        // *ppvResource satisfies riidResource (ID3D12Resource or a
-        // binary-compatible newer version of it) - used here purely as an
-        // identity key, not through its vtable, so the exact requested
-        // interface version doesn't matter.
-        auto* resource = static_cast<ID3D12Resource*>(*ppvResource);
-        RecordResource(resource, ResourceInfo{desc->Format, desc->Width, desc->Height});
-    }
-    return hr;
-}
-
-HRESULT STDMETHODCALLTYPE HookCreatePlacedResource(
-    ID3D12Device* device,
-    ID3D12Heap* heap,
-    UINT64 heapOffset,
-    const D3D12_RESOURCE_DESC* desc,
-    D3D12_RESOURCE_STATES initialState,
-    const D3D12_CLEAR_VALUE* optimizedClearValue,
-    REFIID riidResource,
-    void** ppvResource)
-{
-    const HRESULT hr = g_originalCreatePlacedResource(
-        device, heap, heapOffset, desc, initialState, optimizedClearValue, riidResource, ppvResource);
-    if (SUCCEEDED(hr) && ppvResource && *ppvResource && desc)
-    {
-        auto* resource = static_cast<ID3D12Resource*>(*ppvResource);
-        RecordResource(resource, ResourceInfo{desc->Format, desc->Width, desc->Height});
-    }
-    return hr;
 }
 
 bool CreateHook(void* target, void* detour, void** original, const char* name)
@@ -754,19 +532,6 @@ bool InstallD3D12Hooks()
         reinterpret_cast<void*>(&HookResourceBarrier),
         reinterpret_cast<void**>(&g_originalResourceBarrier),
         "ResourceBarrier");
-    ok &= CreateHook(
-        VTableEntry(commandList.Get(), kOmSetRenderTargetsIndex),
-        reinterpret_cast<void*>(&HookOMSetRenderTargets),
-        reinterpret_cast<void**>(&g_originalOMSetRenderTargets),
-        "OMSetRenderTargets");
-    ok &= CreateHook(
-        VTableEntry(commandList.Get(), kClearRenderTargetViewIndex),
-        reinterpret_cast<void*>(&HookClearRenderTargetView),
-        reinterpret_cast<void**>(&g_originalClearRenderTargetView),
-        "ClearRenderTargetView");
-
-    // Todo: Investigate why installing CreateRenderTargetView,
-    // CreateCommittedResource, CreatePlacedResource crash here
 
     // Wire the surface registry before any hook can fire (docs/
     // REFACTOR_PLAN.md sec 2.5, Phase 8). Order matters: velocity must

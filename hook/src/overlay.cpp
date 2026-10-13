@@ -556,11 +556,6 @@ void Transition(
 
 } // namespace
 
-bool OverlayActive()
-{
-    return g_mode.load(std::memory_order_relaxed) != 0;
-}
-
 void OverlaySetOriginals(ResourceBarrierFn resourceBarrier, ExecuteCommandListsFn executeCommandLists)
 {
     g_originalResourceBarrier = resourceBarrier;

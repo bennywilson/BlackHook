@@ -756,29 +756,6 @@ bool CreateReadbackBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resou
     return SUCCEEDED(hr);
 }
 
-// DEFAULT-heap buffer a compute shader can write via root UAV. Needed
-// because READBACK memory isn't GPU-writable except as a copy destination.
-bool CreateDefaultUavBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resource>& out)
-{
-    D3D12_HEAP_PROPERTIES heapProps{};
-    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = bytes;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_UNKNOWN;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-
-    const HRESULT hr = device->CreateCommittedResource(
-        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out));
-    return SUCCEEDED(hr);
-}
-
 // Plane count for a format (depth/stencil = 2, most others = 1). Subresource
 // count is mips * arraySize * planeCount - getting this wrong silently
 // truncates the copy.

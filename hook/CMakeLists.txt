@@ -46,7 +46,6 @@ add_library(mv_hook SHARED
   src/dllmain.cpp
   src/logging.cpp
   src/d3d12_hook.cpp
-  src/resource_tracking.cpp
   src/surface_identify.cpp
   src/surface_registry.cpp
   src/surface_profile.cpp

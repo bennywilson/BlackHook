@@ -72,6 +72,5 @@ void StartOverlayHotkeyThread();
 // DLL_PROCESS_DETACH runs at process exit, Windows has already killed the
 // thread, and destroying a still-joinable std::thread calls std::terminate().
 void StopOverlayHotkeyThread();
-bool OverlayActive();
 
 } // namespace mv
