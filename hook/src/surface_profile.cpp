@@ -653,12 +653,34 @@ void Load()
             all.push_back(&optional.spec);
         }
     }
+    // Only the always-registered surfaces can be an extent source.
+    const auto specNamed = [&](const char* name) -> const SurfaceSpec*
+    {
+        for (const SurfaceSpec* spec : {&g_profile.velocity, &g_profile.depth})
+        {
+            if (std::strcmp(spec->name, name) == 0)
+            {
+                return spec;
+            }
+        }
+        return nullptr;
+    };
     for (const SurfaceSpec* spec : all)
     {
-        if (spec->extentFrom != nullptr && std::string(spec->extentFrom) != "velocity" &&
-            std::string(spec->extentFrom) != "depth")
+        // Follow the chain: a loop would recurse forever in the reopen cascade.
+        size_t hops = 0;
+        for (const SurfaceSpec* s = spec; s->extentFrom != nullptr; ++hops)
         {
-            Fail(path + ": " + spec->name + ".extent_from names '" + spec->extentFrom + "', which is not a surface");
+            const SurfaceSpec* source = specNamed(s->extentFrom);
+            if (source == nullptr)
+            {
+                Fail(path + ": " + s->name + ".extent_from names '" + s->extentFrom + "', which is not a surface");
+            }
+            if (hops == all.size())
+            {
+                Fail(path + ": " + spec->name + "'s extent_from chain loops back on itself");
+            }
+            s = source;
         }
     }
 
