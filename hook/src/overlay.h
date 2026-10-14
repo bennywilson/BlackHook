@@ -33,24 +33,14 @@ enum class OverlayMode
     Count = 4
 };
 
-// The surfaces the overlay keeps a GPU-side copy of. Depth, normals and
-// specular are the grid's other three quadrants; velocity feeds modes 1-2 and
-// paces depth's copy (see OverlayCaptureSurface).
-enum class OverlaySurface
-{
-    Velocity = 0,
-    Depth = 1,
-    Normals = 2,
-    Specular = 3,
-    Count = 4
-};
-
 // Called from the Present hooks before chaining through, while the back buffer
 // `frame` is the presented-frame counter. This function checsk that the velocity texture
 // being drawn actually belongs to this frame.
 void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint64_t frame);
 
-// Records a copy of a surface into the overlay's own SRV-able texture for it.
+// Records a copy of `surface` (capture.h index) into the overlay's own SRV-able
+// texture for it. Velocity feeds modes 1-2 and paces depth's copy; depth,
+// normals and specular are the grid's other quadrants.
 // Called at the surface's trigger edge, where the source is known to hold
 // valid contents (they are transient resources). The first edge of a frame
 // wins - except depth, which keeps re-copying until velocity has been copied
@@ -58,7 +48,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
 // current mode needs that surface. `frame` stamps the copy so
 // OverlayOnPresent knows if it is this frame's.
 void OverlayCaptureSurface(
-    OverlaySurface surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+    int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
     D3D12_RESOURCE_STATES stateBefore, uint64_t frame);
 
 // The overlay records its own barriers and submissions; they must go through

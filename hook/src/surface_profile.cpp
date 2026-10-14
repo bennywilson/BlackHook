@@ -578,7 +578,7 @@ void Load()
     }
     for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
     {
-        const char* optionalName = SurfaceProfile::kOptionalSurfaceNames[i];
+        const char* optionalName = kSurfaceNames[kFirstOptionalSurface + i];
         g_profile.optional[i] = SurfaceProfile::OptionalSurface{};
         if (const json* spec = surfaces.Optional(optionalName))
         {
@@ -624,8 +624,8 @@ void Load()
         std::string known;
         for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
         {
-            known += (known.empty() ? "" : ", ") + std::string(SurfaceProfile::kOptionalSurfaceNames[i]);
-            if (surface == SurfaceProfile::kOptionalSurfaceNames[i])
+            known += (known.empty() ? "" : ", ") + std::string(kSurfaceNames[kFirstOptionalSurface + i]);
+            if (surface == kSurfaceNames[kFirstOptionalSurface + i])
             {
                 target = &g_profile.optional[i];
             }
@@ -735,7 +735,7 @@ const SurfaceSpec* SurfaceProfile::Optional(const char* surfaceName) const noexc
 {
     for (int i = 0; i < kOptionalSurfaceCount; ++i)
     {
-        if (optional[i].present && std::strcmp(kOptionalSurfaceNames[i], surfaceName) == 0)
+        if (optional[i].present && std::strcmp(kSurfaceNames[kFirstOptionalSurface + i], surfaceName) == 0)
         {
             return &optional[i].spec;
         }

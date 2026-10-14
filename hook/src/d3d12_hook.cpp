@@ -18,8 +18,6 @@
 #include "surface_profile.h"
 #include "surface_registry.h"
 
-#include <cstring>
-
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
@@ -276,65 +274,22 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                             std::to_string(stateBefore) + " after=" + std::to_string(stateAfter));
                 }
 
-                // Records the transition into the shared profile store once,
-                // fans out to every identifier's liveness tracking, and
-                // reproduces what used to be two hand-wired per-surface
-                // blocks here: candidate validation (capture on success,
-                // reopen on failure - the resolution-change/DRS/resize case)
-                // and rival-edge adoption for velocity. A reopen triggered
-                // here reaches capture.cpp via the registry's
-                // ReopenObserver (wired in InstallD3D12Hooks below), not a
-                // return value - see SurfaceRegistry::SetReopenObserver.
-                constexpr int kMaxTriggers = 4; // one per identifier, at most 3 today
+                // Profiles the transition, tracks liveness, and returns the
+                // surfaces whose selected (or rival-adopted) resource just took
+                // its trigger edge. A reopen it triggers reaches capture.cpp
+                // through the registry's ReopenObserver.
+                constexpr int kMaxTriggers = 4; // mutual exclusion: at most one in practice
                 mv::SurfaceTrigger triggers[kMaxTriggers];
                 const int triggerCount = registry.OnBarrierTransition(resource, frame, stateBefore, stateAfter, triggers, kMaxTriggers);
                 for (int t = 0; t < triggerCount; ++t)
                 {
                     const mv::SurfaceTrigger& trig = triggers[t];
+                    const int surface = mv::SurfaceIndex(trig.identifier->Spec().name);
                     mv::SetFrameIndex(frame);
-                    if (std::strcmp(trig.identifier->Spec().name, "velocity") == 0)
-                    {
-                        // RENDER_TARGET -> shader-resource is the moment
-                        // velocity has been fully written and is about to be
-                        // read - the only safe point to copy it, since it's a
-                        // transient/placed resource whose heap memory gets
-                        // aliased later in the frame.
-                        mv::OnVelocityReadable(cmdList, trig.resource, trig.stateAfter);
-                        // Same moment, same validity argument - the live
-                        // overlay samples a GPU-side copy taken here rather
-                        // than anything read back to the CPU.
-                        mv::OverlayCaptureSurface(mv::OverlaySurface::Velocity, cmdList, trig.resource,
-                                                  static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
-                    }
-                    else if (std::strcmp(trig.identifier->Spec().name, "depth") == 0)
-                    {
-                        // DEPTH_WRITE -> readable is depth's equivalent of
-                        // velocity's trigger edge - same reason for copying
-                        // here rather than at Present, scene depth is a
-                        // transient placed resource too.
-                        mv::OnDepthReadable(cmdList, trig.resource, trig.stateAfter);
-                        // The overlay's GBuffer grid (F7 / MV_OVERLAY=3); a
-                        // no-op in every other mode.
-                        mv::OverlayCaptureSurface(mv::OverlaySurface::Depth, cmdList, trig.resource,
-                                                  static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
-                    }
-                    else
-                    {
-                        // An optional surface (normals = GBufferA, specular =
-                        // GBufferB): RT -> shader-resource, same moment and
-                        // same reason as velocity's. Only reachable for those
-                        // MV_SURFACES registered.
-                        mv::OnOptionalSurfaceReadable(
-                            trig.identifier->Spec().name, cmdList, trig.resource, trig.stateAfter);
-                        const char* name = trig.identifier->Spec().name;
-                        if (std::strcmp(name, "normals") == 0 || std::strcmp(name, "specular") == 0)
-                        {
-                            mv::OverlayCaptureSurface(
-                                std::strcmp(name, "normals") == 0 ? mv::OverlaySurface::Normals
-                                                                  : mv::OverlaySurface::Specular,
-                                cmdList, trig.resource, static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
-                        }
-                    }
+                    mv::OnSurfaceReadable(surface, cmdList, trig.resource, trig.stateAfter);
+                    // The live overlay copies at the same edge, on the GPU.
+                    mv::OverlayCaptureSurface(surface, cmdList, trig.resource,
+                                              static_cast<D3D12_RESOURCE_STATES>(trig.stateAfter), frame);
                 }
                 break;
             }

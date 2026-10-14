@@ -33,51 +33,26 @@ anything.
 """
 import argparse
 import hashlib
+import json
 import os
 import sys
 
-# Surfaces, as (manifest/meta name, file prefix). Extending this is what adding
-# a fourth surface looks like here.
-SURFACES = [
-    ("velocity", "vel"),
-    ("depth", "depth"),
-    ("color", "color"),
-    ("normals", "normals"),
-    ("specular", "specular"),
-]
+def load_manifest(dump_dir):
+    """manifest.json as a dict, or None. Written only when a burst completes."""
+    path = os.path.join(dump_dir, "manifest.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
-def load_metadata(dump_dir):
-    """The dump's layout description, as a flat dict, from whichever format it uses.
-
-    Handles both sides of the Phase 4 migration: manifest.json once it exists,
-    meta.txt/meta_depth.txt before that. Without this the oracle stops working
-    on exactly the phase that changes the metadata format, which is the phase
-    that most needs it.
-    """
-    manifest = os.path.join(dump_dir, "manifest.json")
-    if os.path.exists(manifest):
-        import json
-        with open(manifest) as f:
-            return ("manifest.json", json.load(f))
-
-    meta = {}
-    found = []
-    for name in ("meta.txt", "meta_depth.txt"):
-        path = os.path.join(dump_dir, name)
-        if not os.path.exists(path):
-            continue
-        found.append(name)
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                meta[k] = v
-    if not found:
-        return (None, None)
-    return ("+".join(found), meta)
+def surfaces(*manifests):
+    """(name, file prefix) for every surface either manifest lists, from its file_pattern."""
+    out = {}
+    for m in manifests:
+        for name, s in (m or {}).get("surfaces", {}).items():
+            out.setdefault(name, s["file_pattern"].split("_%")[0])
+    return sorted(out.items())
 
 
 def load_frame_map(dump_dir):
@@ -142,23 +117,14 @@ def flatten(meta, prefix=""):
     return out
 
 
-def diff_metadata(before, after):
+def diff_metadata(before_meta, after_meta):
     """Returns (problems, run_varying): human-readable lines for differences
     that count against equivalence, and for those that don't (RUN_VARYING)."""
-    (before_src, before_meta) = before
-    (after_src, after_meta) = after
     problems, varying = [], []
     if before_meta is None or after_meta is None:
         problems.append(
-            f"metadata missing: before={before_src or 'NONE'} after={after_src or 'NONE'}"
-            " (manifest.json is written when a burst SEALS - a short testhost run never gets there)")
-        return problems, varying
-    if before_src != after_src:
-        problems.append(f"metadata format changed: {before_src} -> {after_src}")
-        # Not fatal on its own - Phase 4 does exactly this deliberately - but the
-        # dicts below will not be comparable, so stop here rather than emit noise.
-        return problems, varying
-    if not isinstance(before_meta, dict) or not isinstance(after_meta, dict):
+            f"manifest.json missing: before={before_meta is not None} after={after_meta is not None}"
+            " (written when a burst SEALS - a short testhost run never gets there)")
         return problems, varying
     # A surface entry with present:false describes data that does not exist -
     # e.g. normals, which a newer hook lists as "not_enabled" and an older one
@@ -204,7 +170,8 @@ def main():
     print()
 
     # --- metadata: must match exactly, outside RUN_VARYING -----------------
-    meta_problems, meta_varying = diff_metadata(load_metadata(args.before), load_metadata(args.after))
+    before_manifest, after_manifest = load_manifest(args.before), load_manifest(args.after)
+    meta_problems, meta_varying = diff_metadata(before_manifest, after_manifest)
     if meta_problems:
         print("METADATA DIFFERS:")
         for p in meta_problems:
@@ -234,7 +201,7 @@ def main():
     # --- content on the intersection ----------------------------------------
     content_ok = True
     any_surface = False
-    for name, prefix in SURFACES:
+    for name, prefix in surfaces(before_manifest, after_manifest):
         identical = differing = missing_before = missing_after = 0
         first_diff = None
         for frame in common:

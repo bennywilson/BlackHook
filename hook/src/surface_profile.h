@@ -1,5 +1,6 @@
 #pragma once
 
+#include "capture.h"
 #include "surface_identify.h"
 
 #include <string>
@@ -34,13 +35,11 @@ struct SurfaceProfile
     SurfaceSpec velocity{};
     SurfaceSpec depth{};
 
-    // Optional surfaces (Phase 10), one slot per kOptionalSurfaceNames entry,
-    // in that order. A slot is `present` when the profile has a spec for it;
-    // it is registered only when also spec.enabled - off by default,
-    // MV_SURFACES=<name>[,<name>] opts in. Fixed array: identifiers keep a
-    // reference to their spec, so slots must never move.
-    static constexpr const char* kOptionalSurfaceNames[] = {"normals", "specular"};
-    static constexpr int kOptionalSurfaceCount = 2;
+    // Optional surfaces: slot i is kSurfaceNames[kFirstOptionalSurface + i].
+    // `present` when the profile has a spec for it; registered only when also
+    // spec.enabled - off by default, MV_SURFACES=<name>[,<name>] opts in. A
+    // fixed array: identifiers keep a reference to their spec.
+    static constexpr int kOptionalSurfaceCount = kSurfaceCount - kFirstOptionalSurface;
     struct OptionalSurface
     {
         bool present = false;

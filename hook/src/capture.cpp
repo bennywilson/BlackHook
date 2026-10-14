@@ -9,7 +9,6 @@
 #include <wrl/client.h>
 
 #include <atomic>
-#include <cassert>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -55,96 +54,23 @@ enum class SlotState
     Submitted
 };
 
-// ---------------------------------------------------------------------------
-// Surfaces.
-//
-// A Surface is one per-frame image the dump carries. Deliberately not called a
-// "plane", "resource" or "buffer": all three already mean something else here
-// (ID3D12Resource, D3D12_RESOURCE_DIMENSION_BUFFER, and D3D12's own
-// depth/stencil subresource PLANES, which live inside a Surface and keep that
-// word).
-//
-// This replaces five field sets that were triplicated across Slot by hand -
-// buffer, footprints, desc, bytes, subresources - plus six more that existed
-// for one surface each (four of them velocity's, one depth's, none colour's).
-// Adding a fourth surface meant editing eleven places, and a forgotten one
-// degraded silently. See docs/REFACTOR_PLAN.md.
-//
-// A fixed array rather than the std::vector the plan sketched: the count is
-// known at compile time until profiles arrive (Phase 9), and an array keeps
-// "no allocation on the hot path" true by construction rather than by
-// remembering to reserve.
-constexpr int kMaxSurfaces = 8;
-constexpr int kSurfaceVelocity = 0;
-constexpr int kSurfaceDepth = 1;
-constexpr int kSurfaceColor = 2;
-// Optional surfaces (docs/REFACTOR_PLAN.md Phase 10): every index from
-// kFirstOptionalSurface on. Each is captured only when MV_SURFACES named it
-// (registering its identifier), is never required - a frame without it is
-// still complete - and shares one capture path (OnOptionalSurfaceReadable).
-// Adding one is an entry here, in kSurfaceSpecs/kStaticFacts, and in
-// surface_profile.cpp's kOptionalSurfaces - nothing else.
-constexpr int kSurfaceNormals = 3;  // GBufferA
-constexpr int kSurfaceSpecular = 4; // GBufferB: metallic, specular, roughness, shading model
-constexpr int kFirstOptionalSurface = kSurfaceNormals;
-constexpr int kSurfaceCount = 5;
-static_assert(kSurfaceCount <= kMaxSurfaces, "surface count outgrew the fixed array");
-
-// Whether a surface's identity is FOUND (structural + behavioural search) or
-// GIVEN (a documented API contract names the exact resource, so there is
-// nothing to search for). Two states, not a spectrum: docs/REFACTOR_PLAN.md
-// sec 3.1 is explicit that a surface may claim KnownByConstruction only when
-// an API contract names it, and colour is the only surface in D3D12 that
-// qualifies - there is no GetVelocityBuffer(), no GetSceneDepth().
-//
-// This is a closed enum, not a free-form flag, and deliberately carries no
-// "assume" or "skip the gate" option: a profile can SELECT
-// KnownByConstruction for a surface that already has one (there is exactly
-// one candidate today, below), but adding a second is a code change, not a
-// config change (sec 2.8 - a profile may narrow/widen/reweight a search, it
-// may never assert an identity outright).
-enum class SourceKind : uint8_t
+// What capture needs per surface (kSurfaceNames order). trigger/arbitration/
+// file pattern are reported in manifest.json as-is.
+struct CaptureFacts
 {
-    Identified,
-    KnownByConstruction
+    const char* filePrefix; // vel_00001.bin
+    const char* trigger;
+    const char* arbitration;
+    const char* note; // appended to the readback-creation log line
 };
-
-// The specific API contract, when SourceKind::KnownByConstruction applies.
-// Meaningless otherwise - kept as its own enum rather than a bool so a second
-// known source (there is none today) does not have to overload this one's
-// meaning.
-enum class KnownSource : uint8_t
-{
-    None,
-    SwapChainBackBuffer
-};
-
-// The data-only half of a surface's description: scalars and names, no state,
-// nothing that survives a call. That is what will let it come out of a JSON
-// profile later without changing shape.
-struct SurfaceSpec
-{
-    const char* name;       // for logs
-    const char* filePrefix; // dump filename stem, as in vel_00001.bin
-    // Appended to this surface's readback-creation log line. Per-surface facts
-    // worth stating once, kept as data rather than as a branch inside the
-    // shared path that writes them.
-    const char* note;
-    SourceKind source;
-    KnownSource known; // meaningful only when source == KnownByConstruction
-};
-
-constexpr SurfaceSpec kSurfaceSpecs[kSurfaceCount] = {
-    {"velocity", "vel", "", SourceKind::Identified, KnownSource::None},
-    {"depth",
-     "depth",
+constexpr CaptureFacts kCaptureFacts[kSurfaceCount] = {
+    {"vel", "render_target_to_shader_resource", "first_in_frame", ""},
+    {"depth", "depth_write_to_readable", "last_before_surface",
      " (plane count comes from the desc: a D24S8 or D32S8 depth buffer is two planes, and copying only the "
-     "first would silently truncate it)",
-     SourceKind::Identified,
-     KnownSource::None},
-    {"back buffer", "color", "", SourceKind::KnownByConstruction, KnownSource::SwapChainBackBuffer},
-    {"normals", "normals", "", SourceKind::Identified, KnownSource::None},
-    {"specular", "specular", "", SourceKind::Identified, KnownSource::None},
+     "first would silently truncate it)"},
+    {"color", "present_back_buffer", "first_in_frame", ""},
+    {"normals", "render_target_to_shader_resource", "first_in_frame", ""},
+    {"specular", "render_target_to_shader_resource", "first_in_frame", ""},
 };
 
 // How well the fence covers a surface's copy.
@@ -197,7 +123,7 @@ struct Slot
 {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commandList;
-    SurfaceCapture surfaces[kMaxSurfaces];
+    SurfaceCapture surfaces[kSurfaceCount];
     UINT64 fenceValue = 0;
     unsigned long long frameIndex = 0;
     int captureIndex = 0;
@@ -422,7 +348,7 @@ struct DumpLayout
     UINT subresources = 0;
 };
 
-DumpLayout g_dumpLayout[kMaxSurfaces];
+DumpLayout g_dumpLayout[kSurfaceCount];
 
 // Records the derived layout (footprints, byte count, subresource count) the
 // first time a surface's readback is established for this dump - a no-op on
@@ -447,7 +373,7 @@ void SnapshotDumpLayout(int surface, const SurfaceCapture& capture)
 // it existed), so the constraint is per dump, not per burst.
 bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 {
-    const char* name = kSurfaceSpecs[surface].name;
+    const char* name = kSurfaceNames[surface];
     DumpLayout& tracked = g_dumpLayout[surface];
     if (!tracked.known)
     {
@@ -799,10 +725,10 @@ bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_D
     {
         return true;
     }
-    const SurfaceSpec& spec = kSurfaceSpecs[surface];
+    const char* name = kSurfaceNames[surface];
     if (capture.readback != nullptr)
     {
-        Log(std::string("capture: ") + spec.name + " layout changed, " + DescToString(capture.desc) + " -> " +
+        Log(std::string("capture: ") + name + " layout changed, " + DescToString(capture.desc) + " -> " +
             DescToString(desc) + "; rebuilding footprints");
     }
     const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
@@ -815,12 +741,12 @@ bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_D
     capture.readback.Reset();
     if (!CreateReadbackBuffer(g_device.Get(), total, capture.readback))
     {
-        Log(std::string("capture: failed to create ") + spec.name + " readback buffer");
+        Log(std::string("capture: failed to create ") + name + " readback buffer");
         return false;
     }
-    Log(std::string("capture: ") + spec.name + " readback buffer created, " + std::to_string(total) + " bytes, " +
+    Log(std::string("capture: ") + name + " readback buffer created, " + std::to_string(total) + " bytes, " +
         std::to_string(subresources) +
-        " subresource(s), rowPitch=" + std::to_string(capture.footprints[0].Footprint.RowPitch) + spec.note);
+        " subresource(s), rowPitch=" + std::to_string(capture.footprints[0].Footprint.RowPitch) + kCaptureFacts[surface].note);
     return true;
 }
 
@@ -1000,27 +926,6 @@ std::string LayoutSurfaceJson(const DumpLayout& layout, int indent)
     return out;
 }
 
-// Static per-surface facts the manifest reports (trigger edge, arbitration
-// rule, file pattern). Written as literals here rather than as SurfaceSpec
-// fields: nothing in the code is DATA-DRIVEN by them yet (OnVelocityReadable
-// and OnDepthReadable are hardcoded functions, not dispatched off a spec) -
-// adding fields nothing reads would be exactly the kind of half-finished
-// abstraction the migration plan warns against. They become real SurfaceSpec
-// fields when SurfaceIdentifier (Phase 6-7) is what actually reads them.
-struct StaticSurfaceFacts
-{
-    const char* trigger;
-    const char* arbitration;
-    const char* filePattern;
-};
-constexpr StaticSurfaceFacts kStaticFacts[kSurfaceCount] = {
-    {"render_target_to_shader_resource", "first_in_frame", "vel_%05d.bin"},
-    {"depth_write_to_readable", "last_before_surface", "depth_%05d.bin"},
-    {"present_back_buffer", "first_in_frame", "color_%05d.bin"},
-    {"render_target_to_shader_resource", "first_in_frame", "normals_%05d.bin"},
-    {"render_target_to_shader_resource", "first_in_frame", "specular_%05d.bin"},
-};
-
 std::string ProcessBaseName()
 {
     char path[MAX_PATH]{};
@@ -1121,10 +1026,8 @@ std::string BuildManifest()
     for (int i = 0; i < kSurfaceCount; ++i)
     {
         const DumpLayout& layout = g_dumpLayout[i];
-        const StaticSurfaceFacts& facts = kStaticFacts[i];
-        j += std::string("    ") + JsonString(kSurfaceSpecs[i].name == std::string("back buffer") ? "color"
-                                                                                                    : kSurfaceSpecs[i].name) +
-             ": {\n";
+        const CaptureFacts& facts = kCaptureFacts[i];
+        j += std::string("    ") + JsonString(kSurfaceNames[i]) + ": {\n";
         j += "      \"present\": " + std::string(layout.known ? "true" : "false") + ",\n";
         if (!layout.known && i == kSurfaceDepth)
         {
@@ -1135,10 +1038,9 @@ std::string BuildManifest()
         {
             // A first-class state, not a log line (docs/REFACTOR_PLAN.md sec
             // 4.1): a consumer can tell "off" from "on but never found".
-            const std::string name = kSurfaceSpecs[i].name;
+            const std::string name = kSurfaceNames[i];
             const SurfaceProfile* profile = ActiveSurfaceProfile();
-            // auto: this file has its own TU-local SurfaceSpec (capture-side facts).
-            const auto* spec = profile != nullptr ? profile->Optional(name.c_str()) : nullptr;
+            const SurfaceSpec* spec = profile != nullptr ? profile->Optional(name.c_str()) : nullptr;
             const bool enabled = spec != nullptr && spec->enabled;
             j += std::string("      \"reason\": ") + (enabled ? "\"never_identified\"" : "\"not_enabled\"") + ",\n";
             j += "      \"detail\": " +
@@ -1162,7 +1064,7 @@ std::string BuildManifest()
         }
         j += std::string("      \"trigger\": ") + JsonString(facts.trigger) + ",\n";
         j += std::string("      \"arbitration\": ") + JsonString(facts.arbitration) + ",\n";
-        j += std::string("      \"file_pattern\": ") + JsonString(facts.filePattern);
+        j += std::string("      \"file_pattern\": ") + JsonString(std::string(facts.filePrefix) + "_%05d.bin");
         if (i >= kFirstOptionalSurface)
         {
             // Unverified against engine source for every optional surface
@@ -1213,8 +1115,7 @@ std::string BuildManifest()
         {
             layoutSurfaces += ",\n";
         }
-        const std::string name = (i == kSurfaceColor) ? "color" : kSurfaceSpecs[i].name;
-        layoutSurfaces += "        " + JsonString(name) + ": " + LayoutSurfaceJson(g_dumpLayout[i], 8);
+        layoutSurfaces += "        " + JsonString(kSurfaceNames[i]) + ": " + LayoutSurfaceJson(g_dumpLayout[i], 8);
         wroteAny = true;
     }
     j += layoutSurfaces;
@@ -1322,8 +1223,8 @@ bool DrainSlot(Slot& slot)
     // into the loop because those two are load-bearing in a way the others are
     // not - the `required` distinction in docs/REFACTOR_PLAN.md, which Phase 8
     // turns into a mask frozen at burst arm.
-    std::vector<uint8_t> data[kMaxSurfaces];
-    bool mapped[kMaxSurfaces] = {};
+    std::vector<uint8_t> data[kSurfaceCount];
+    bool mapped[kSurfaceCount] = {};
     if (!MapOut(
             slot.surfaces[kSurfaceVelocity].readback.Get(),
             slot.surfaces[kSurfaceVelocity].bytes,
@@ -1358,7 +1259,7 @@ bool DrainSlot(Slot& slot)
         {
             continue;
         }
-        sprintf_s(nameBuf, "%s_%05d.bin", kSurfaceSpecs[i].filePrefix, slot.captureIndex);
+        sprintf_s(nameBuf, "%s_%05d.bin", kCaptureFacts[i].filePrefix, slot.captureIndex);
         jobs.push_back(WriteJob{DumpDir() + nameBuf, std::move(data[i]), /*append=*/false, /*renameTo=*/{}});
         haveVelocity = haveVelocity || i == kSurfaceVelocity;
         haveColor = haveColor || i == kSurfaceColor;
@@ -1524,7 +1425,7 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
 
 } // namespace
 
-void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velocity, int stateAfter)
+static void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velocity, int stateAfter)
 {
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || velocity == nullptr)
     {
@@ -1621,7 +1522,7 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
     surface.present = true;
 }
 
-void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter)
+static void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter)
 {
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || depth == nullptr)
     {
@@ -1714,31 +1615,14 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 }
 
-int OptionalSurfaceIndex(const char* name)
-{
-    for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
-    {
-        if (std::strcmp(kSurfaceSpecs[i].name, name) == 0)
-        {
-            return i;
-        }
-    }
-    return -1;
-}
-
-void OnOptionalSurfaceReadable(
-    const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
+static void OnOptionalSurfaceReadable(
+    int index, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
 {
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || resource == nullptr)
     {
         return;
     }
     if (g_originalResourceBarrier == nullptr)
-    {
-        return;
-    }
-    const int index = surfaceName != nullptr ? OptionalSurfaceIndex(surfaceName) : -1;
-    if (index < 0)
     {
         return;
     }
@@ -1789,6 +1673,34 @@ void OnOptionalSurfaceReadable(
     surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
     ++surface.copies;
     surface.present = true;
+}
+
+int SurfaceIndex(const char* name)
+{
+    for (int i = 0; name != nullptr && i < kSurfaceCount; ++i)
+    {
+        if (std::strcmp(kSurfaceNames[i], name) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
+{
+    if (surface == kSurfaceVelocity)
+    {
+        OnVelocityReadable(cmdList, resource, stateAfter);
+    }
+    else if (surface == kSurfaceDepth)
+    {
+        OnDepthReadable(cmdList, resource, stateAfter);
+    }
+    else if (surface >= kFirstOptionalSurface && surface < kSurfaceCount)
+    {
+        OnOptionalSurfaceReadable(surface, cmdList, resource, stateAfter);
+    }
 }
 
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
@@ -2260,20 +2172,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         color.footprints,
         D3D12_RESOURCE_STATE_PRESENT,
         g_originalResourceBarrier);
-    // Our list, our submit, immediately before the Signal below - so there is
-    // nothing to check and nothing that could make it stale. Recorded as its
-    // own value rather than a Strong that would mean something different.
-    //
-    // The assert is the tie between two facts that happen to coincide for
-    // colour today but are not the same fact: SourceKind says WHERE the
-    // resource's identity came from (an API contract vs. a search),
-    // Coverage says whether the FENCE covers this particular copy. Nothing
-    // stops a future KnownByConstruction surface from riding a command list
-    // it did not submit itself and needing real coverage grading - if that
-    // ever happens, this line is where it would need to change, and the
-    // assert is what makes silently forgetting to change it loud instead of
-    // quiet.
-    assert(kSurfaceSpecs[kSurfaceColor].source == SourceKind::KnownByConstruction);
+    // Our list, our submit, immediately before the Signal below: nothing to check.
     color.coverage = Coverage::ByConstruction;
     g_coverageByConstruction.fetch_add(1, std::memory_order_relaxed);
     ++color.copies;

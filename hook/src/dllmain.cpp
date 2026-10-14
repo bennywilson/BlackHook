@@ -10,24 +10,8 @@
 #include "surface_profile.h"
 #include "surface_registry.h"
 
-// MvIdentified*Resource() functions are used by the test harness (testhost/)
-// after placing several look alike buffers. Returns nullptr while search is 
-// running or when it refused to 
-extern "C" __declspec(dllexport) void* MvIdentifiedVelocityResource() {
-    return mv::GetSurfaceRegistry().Selected("velocity");
-}
-
-extern "C" __declspec(dllexport) void* MvIdentifiedDepthResource() {
-    return mv::GetSurfaceRegistry().Selected("depth");
-}
-
-// nullptr also when normals is not enabled (MV_SURFACES=normals) at all.
-extern "C" __declspec(dllexport) void* MvIdentifiedNormalsResource() {
-    return mv::GetSurfaceRegistry().Selected("normals");
-}
-
-// Any surface by name ("specular", ...): nullptr while searching, ambiguous,
-// or not registered.
+// The resource a surface ("velocity", "depth", ...) selected, for the test
+// harness: nullptr while searching, ambiguous, or not registered.
 extern "C" __declspec(dllexport) void* MvIdentifiedSurface(const char* name) {
     return name != nullptr ? mv::GetSurfaceRegistry().Selected(name) : nullptr;
 }

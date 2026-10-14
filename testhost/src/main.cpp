@@ -44,7 +44,7 @@
 //
 //   * debug-layer errors across the run must be zero (the original claim), and
 //   * identification must pick the RIGHT resource out of the line-up, checked
-//     by pointer through the DLL's MvIdentifiedVelocityResource export - not by
+//     by pointer through the DLL's MvIdentifiedSurface export - not by
 //     the presence of a dump.
 //
 // Each decoy is rejected by exactly one of the two filters the hook applies, so
@@ -852,6 +852,12 @@ int main(int argc, char** argv) {
     } else {
         printf("[testhost] no --hook given; running unhooked (baseline)\n");
     }
+    // The resource the hook selected for a surface, or nullptr.
+    using SurfaceFn = void* (*)(const char*);
+    const auto identifiedFn = hookModule != nullptr
+        ? reinterpret_cast<SurfaceFn>(reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedSurface")))
+        : nullptr;
+    auto identified = [&](const char* surface) { return identifiedFn != nullptr ? identifiedFn(surface) : nullptr; };
 
     auto barrier = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
         D3D12_RESOURCE_BARRIER b{};
@@ -1090,15 +1096,12 @@ int main(int argc, char** argv) {
     // days, during the R16G16B16A16_FLOAT/_UNORM episode.
     bool identificationPassed = true;
     if (hookModule != nullptr) {
-        using IdentifiedFn = void*(*)();
-        auto identified = reinterpret_cast<IdentifiedFn>(
-            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedVelocityResource")));
-        if (identified == nullptr) {
-            printf("\n[testhost] FAIL - mv_hook.dll does not export MvIdentifiedVelocityResource; "
+        if (identifiedFn == nullptr) {
+            printf("\n[testhost] FAIL - mv_hook.dll does not export MvIdentifiedSurface; "
                    "cannot check which resource was picked\n");
             identificationPassed = false;
         } else {
-            void* picked = identified();
+            void* picked = identified("velocity");
             const LookAlike* expected = nullptr;
             for (const LookAlike& target : lineUp) {
                 if (target.shouldBeSelected) {
@@ -1202,14 +1205,11 @@ int main(int argc, char** argv) {
     // ---- Did it identify the right depth buffer? ------------------------
     bool depthIdentificationPassed = true;
     if (hookModule != nullptr) {
-        using IdentifiedFn = void*(*)();
-        auto identifiedDepth = reinterpret_cast<IdentifiedFn>(
-            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedDepthResource")));
-        if (identifiedDepth == nullptr) {
-            printf("\n[testhost] FAIL - mv_hook.dll does not export MvIdentifiedDepthResource\n");
+        if (identifiedFn == nullptr) {
+            printf("\n[testhost] FAIL - mv_hook.dll does not export MvIdentifiedSurface\n");
             depthIdentificationPassed = false;
         } else {
-            void* picked = identifiedDepth();
+            void* picked = identified("depth");
             const DepthLookAlike* expected = nullptr;
             for (const DepthLookAlike& target : depthLineUp) {
                 if (target.shouldBeSelected) {
@@ -1249,13 +1249,10 @@ int main(int argc, char** argv) {
     // ---- Phase 10: did normals pick GBufferA, and was velocity kept out? ---
     bool normalsIdentificationPassed = true;
     if (normals && hookModule != nullptr) {
-        using IdentifiedFn = void* (*)();
         using StringFn = const char* (*)();
-        auto identifiedNormals = reinterpret_cast<IdentifiedFn>(
-            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedNormalsResource")));
         auto logDirectory = reinterpret_cast<StringFn>(
             reinterpret_cast<void*>(GetProcAddress(hookModule, "MvLogDirectory")));
-        void* picked = identifiedNormals != nullptr ? identifiedNormals() : nullptr;
+        void* picked = identified("normals");
         const LookAlike* expected = nullptr;
         printf("\n[testhost] ==== normals identification ====\n");
         for (const LookAlike& target : lineUp) {
@@ -1338,10 +1335,7 @@ int main(int argc, char** argv) {
     // ---- Phase 10 follow-up: did specular pick GBufferB over GBufferC? ---
     bool specularIdentificationPassed = true;
     if (specular && hookModule != nullptr) {
-        using SurfaceFn = void* (*)(const char*);
-        auto identifiedSurface = reinterpret_cast<SurfaceFn>(
-            reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedSurface")));
-        void* picked = identifiedSurface != nullptr ? identifiedSurface("specular") : nullptr;
+        void* picked = identified("specular");
         const LookAlike* expected = nullptr;
         printf("\n[testhost] ==== specular identification ====\n");
         for (const LookAlike& target : lineUp) {
@@ -1411,12 +1405,7 @@ int main(int argc, char** argv) {
             resizeTestPassed = false;
             depthReopenRecoveryPassed = false;
         } else {
-            using IdentifiedFn = void* (*)();
             using VoidFn = void (*)();
-            auto identifiedVelocityFn = reinterpret_cast<IdentifiedFn>(
-                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedVelocityResource")));
-            auto identifiedDepthFn = reinterpret_cast<IdentifiedFn>(
-                reinterpret_cast<void*>(GetProcAddress(hookModule, "MvIdentifiedDepthResource")));
             auto forceReopenDepth = reinterpret_cast<VoidFn>(
                 reinterpret_cast<void*>(GetProcAddress(hookModule, "MvForceReopenDepth")));
             auto forceReopenVelocity = reinterpret_cast<VoidFn>(
@@ -1513,7 +1502,7 @@ int main(int argc, char** argv) {
                     // Polled every 30 presented frames once identified
                     // (d3d12_hook.cpp's kResizePollFrames) - generous budget
                     // for the poll to notice plus the reopen to fire.
-                    const int reopenFrame = waitFor(50, [&] { return identifiedVelocityFn() == nullptr; });
+                    const int reopenFrame = waitFor(50, [&] { return identified("velocity") == nullptr; });
                     if (reopenFrame < 0) {
                         printf("[testhost]   FAIL - velocity was never observed reopened (null) within 50 frames of "
                                "the resize\n");
@@ -1521,7 +1510,7 @@ int main(int argc, char** argv) {
                     } else {
                         // Same resource, same descriptor - it settles again
                         // after spec.settleFrames (90); generous margin.
-                        const int reselectedFrame = waitFor(150, [&] { return identifiedVelocityFn() != nullptr; });
+                        const int reselectedFrame = waitFor(150, [&] { return identified("velocity") != nullptr; });
                         if (reselectedFrame < 0) {
                             printf("[testhost]   FAIL - velocity never reidentified after the resize (reopened at "
                                    "frame %d)\n",
@@ -1543,7 +1532,7 @@ int main(int argc, char** argv) {
                     printf("[testhost]   FAIL - mv_hook.dll does not export MvForceReopenDepth\n");
                     depthReopenRecoveryPassed = false;
                 } else {
-                    void* before = identifiedDepthFn();
+                    void* before = identified("depth");
                     // Simulate the engine reallocating scene depth: stop
                     // feeding edges to the resource currently selected, and
                     // start feeding CustomDepth (depth look-alike 4 -
@@ -1556,7 +1545,7 @@ int main(int argc, char** argv) {
                     depthLineUp[4].edgesPerFrame = 4; // CustomDepth takes over
                     forceReopenDepth();
 
-                    const int nullFrame = waitFor(10, [&] { return identifiedDepthFn() == nullptr; });
+                    const int nullFrame = waitFor(10, [&] { return identified("depth") == nullptr; });
                     if (nullFrame < 0) {
                         printf("[testhost]   FAIL - depth was never observed null after the forced reopen\n");
                         depthReopenRecoveryPassed = false;
@@ -1565,8 +1554,8 @@ int main(int argc, char** argv) {
                         // empty-survivors retry cycle (2x settleFrames =
                         // 120) before CustomDepth's freshly-accumulated
                         // edges clear the behaviour gate - generous margin.
-                        const int recoveredFrame = waitFor(300, [&] { return identifiedDepthFn() != nullptr; });
-                        void* after = identifiedDepthFn();
+                        const int recoveredFrame = waitFor(300, [&] { return identified("depth") != nullptr; });
+                        void* after = identified("depth");
                         if (recoveredFrame < 0) {
                             printf("[testhost]   FAIL - depth never produced an answer again after the reopen\n");
                             depthReopenRecoveryPassed = false;

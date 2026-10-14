@@ -22,21 +22,18 @@ namespace
 // skipped for that frame rather than waiting.
 constexpr UINT kFrames = 3;
 
-// Slots in the SRV heap, matching t0..t4 in the overlay shader: the scene
-// snapshot, then one per OverlaySurface in enum order.
-constexpr UINT kSrvSceneColor = 0;
-constexpr UINT kSrvFirstSurface = 1;
-constexpr UINT kSurfaceCount = static_cast<UINT>(OverlaySurface::Count);
-constexpr UINT kSrvCount = kSrvFirstSurface + kSurfaceCount;
+// SRV heap slot i = surface i (capture.h), matching t0..t4 in the shader. The
+// colour slot holds the snapshot of the finished frame taken at Present.
+constexpr UINT kSrvCount = kSurfaceCount;
 
 // Opacity of the velocity colours when composited over the live frame.
 constexpr float kOverGameplayBlend = 0.75f;
 
 // Overlay shader source
 const char* kShaderSource = R"HLSL(
-Texture2D<float4> SceneColor : register(t0);
-Texture2D<float4> Velocity   : register(t1);
-Texture2D<float>  Depth      : register(t2); // plane 0 only (depth, not stencil)
+Texture2D<float4> Velocity   : register(t0);
+Texture2D<float>  Depth      : register(t1); // plane 0 only (depth, not stencil)
+Texture2D<float4> SceneColor : register(t2);
 Texture2D<float4> Normals    : register(t3);
 Texture2D<float4> Specular   : register(t4);
 SamplerState Samp            : register(s0);
@@ -206,7 +203,7 @@ UINT64 g_nextFenceValue = 1;
 UINT g_frame = 0;
 FrameResources g_frames[kFrames];
 
-// One GPU-side copy per OverlaySurface: the texture, the desc it was created
+// One GPU-side copy per surface (the colour slot is unused): the texture, the desc it was created
 // from (CopyResource requires identical layouts, so a resolution change -
 // dynamic resolution scaling, a window resize - recreates it rather than
 // removing the device), and which presented frame its contents are from.
@@ -218,7 +215,6 @@ struct SourceCopy
     bool valid = false;
 };
 SourceCopy g_sources[kSurfaceCount];
-const char* const kSurfaceNames[kSurfaceCount] = {"velocity", "depth", "normals", "specular"};
 
 // A copy recorded during frame N is stamped N, and OverlayOnPresent for frame N
 // runs before the frame counter advances, so the expected age is 0. One frame of
@@ -628,13 +624,14 @@ void StopOverlayHotkeyThread()
 }
 
 void OverlayCaptureSurface(
-    OverlaySurface surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
+    int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
     D3D12_RESOURCE_STATES stateBefore, uint64_t frame)
 {
     const int mode = g_mode.load(std::memory_order_relaxed);
     // Only copy what the current mode draws: velocity for every mode, the
     // rest for the grid alone. Off costs one load and a branch.
-    const bool wanted = mode != 0 && (surface == OverlaySurface::Velocity ||
+    const bool wanted = mode != 0 && surface >= 0 && surface < kSurfaceCount && surface != kSurfaceColor &&
+                        (surface == kSurfaceVelocity ||
                                       mode == static_cast<int>(OverlayMode::GBufferGrid));
     if (!wanted || cmdList == nullptr || source == nullptr)
     {
@@ -649,14 +646,14 @@ void OverlayCaptureSurface(
 
     const UINT index = static_cast<UINT>(surface);
     SourceCopy& copy = g_sources[index];
-    if (surface == OverlaySurface::Depth)
+    if (surface == kSurfaceDepth)
     {
         // Depth takes several edges a frame, and the FIRST is not the scene:
         // on Skyrunner it held only the first-person weapon. Same rule as
         // capture.cpp's OnDepthReadable: keep re-copying until velocity has
         // been copied this frame, so the last depth BEFORE velocity - the
         // depth the frame was rendered against - is what is drawn.
-        const SourceCopy& velocity = g_sources[static_cast<UINT>(OverlaySurface::Velocity)];
+        const SourceCopy& velocity = g_sources[kSurfaceVelocity];
         if (copy.valid && copy.copyFrame == frame && velocity.valid && velocity.copyFrame == frame)
         {
             return;
@@ -692,7 +689,7 @@ void OverlayCaptureSurface(
             return;
         }
         copy.desc = desc;
-        CreateSrvFor(copy.tex.Get(), srvFormat, kSrvFirstSurface + index);
+        CreateSrvFor(copy.tex.Get(), srvFormat, index);
         Log(std::string("overlay: ") + kSurfaceNames[index] + " copy texture created " +
             std::to_string(desc.Width) + "x" + std::to_string(desc.Height) +
             " fmt=" + std::to_string(static_cast<int>(desc.Format)) +
@@ -795,19 +792,19 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
             return;
         }
         g_sceneColorDesc = backDesc;
-        CreateSrvFor(g_sceneColorTex.Get(), backDesc.Format, kSrvSceneColor);
+        CreateSrvFor(g_sceneColorTex.Get(), backDesc.Format, kSurfaceColor);
     }
 
     // Is the velocity texture actually this frame's? Computed before the slot
     // check below so the freshness counters measure the game, not hook's own frame
     // pacing
-    const SourceCopy& velocity = g_sources[static_cast<UINT>(OverlaySurface::Velocity)];
+    const SourceCopy& velocity = g_sources[kSurfaceVelocity];
     const uint64_t copyAge =
         (velocity.valid && frame >= velocity.copyFrame) ? (frame - velocity.copyFrame) : UINT64_MAX;
     const bool stale = !velocity.valid || copyAge > kMaxAcceptableCopyAge;
     // The same test per grid quadrant.
     float staleBySurface[kSurfaceCount];
-    for (UINT s = 0; s < kSurfaceCount; ++s)
+    for (int s = 0; s < kSurfaceCount; ++s)
     {
         const SourceCopy& c = g_sources[s];
         staleBySurface[s] = (!c.valid || frame < c.copyFrame || frame - c.copyFrame > kMaxAcceptableCopyAge) ? 1.0f : 0.0f;
@@ -889,10 +886,10 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
 
     // Layout matches the shader's cbuffer Params.
     const float constants[8] = {
-        staleBySurface[0],
-        staleBySurface[1],
-        staleBySurface[2],
-        staleBySurface[3],
+        staleBySurface[kSurfaceVelocity],
+        staleBySurface[kSurfaceDepth],
+        staleBySurface[kSurfaceNormals],
+        staleBySurface[kSurfaceSpecular],
         static_cast<float>(mode),
         kOverGameplayBlend,
         static_cast<float>(velocity.desc.Width ? velocity.desc.Width : 1),

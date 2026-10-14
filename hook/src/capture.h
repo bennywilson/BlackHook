@@ -6,6 +6,23 @@
 namespace mv
 {
 
+// The per-frame surfaces a dump carries, in manifest order: the one list of
+// their names. velocity and color are always captured, depth once identified;
+// the optional ones (from kFirstOptionalSurface on) only when MV_SURFACES names
+// them, and a frame without them is still complete. A new surface is an entry
+// here and in capture.cpp's kCaptureFacts, plus a spec in profiles/ue5.json.
+constexpr int kSurfaceVelocity = 0;
+constexpr int kSurfaceDepth = 1;
+constexpr int kSurfaceColor = 2;    // the back buffer, known by construction
+constexpr int kSurfaceNormals = 3;  // GBufferA
+constexpr int kSurfaceSpecular = 4; // GBufferB: metallic, specular, roughness, shading model
+constexpr int kSurfaceCount = 5;
+constexpr int kFirstOptionalSurface = kSurfaceNormals;
+inline constexpr const char* kSurfaceNames[kSurfaceCount] = {"velocity", "depth", "color", "normals", "specular"};
+
+// kSurfaceNames index of `name`, or -1.
+int SurfaceIndex(const char* name);
+
 // Function-pointer types for the originals we must call through
 using ResourceBarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -24,28 +41,13 @@ ID3D12CommandQueue* GetGameQueue();
 // Starts the hotkey polling thread (F8 = begin a capture burst).
 void StartCaptureHotkeyThread();
 
-// Called from the ResourceBarrier hook when velocity transitions
-// RENDER_TARGET -> shader-resource: the only point where it's both final and
-// still valid, since it's a transient resource whose heap memory gets
-// recycled later in the frame.
-//
-// `stateAfter` is whatever the game's own barrier moved it to (e.g.
-// ALL_SHADER_RESOURCE or PIXEL_SHADER_RESOURCE, title-dependent); our copy
-// restores that same state afterward.
-void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velocity, int stateAfter);
-
-// Called from the ResourceBarrier hook when scene depth transitions
-// DEPTH_WRITE -> readable. Unlike velocity this can fire multiple times per
-// frame (prepass + base-pass edges); each copy overwrites the same readback
-// buffer, so the last one in the frame is what lands.
-void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter);
-
-// Called from the ResourceBarrier hook on an optional surface's trigger edge
-// ("normals" = GBufferA, "specular" = GBufferB), when MV_SURFACES registered
-// its identifier. One copy per frame (the first edge). Optional: a frame
-// without it is still written. Unknown names are ignored.
-void OnOptionalSurfaceReadable(
-    const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter);
+// Called from the ResourceBarrier hook on an identified surface's trigger edge
+// (RENDER_TARGET -> shader-resource; depth: DEPTH_WRITE -> readable) - the one
+// point a transient resource is both finished and not yet recycled. Copies it
+// into this frame's slot; `stateAfter` is the state the game moved it to, which
+// the copy restores. Which edge of a frame wins is per surface (see
+// kCaptureFacts). Ignored outside a burst or for kSurfaceColor.
+void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter);
 
 // DIAGNOSTIC: with MV_SNAPSHOT=<surface>, copies one frame of each of that
 // surface's scene-extent candidates to snapshot_<surface>_<ptr>_*.bin in the
@@ -60,12 +62,9 @@ void SnapshotCandidate(
 // any earlier captures whose GPU work has completed.
 void OnPresent(IDXGISwapChain* swapChain);
 
-// Called by d3d12_hook.cpp whenever SurfaceRegistry::OnBarrierTransition or
-// ::NoteBackBufferSize reports that `surfaceName`'s search reopened. Ends
-// the current burst (docs/REFACTOR_PLAN.md finding 1.14) if that surface is
-// required for it and a burst is in progress; a no-op otherwise. `surfaceName`
-// matches a SurfaceSpec::name - "velocity", "depth" or "normals" (never
-// required, so its reopen never ends a burst).
+// The registry's ReopenObserver: `surfaceName`'s search reopened. Ends the
+// burst in progress if that surface is required for it (velocity always,
+// depth if it was identified when the burst began); a no-op otherwise.
 void NotifySurfaceReopened(const char* surfaceName);
 
 // Current present index, used to pair velocity and colour within one frame.
