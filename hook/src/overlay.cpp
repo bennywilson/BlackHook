@@ -134,10 +134,8 @@ float4 PSMain(VSOut i) : SV_Target
 
     float3 scene = SceneColor.SampleLevel(Samp, i.uv, 0).rgb;
 
-    // The velocity texture holds whatever was last copied into it, and the copy
-    // only happens on the identified resource's RENDER_TARGET -> shader-resource
-    // barrier. On a frame where that barrier does not occur there is no new
-    // velocity, so draw an oncreen indicator and skip.
+    // The velocity copy happens only at the identified resource's RT -> SRV
+    // edge; on a frame without one there is no new velocity - mark it stale.
     if (Stale > 0.5)
     {
         bool border = i.uv.x < 0.004 || i.uv.x > 0.996 || i.uv.y < 0.007 || i.uv.y > 0.993;
@@ -157,14 +155,11 @@ float4 PSMain(VSOut i) : SV_Target
     // encodes near 0.5 - so they are masked rather than shown.
     bool written = any(raw.rg > 0.0);
 
-    // Channels straight to RGB, exactly as the engine's visualizetexture does.
-    // Channel 2 carries no displacement: under VELOCITY_ENCODE_DEPTH it holds
-    // the HIGH 16 bits of the float32 DeviceZ delta (Common.ush:2071), with
-    // the low 16 in channel 3. That is why it looks bimodal (~0.214 / ~0.713)
-    // - the two modes are the sign bit of that float, not two kinds of motion
-    // - and it is what separates the engine's olive and lavender colour
-    // families. Shown rather than dropped so this view matches the engine's,
-    // but nothing here should be read as a third motion axis.
+    // Channels straight to RGB, as the engine's visualizetexture does. Channel 2
+    // is not a motion axis: under VELOCITY_ENCODE_DEPTH it holds the high 16 bits
+    // of the float32 DeviceZ delta (Common.ush), with the low 16 in channel 3 -
+    // hence its bimodal look (the sign bit) and the engine view's olive and
+    // lavender families.
     if (Mode < 1.5)
     {
         return float4(written ? raw : 0.0.xxx, 1.0);
@@ -183,10 +178,8 @@ struct FrameResources
 std::mutex g_mutex;
 std::atomic<int> g_mode{0};
 
-// Joinable + stop flag, then detach()ed, never joined: this only runs from
-// DLL_PROCESS_DETACH, after Windows has already killed the thread. Contrast
-// capture.cpp's StopCaptureHotkeyThread, which joins a genuinely live thread
-// via MvFlushCapture.
+// Joinable with a stop flag, but only ever detach()ed: it is stopped from
+// DLL_PROCESS_DETACH, after Windows has already killed it.
 std::atomic<bool> g_hotkeyStop{false};
 std::thread g_hotkeyThread;
 
@@ -203,10 +196,9 @@ UINT64 g_nextFenceValue = 1;
 UINT g_frame = 0;
 FrameResources g_frames[kFrames];
 
-// One GPU-side copy per surface (the colour slot is unused): the texture, the desc it was created
-// from (CopyResource requires identical layouts, so a resolution change -
-// dynamic resolution scaling, a window resize - recreates it rather than
-// removing the device), and which presented frame its contents are from.
+// One GPU-side copy per surface (the colour slot is unused): the texture, the
+// desc it was created from (CopyResource needs identical layouts, so a
+// resolution change recreates it), and which presented frame it holds.
 struct SourceCopy
 {
     ComPtr<ID3D12Resource> tex;
@@ -216,15 +208,13 @@ struct SourceCopy
 };
 SourceCopy g_sources[kSurfaceCount];
 
-// A copy recorded during frame N is stamped N, and OverlayOnPresent for frame N
-// runs before the frame counter advances, so the expected age is 0. One frame of
-// slack is allowed so that an engine which presents at a different point in its
-// own frame does not blank the overlay permanently
+// A copy recorded during frame N is stamped N and drawn at Present N, so the
+// expected age is 0; one frame of slack for an engine that presents at a
+// different point in its frame.
 constexpr uint64_t kMaxAcceptableCopyAge = 1;
 
-// Freshness instrumentation. mv_candidates.log can't answer "how often is
-// there no new velocity?" - its batched, drop-tolerant logging loses records,
-// so counted here instead, where the draw decision is actually made.
+// How often there is no new velocity to draw, counted where the draw decision
+// is made.
 uint64_t g_freshCount = 0;
 uint64_t g_staleCount = 0;
 uint64_t g_staleRun = 0;
@@ -300,11 +290,9 @@ void CreateSrvFor(ID3D12Resource* resource, DXGI_FORMAT format, UINT index)
     g_device->CreateShaderResourceView(resource, &desc, SrvCpu(index));
 }
 
-// Creates a texture matching a source resource's layout so CopyResource can be
-// used directly. Drops RENDER_TARGET: this copy is only ever read. Keeps
-// ALLOW_DEPTH_STENCIL, though - D3D12 copies depth-stencil data only between
-// depth-stencil resources - which is harmless for reading since
-// DENY_SHADER_RESOURCE stays off.
+// A texture matching a source's layout, so CopyResource can be used directly.
+// Drops RENDER_TARGET (only ever read) but keeps ALLOW_DEPTH_STENCIL: D3D12
+// copies depth-stencil data only between depth-stencil resources.
 bool CreateMatchingTexture(const D3D12_RESOURCE_DESC& sourceDesc, ComPtr<ID3D12Resource>& out)
 {
     D3D12_HEAP_PROPERTIES heapProps{};
@@ -440,15 +428,10 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     }
     g_srvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // One RTV per in-flight frame, not one shared slot. A descriptor must stay
-    // valid until every command list referencing it has finished executing,
-    // and with kFrames submissions in flight and no wait between them, writing
-    // a new back buffer's RTV into a single slot every frame overwrites a
-    // descriptor the GPU may still be reading. It happened to work here
-    // because the three back buffers are identical in every respect except
-    // address, so the stale descriptor described a compatible resource - a
-    // coincidence of this swapchain's configuration, not a guarantee, and the
-    // debug layer flags it.
+    // One RTV per in-flight frame: a descriptor must outlive every command list
+    // referencing it, and with kFrames submissions in flight a single shared
+    // slot would be overwritten while the GPU may still read it (the debug
+    // layer flags it).
     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
     rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvDesc.NumDescriptors = kFrames;
@@ -595,9 +578,6 @@ void StartOverlayHotkeyThread()
                     const int next = (g_mode.load() + 1) % static_cast<int>(OverlayMode::Count);
                     g_mode.store(next);
                     // Must match OverlayMode in overlay.h, including its count.
-                    // These previously still listed the removed flow-coloured
-                    // view, so mode 1 logged itself as "flow colours" while
-                    // actually drawing the raw channel mapping.
                     static_assert(static_cast<int>(OverlayMode::Count) == 4, "kNames is out of sync with OverlayMode");
                     static const char* kNames[] = {
                         "normal", "SceneVelocity (raw channels, engine view)", "SceneVelocity over gameplay",
@@ -618,8 +598,7 @@ void StopOverlayHotkeyThread()
     {
         return;
     }
-    // Already terminated by Windows; detach so the destructor does not call
-    // std::terminate(). See the same pair in StopCaptureHotkeyThread.
+    // Detach, never join: see g_hotkeyThread.
     g_hotkeyThread.detach();
 }
 
@@ -648,11 +627,9 @@ void OverlayCaptureSurface(
     SourceCopy& copy = g_sources[index];
     if (surface == kSurfaceDepth)
     {
-        // Depth takes several edges a frame, and the FIRST is not the scene:
-        // on Skyrunner it held only the first-person weapon. Same rule as
-        // capture.cpp's OnDepthReadable: keep re-copying until velocity has
-        // been copied this frame, so the last depth BEFORE velocity - the
-        // depth the frame was rendered against - is what is drawn.
+        // last_before_surface, as capture does: depth's FIRST edge can be a
+        // partial pass (on Skyrunner, the weapon alone), so keep re-copying
+        // until velocity has been copied this frame.
         const SourceCopy& velocity = g_sources[kSurfaceVelocity];
         if (copy.valid && copy.copyFrame == frame && velocity.valid && velocity.copyFrame == frame)
         {
@@ -699,8 +676,7 @@ void OverlayCaptureSurface(
     Transition(cmdList, copy.tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(cmdList, source, stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-    // Identical descs, so a whole-resource copy handles every plane and mip w/o
-    // per-subresource book keeping
+    // Identical descs: one whole-resource copy covers every plane and mip.
     cmdList->CopyResource(copy.tex.Get(), source);
 
     Transition(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, stateBefore);
@@ -795,9 +771,8 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         CreateSrvFor(g_sceneColorTex.Get(), backDesc.Format, kSurfaceColor);
     }
 
-    // Is the velocity texture actually this frame's? Computed before the slot
-    // check below so the freshness counters measure the game, not hook's own frame
-    // pacing
+    // Is the velocity copy this frame's? Measured before the slot check, so
+    // the freshness counters measure the game, not this hook's pacing.
     const SourceCopy& velocity = g_sources[kSurfaceVelocity];
     const uint64_t copyAge =
         (velocity.valid && frame >= velocity.copyFrame) ? (frame - velocity.copyFrame) : UINT64_MAX;

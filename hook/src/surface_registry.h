@@ -13,32 +13,15 @@
 #include <utility>
 #include <vector>
 
-// SurfaceRegistry - docs/REFACTOR_PLAN.md sec 2.5, Phase 8.
-//
-// Owns the identifiers themselves (built by InstallD3D12Hooks from the active
-// profile's specs - every one a plain SurfaceIdentifier since Phase 10 moved
-// rival adoption into the base class), and everything that used to be
-// hand-wired across d3d12_hook.cpp and resource_tracking.h because no single
-// file had visibility into every registered identifier at once:
-//
-//   - ONE shared BarrierProfileStore, so N identifiers cost one map lookup
-//     per transition, not N (finding 1.16).
-//   - The reopen cascade, derived from each identifier's spec.extentFrom
-//     instead of hand-wired call sites (finding 1.9).
-//   - The global identify seen-set/budget refill, called once per cascade
-//     instead of once per identifier that happens to clear its own shortlist
-//     (finding 1.7).
-//   - Per-identifier candidate sets (surface_identify.h), plus the one
-//     invariant only a registry can enforce: mutual exclusion, no resource
-//     claimed by two identifiers (docs/REFACTOR_PLAN.md sec 3.3).
-//   - Known-source exclusion: resources obtained via a documented API
-//     contract (colour's swapchain buffers) are never eligible for any
-//     identifier's search (sec 3.3).
-//
-// d3d12_hook.cpp calls this registry's entry points instead of the
-// per-surface free functions it used to call directly, and capture.cpp/
-// dllmain.cpp reach individual surfaces by name (Find/Selected) rather than
-// through per-surface wrapper headers.
+// Owns every SurfaceIdentifier (one per enabled surface of the active profile)
+// and what only something that sees all of them can do:
+//   - one shared BarrierProfileStore, so a transition costs one lookup however
+//     many surfaces there are;
+//   - the reopen cascade, derived from spec.extentFrom: reopening a surface
+//     reopens everything sized from it;
+//   - the identify seen-set and GetDesc() budget, refilled once per cascade;
+//   - mutual exclusion (no resource claimed by two surfaces) and known-source
+//     exclusion (no search may select a swapchain back buffer).
 
 namespace mv
 {
@@ -55,33 +38,21 @@ class SurfaceRegistry : public MutualExclusionChecker
 public:
     SurfaceRegistry() noexcept;
 
-    // Called once per surface, from InstallD3D12Hooks, before Configure().
-    // Takes ownership; the identifier lives for the process. Order matters
-    // only in that a surface naming another via spec.extentFrom must be
-    // registered after the surface it names - true for depth-after-velocity
-    // today, and worth keeping true rather than making Configure()
-    // topologically sort a two-node graph.
+    // Once per surface, before Configure(). Takes ownership.
     void Register(std::unique_ptr<SurfaceIdentifier> identifier) noexcept;
 
-    // Called at most once, any time before the first Reopen (typically from
-    // InstallD3D12Hooks, alongside Register/Configure). ReopenCascade calls
-    // this for every identifier it reopens, root or dependent - by
-    // construction, not by every call site that can trigger a reopen
-    // remembering to notify capture.cpp itself (docs/REFACTOR_PLAN.md
-    // finding 1.14: the whole point is that this must hold regardless of
-    // WHICH path triggered the reopen - a barrier-hook descriptor mismatch,
-    // a back-buffer resize, or anything else, present or future). The
-    // registry has no notion of "burst"; it just reports what reopened.
+    // Called for every identifier a cascade reopens, root or dependent, and so
+    // whatever triggered it (descriptor mismatch, resize, ...). capture.cpp
+    // uses it to end a burst that required that surface.
     using ReopenObserver = void (*)(const char* surfaceName);
     void SetReopenObserver(ReopenObserver observer) noexcept;
 
-    // Called once, after every Register() call, before hooks go live. Wires
-    // the shared profile store, known-source exclusion, mutual exclusion,
-    // and the extentFrom dependency graph.
+    // Once, after every Register(), before hooks go live. Wires the shared
+    // profile store, both exclusions, and the extentFrom dependencies.
     void Configure() noexcept;
 
-    // nullptr if no surface of that name is registered - which is every
-    // surface, if the profile failed to load (surface_profile.h).
+    // nullptr if no surface of that name is registered (every surface, if the
+    // profile failed to load).
     SurfaceIdentifier* Find(const char* name) noexcept;
 
     // The named surface's selected resource, or nullptr while it is
@@ -105,14 +76,10 @@ public:
 
     void OnUavBarrier(ID3D12Resource* resource) noexcept;
 
-    // Every transition barrier. Records it into the shared store once, fans
-    // out to every identifier for liveness tracking, and reproduces what the
-    // old hand-wired dispatch did at the call site: candidate validation
-    // (capturing on success, reopening on failure) and rival-edge adoption.
-    // Writes 0..n capturable triggers into `out` (capacity `outCapacity`)
-    // and returns the count. A reopen triggered here reaches the
-    // ReopenObserver the same as any other (see SetReopenObserver) - there
-    // is no separate out-param for it.
+    // Every transition barrier: profiles it, tracks liveness, validates a
+    // candidate taking its trigger edge (reopening on a changed descriptor) and
+    // offers other trigger edges for rival adoption. Writes the surfaces to
+    // capture into `out` and returns how many.
     int OnBarrierTransition(
         ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter, SurfaceTrigger* out,
         int outCapacity) noexcept;
@@ -133,12 +100,10 @@ public:
     }
     void OnBarrierBatch(ID3D12GraphicsCommandList* cmdList, const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept;
 
-    // DIAGNOSTIC: called from OnBarrierBatch for every RT -> SRV edge of a
-    // resource an optional surface has shortlisted, at the dependency's
-    // extent, once velocity and depth are selected - the hook's
-    // MV_SNAPSHOT=<surface> uses it to copy one frame of each candidate to
-    // disk so the candidates can be told apart by their pixels. The registry
-    // decides nothing with it. Wired once, like SetReopenObserver.
+    // MV_SNAPSHOT: each RT -> SRV edge of a resource an optional surface has
+    // shortlisted at the scene extent, once velocity and depth are selected,
+    // so one frame of every candidate can be copied out and told apart by its
+    // pixels. Decides nothing.
     using CandidateEdgeObserver = void (*)(
         const char* surfaceName, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter);
     void SetCandidateEdgeObserver(CandidateEdgeObserver observer) noexcept
@@ -146,16 +111,11 @@ public:
         candidateEdgeObserver_ = observer;
     }
 
-    // Forwards to every self-contained identifier (spec.extentFrom ==
-    // nullptr) - a dependent inherits reopening through the cascade instead
-    // of tracking the back buffer itself. Reopens (reaching the
-    // ReopenObserver, see above) if any of them reports the size changed
-    // after a decision was made.
+    // Forwards to every surface not sized from another; reopens (cascading)
+    // any that report the size changed after a decision.
     void NoteBackBufferSize(uint64_t width, uint32_t height) noexcept;
 
-    // Resources obtained via a documented API contract (colour's swapchain
-    // buffers) - fed here so no identifier's search can ever select one
-    // (docs/REFACTOR_PLAN.md sec 3.3).
+    // A swapchain back buffer: never selectable, purged from any shortlist.
     void NoteKnownSourceResource(ID3D12Resource* resource) noexcept;
 
     // Reopens `rootName` and every identifier transitively depending on its
@@ -175,8 +135,7 @@ private:
         std::vector<SurfaceIdentifier*> dependents; // identifiers whose extentSource == this one
     };
 
-    // Diagnostic convenience for d3d12_hook.cpp's "candidates" log channel:
-    // true if ANY registered identifier holds `resource` as a candidate.
+    // For mv_candidates.log (MV_DIAG): does ANY surface hold `resource`?
 public:
     bool IsAnyCandidate(ID3D12Resource* resource) const noexcept;
 
@@ -200,7 +159,7 @@ private:
     std::atomic<bool> profileDumped_{false};
     ReopenObserver reopenObserver_ = nullptr;
 
-    // OnBarrierBatch's tallies - diagnostic only, see there.
+    // OnBarrierBatch's MV_DIAG tallies.
     static constexpr size_t kMaxBatchSurfaces = 8; // entries_ capacity
     struct BatchStats
     {
@@ -220,12 +179,8 @@ private:
     std::map<std::pair<SurfaceIdentifier*, ID3D12Resource*>, BatchStats> batchStats_;
 };
 
-// The one process-wide registry. Register()/Configure() are called once from
-// InstallD3D12Hooks, before hooks go live. Exposed as a singleton, rather
-// than passed around explicitly, because both d3d12_hook.cpp (the barrier
-// hook) and capture.cpp (known-source feeding, ending a burst on a required
-// surface's reopen) need to reach the same instance, and neither owns the
-// other.
+// The one process-wide registry, set up by InstallD3D12Hooks before the hooks
+// go live; d3d12_hook.cpp, capture.cpp and dllmain.cpp all reach it.
 SurfaceRegistry& GetSurfaceRegistry() noexcept;
 
 } // namespace mv

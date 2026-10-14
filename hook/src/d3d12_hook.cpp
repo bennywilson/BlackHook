@@ -45,7 +45,6 @@ namespace
 //      [18-21] IDXGISwapChain1         (GetDesc1 .. GetCoreWindow)
 //      [22]    Present1                <-- Target hook
 //
-//
 //  ID3D12CommandQueue:
 //      [00-02] IUnknown
 //      [03-06] ID3D12Object
@@ -84,9 +83,9 @@ Present1_t g_originalPresent1 = nullptr;
 ExecuteCommandLists_t g_originalExecuteCommandLists = nullptr;
 ResourceBarrier_t g_originalResourceBarrier = nullptr;
 
-// Global frame key: single source of truth for pairing velocity and colour
-// captures across both Present paths. Atomic since multiple threads record
-// command lists in parallel; the counters below are diagnostics only.
+// The present count: the frame key pairing a frame's barrier-time copies with
+// its Present. Atomic since multiple threads record command lists in parallel;
+// the counters below are diagnostics only.
 std::atomic<uint64_t> g_frameCounter{0};
 
 std::atomic<uint64_t> g_presentCount{0};
@@ -97,15 +96,10 @@ std::atomic<uint64_t> g_resourceBarrierCount{0};
 // Periodic summary of high-frequency hooks
 void LogHeartbeatIfDue()
 {
-    // Gate on activity from *either* Present path - modern D3D12 titles
-    // (UE5 included) almost always present via IDXGISwapChain3::Present1
-    // (flip-model/HDR/VRR support), so gating on legacy Present alone would
-    // silently never fire even with everything working correctly.
+    // Either Present path: UE5 presents via Present1 (flip model).
     const uint64_t n = g_presentCount.load(std::memory_order_relaxed) + g_present1Count.load(std::memory_order_relaxed);
     if (n <= 5 || n % 300 == 0)
     {
-        // Total alongside individual Present/Present1 counts reveals which
-        // swapchain API the engine uses, rather than masking it in a sum.
         Log("heartbeat: frames=" + std::to_string(n) +
             " present=" + std::to_string(g_presentCount.load(std::memory_order_relaxed)) +
             " present1=" + std::to_string(g_present1Count.load(std::memory_order_relaxed)) +
@@ -117,16 +111,12 @@ void LogHeartbeatIfDue()
 // These hooks fully replace the game's Present/ExecuteCommandLists/etc.
 // Every path through them MUST call the original.
 //
-// The capture hand-off happens *before* the counter is incremented and
-// before chaining to the real Present: the back buffer still holds the
-// finished frame at this point, and the frame index must match the one
-// ResourceBarrier used earlier in the same frame so velocity/colour pair up.
+// The capture hand-off happens before the frame counter advances and before
+// the real Present: the back buffer still holds the finished frame, and the
+// frame index matches the one the frame's barriers were tagged with.
 //
-// Back-buffer size is read every frame until identification has an answer
-// (the search uses it), then polled (the resize check uses it).
-
-// Window resizing abandons the identified velocity resource which requires
-// reidentifying it. Poll every 30 frames
+// Back-buffer size is read every frame until velocity is identified, then
+// polled: a resize abandons the identified scene textures.
 constexpr uint64_t kResizePollFrames = 30;
 
 void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t frame)
@@ -148,15 +138,11 @@ void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t 
     }
 }
 
-// Known-source exclusion (docs/REFACTOR_PLAN.md sec 3.3), fed from here on
-// EVERY Present - not from capture.cpp, which only reached it mid-burst. Until
-// Phase 10 nothing noticed: no surface had a format matching the back buffer.
-// Normals does (R8G8B8A8_UNORM), so outside a burst its structural shortlist
-// was holding references to the swapchain's buffers - which hung process exit
-// (flip-model teardown with outstanding buffer refs) and would make a real
-// game's ResizeBuffers fail. All buffers, not just the current one: a buffer
-// can take a barrier before it is first presented, and the registry purges a
-// newly-noted one from any shortlist that got there first.
+// Known-source exclusion, fed on EVERY Present: a surface whose formats include
+// the back buffer's (normals: R8G8B8A8_UNORM) would otherwise shortlist - and
+// hold references to - the swapchain's buffers, which hangs flip-model teardown
+// at exit and fails a game's ResizeBuffers. All buffers, not just the current
+// one: a buffer can take a barrier before it is first presented.
 void NoteKnownSources(IDXGISwapChain* const swapChain)
 {
     if (!swapChain)
@@ -213,10 +199,10 @@ void STDMETHODCALLTYPE
 HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
 {
     g_executeCommandListsCount.fetch_add(1, std::memory_order_relaxed);
-    // Remember the game's graphics queue so our own back-buffer copy can be
-    // submitted to it (and covered by the same fence as the velocity copy).
+    // The game's direct queue: our back-buffer copy goes there, under the same
+    // fence as the velocity copy.
     mv::NoteCommandQueue(queue);
-    // Check that the list carrying the velocity copy is submitted to that queue before we signal the fence.
+    // Checks the list carrying the velocity copy was submitted to that queue.
     mv::NoteSubmission(queue, numCommandLists, commandLists);
     g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
 }
@@ -251,7 +237,6 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
         return;
     }
 
-    // Recurrence logging for known candidates
     const uint64_t frame = g_frameCounter.load(std::memory_order_relaxed);
     mv::SurfaceRegistry& registry = mv::GetSurfaceRegistry();
     for (UINT i = 0; i < numBarriers; ++i)
@@ -488,21 +473,12 @@ bool InstallD3D12Hooks()
         reinterpret_cast<void**>(&g_originalResourceBarrier),
         "ResourceBarrier");
 
-    // Wire the surface registry before any hook can fire (docs/
-    // REFACTOR_PLAN.md sec 2.5, Phase 8). Order matters: velocity must
-    // register before depth, since depth's spec.extentFrom names
-    // "velocity" and Configure() resolves that name by looking it up in
-    // what's already registered.
-    //
-    // The specs come from the active profile (Phase 9). If it failed to load
-    // nothing is registered: hooks still install, so the game runs and the
-    // log explains, but no surface is ever identified or captured - there is
-    // no built-in spec to fall back to (surface_profile.h).
+    // Wire the surface registry before any hook can fire. Velocity registers
+    // first: the others name it in spec.extentFrom. If the profile failed to
+    // load nothing is registered - the game runs, nothing is identified, and
+    // the log says why; there is no built-in spec to fall back to.
     if (const mv::SurfaceProfile* profile = mv::LoadSurfaceProfile())
     {
-        // Every surface is a plain SurfaceIdentifier, configured entirely by
-        // its spec - including rival adoption, which velocity's subclass used
-        // to own until Phase 10 found normals needed it too.
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->velocity));
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
         // Optional surfaces, after velocity (their extent source), each only

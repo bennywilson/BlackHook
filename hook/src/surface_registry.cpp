@@ -13,11 +13,8 @@ namespace mv
 namespace
 {
 
-// The survey dump (see README, "identifying by behaviour") stays on its
-// original schedule: late enough that every resource has had thousands of
-// frames to show its pattern. Previously velocity_identify.cpp's
-// kProfileDumpFrame; moved here because the survey is now of the one shared
-// store, not of one identifier's own map.
+// When mv_barrier_profile.log is written: late enough that every resource has
+// had thousands of frames to show its pattern.
 constexpr uint64_t kProfileDumpFrame = 2000;
 
 // Distinct resources GetDesc() is called on (see ConsiderResource). Generous for
@@ -131,11 +128,9 @@ void SurfaceRegistry::Configure() noexcept
             sharedCallSignals_ = sharedCallSignals_ || spec.signals[i].id == SignalId::SharesCallWithEdge;
         }
     }
-    // Second pass, after every identifier has a stable address in
-    // entries_: resolve each spec.extentFrom name to the identifier it
-    // names, wire the functional half (SetExtentSource, same as Phase 7's
-    // manual wiring), and record the reverse edge for the reopen cascade
-    // (docs/REFACTOR_PLAN.md finding 1.9).
+    // Second pass, once every identifier has a stable address: resolve each
+    // spec.extentFrom to its identifier, and record the reverse edge for the
+    // reopen cascade.
     for (Entry& e : entries_)
     {
         const char* extentFrom = e.identifier->Spec().extentFrom;
@@ -222,11 +217,8 @@ int SurfaceRegistry::OnBarrierTransition(
 
 void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
 {
-    // Registration order is velocity-then-depth (InstallD3D12Hooks), so this
-    // naturally runs a dependency's OnFrame after its source's, same as the
-    // pre-Phase-8 hand-ordered calls in d3d12_hook.cpp - not load-bearing
-    // (OnFrame re-reads the live source each call, so a stale-by-one-Present
-    // read is harmless), but worth keeping true rather than relying on it.
+    // Registration order (velocity first) runs a source's OnFrame before its
+    // dependents'. Not load-bearing: OnFrame re-reads the live source.
     for (Entry& e : entries_)
     {
         e.identifier->OnFrame(frame);
@@ -479,10 +471,8 @@ void SurfaceRegistry::NoteKnownSourceResource(ID3D12Resource* resource) noexcept
     {
         if (e.identifier->ForgetKnownSource(resource))
         {
-            // Selected a back buffer: wrong by definition (sec 3.1 - it is
-            // colour's, by API contract). Should be unreachable now that
-            // sources are noted every Present, but if it happens, say so and
-            // search again rather than keep capturing it as something else.
+            // Selected a back buffer: wrong by definition. Unreachable while
+            // sources are noted every Present; if it happens, search again.
             ReopenCascade(e.identifier->Spec().name, ReopenReason::DescriptorChanged,
                           "the selected resource is a swapchain back buffer (known by construction)");
         }
@@ -512,11 +502,8 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
     std::vector<Entry*> cascade;
     CollectCascade(root, &cascade);
 
-    // Once per cascade, not once per identifier in it (docs/REFACTOR_PLAN.md
-    // sec 2.5 point 3, finding 1.7) - see the long comment this replaced on
-    // SurfaceIdentifier::Reopen for why a depth-only reopen never refilling
-    // this was a real, permanent loss of the ability to notice a
-    // replacement resource once the identify budget was spent.
+    // Once per cascade: without the refill a reopen after the budget ran out
+    // could never find the replacement resource.
     ForgetAllResourcesSeen();
 
     for (Entry* e : cascade)
@@ -531,12 +518,8 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
                 std::string("the ") + root->identifier->Spec().name + " search was reopened";
             e->identifier->Reopen(ReopenReason::DependencyReopened, dependentDetail.c_str());
         }
-        // Fires for every identifier in the cascade, not just the root - a
-        // dependent's own requirement (e.g. depth's, per capture.cpp's
-        // frozen per-burst mask) is a separate question from the root's,
-        // and only the observer's caller knows the answer. By construction:
-        // this is the ONLY place ReopenCascade calls Reopen(), so nothing
-        // that reopens can skip notifying, regardless of what triggered it.
+        // For every identifier in the cascade, root or dependent: whether a
+        // dependent's reopen matters (depth's, per burst) is the observer's call.
         if (reopenObserver_ != nullptr)
         {
             reopenObserver_(e->identifier->Spec().name);

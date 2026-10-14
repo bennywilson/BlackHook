@@ -564,9 +564,8 @@ void Load()
     const json& surfacesJson = profile.Required("surfaces");
     Fields surfaces(surfacesJson, profile.Path("surfaces"));
     // velocity and depth are required and always on: every dump is keyed off
-    // velocity, and depth's extent link and burst atomicity assume it.
-    // normals (Phase 10) is optional in a profile and off unless opted into.
-    // Any other surface name is a mistake worth hearing about.
+    // velocity, and depth's extent link and burst atomicity assume it. Any
+    // other surface name is a mistake worth hearing about.
     g_profile.velocity = ParseSurface(surfaces.Required("velocity"), "velocity", surfaces.Path("velocity"));
     g_profile.depth = ParseSurface(surfaces.Required("depth"), "depth", surfaces.Path("depth"));
     for (const SurfaceSpec* spec : {&g_profile.velocity, &g_profile.depth})
@@ -589,11 +588,8 @@ void Load()
     surfaces.RejectUnknown();
     profile.RejectUnknown();
 
-    // MV_IDENTIFY_FRAMES: the one per-run override, kept from before profiles
-    // existed (it is how mv_testhost fits the settling window into a short
-    // run). Applied here, on top of whichever profile ran, so the spec stays
-    // the single source the identifier reads - and logged, so a capture made
-    // with it says so. Phase 6 dropped this by accident; restored here.
+    // MV_IDENTIFY_FRAMES: overrides velocity's settle_frames for this run (how
+    // mv_testhost fits the settling window into a short run). Logged.
     g_profile.overrides.clear();
     const std::string identifyFrames = EnvVar("MV_IDENTIFY_FRAMES");
     if (!identifyFrames.empty())
@@ -608,10 +604,9 @@ void Load()
         g_profile.overrides = "velocity.settle_frames=" + std::to_string(frames) + " (MV_IDENTIFY_FRAMES)";
     }
 
-    // MV_SURFACES: comma-separated optional surfaces to switch on for this
-    // run (docs/REFACTOR_PLAN.md Phase 10: "opt in with MV_SURFACES=normals").
-    // Only optional surfaces may be named - velocity and depth are always on -
-    // and a name this profile has no spec for is an error, not a no-op.
+    // MV_SURFACES: comma-separated optional surfaces to switch on for this run.
+    // A name that is not optional, or that this profile has no spec for, is an
+    // error, not a no-op.
     std::istringstream optIn(EnvVar("MV_SURFACES"));
     std::string surface;
     while (std::getline(optIn, surface, ','))

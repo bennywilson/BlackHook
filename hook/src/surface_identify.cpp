@@ -95,8 +95,7 @@ bool IsReverseTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfte
         case TriggerEdge::RenderTargetToShaderResource:
             return IsShaderResourceState(stateBefore) && stateAfter == D3D12_RESOURCE_STATE_RENDER_TARGET;
         case TriggerEdge::DepthWriteToReadable:
-            // Depth has no reverse-edge concept in the pre-extraction code -
-            // readable -> DEPTH_WRITE was never tracked.
+            // Depth's reverse edge (readable -> DEPTH_WRITE) is not tracked.
             return false;
     }
     return false;
@@ -174,8 +173,7 @@ bool BarrierProfileStore::RecordTransition(ID3D12Resource* resource, uint64_t fr
         p.sawUnorderedAccess = true;
     }
 
-    // Computed once, for every TriggerEdge that exists - not once per
-    // identifier (docs/REFACTOR_PLAN.md sec 2.5 point 1, finding 1.16).
+    // Computed once per TriggerEdge, not once per identifier.
     for (int edge = 0; edge < kTriggerEdgeCount; ++edge)
     {
         const auto trigger = static_cast<TriggerEdge>(edge);
@@ -342,10 +340,8 @@ void SurfaceIdentifier::SetMutualExclusion(MutualExclusionChecker* checker) noex
 bool SurfaceIdentifier::StructurallyPlausible(
     ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc, int* formatScore, const char** rejection) const noexcept
 {
-    // Known-source exclusion first (docs/REFACTOR_PLAN.md sec 3.3): a
-    // resource obtained through a documented API contract (the swapchain's
-    // own back buffers) is never a candidate for anything this class
-    // searches for, no matter what its descriptor looks like.
+    // Known-source exclusion first: a swapchain back buffer is never a
+    // candidate, whatever its descriptor.
     *formatScore = 0;
     *rejection = "";
     if (knownSourceExclusion_ != nullptr && knownSourceExclusion_->Contains(resource))
@@ -663,12 +659,9 @@ int SurfaceIdentifier::CollectSignals(
         evaluated[n++] = {name, sw.weight, present};
     }
 
-    // The format table's own score is a baseline, not a signal: it counts in
-    // full once it clears spec.formatScoreGate, and is not scaled by a
-    // per-signal weight. velocity gates this at 4 (desktop-tier only,
-    // reported as its own checkbox below); depth's gate is 0, so every
-    // structurally-accepted format counts in full and this line is skipped -
-    // depth's pre-extraction log never had a signals section at all.
+    // The format table's score is a baseline, not a weighted signal: it counts
+    // in full once it reaches spec.formatScoreGate (velocity: 4, reported as its
+    // own checkbox below; others: 0, always counted, no checkbox).
     int total = (formatScore >= spec_.formatScoreGate) ? formatScore : 0;
     if (signalsLine != nullptr)
     {
@@ -824,14 +817,9 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         return;
     }
 
-    // Primary: score. Secondary/tertiary: trigger-edge count, then total
-    // transitions - both always computed (harmless when unused: a surface
-    // whose survivors never tie on score never reaches them). velocity's
-    // ambiguity rule (ScoreMargin) always treats an exact score tie as
-    // AMBIGUOUS regardless of order, so this is a no-op for velocity's
-    // observable behaviour; depth's ambiguity rule (EdgeCountRatio) needs
-    // exactly this secondary ordering to break a same-format tie correctly -
-    // this is the ordering the pre-extraction depth Decide() used.
+    // Score, then trigger-edge count, then total transitions. ScoreMargin
+    // treats any score tie as AMBIGUOUS whatever the order; EdgeCountRatio
+    // (depth) relies on the edge-count ordering to break a same-format tie.
     std::sort(
         survivors.begin(),
         survivors.end(),
@@ -903,11 +891,8 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
     MarkCandidate(winner.resource, winner.desc);
     if (!IsCandidate(winner.resource))
     {
-        // Mutual exclusion refused the claim (docs/REFACTOR_PLAN.md sec 3.3) -
-        // another identifier already holds this resource. Stay in Searching
-        // rather than reporting a selection nothing will ever capture from;
-        // retry like the empty-survivors path so a later window (after
-        // whichever identifier collided has moved on) gets another chance.
+        // Mutual exclusion refused the claim: another identifier holds it. Stay
+        // Searching and retry later, like the empty-survivors path.
         Log(std::string(spec_.logPrefix) + ": top candidate " + DescLine(winner.resource, winner.desc) +
             " could not be claimed (see the REFUSING line above) - not selecting it. Retrying.");
         decideAtFrame_.store(frame + spec_.settleFrames * 2, std::memory_order_relaxed);
@@ -1029,10 +1014,8 @@ bool SurfaceIdentifier::ValidateCandidate(ID3D12Resource* resource) noexcept
         }
         recorded = it->second.desc;
     }
-    // Safe to call GetDesc() here specifically because a candidate is held BY
-    // REFERENCE (see MarkCandidate) - this is one of the few places in the
-    // project where touching a resource outside the call that handed it to
-    // us is defensible, and only for that reason.
+    // GetDesc() outside the call that handed us the resource is safe only
+    // because a candidate is held by reference (see MarkCandidate).
     const D3D12_RESOURCE_DESC current = resource->GetDesc();
     const bool same = recorded.Dimension == current.Dimension && recorded.Width == current.Width &&
                        recorded.Height == current.Height && recorded.DepthOrArraySize == current.DepthOrArraySize &&
@@ -1142,15 +1125,12 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
         return false;
     }
 
-    // The evidence that WON the selection must hold for a rival too. Only
-    // shares_call_with_edge is checked: it is the one signal that separated
-    // normals from a same-descriptor decoy (an identical desc passes every
-    // structural test above). A rival with enough history that lacks it is
-    // ignored outright - without touching the run below, so a decoy taking
-    // its edge every frame cannot keep resetting the real copy's run. One
-    // without enough history yet is tracked, and must pass before adoption.
-    // The rival is profiled here if it was not already: it may have
-    // appeared after the identify budget was spent.
+    // The shares_call_with_edge evidence that won the selection must hold for a
+    // rival too: it is what separated normals from a same-descriptor decoy. A
+    // rival with enough history that lacks it is ignored without touching the
+    // run below; one without enough history yet is tracked, and must pass
+    // before adoption. Profiled here in case it appeared after the identify
+    // budget was spent.
     int evidence = 1;
     if (selectedEvidenceMask_.load(std::memory_order_relaxed) != 0)
     {
@@ -1340,40 +1320,23 @@ void SurfaceIdentifier::Reopen(ReopenReason /*reason*/, const char* detail) noex
             std::lock_guard<std::mutex> lock(resolutionMutex_);
             resolutionHistogram_.clear();
         }
-        // Note: refilling the global identify budget/seen-set used to happen
-        // here (ForgetAllResourcesSeen). It is now SurfaceRegistry::
-        // ReopenCascade's job, called exactly once per cascade rather than
-        // once per identifier in it (docs/REFACTOR_PLAN.md sec 2.5 point 3,
-        // finding 1.7) - without that move, a cascade reopening two
-        // identifiers that both clear the shortlist would refill it twice
-        // for no benefit, and a depth-only reopen (reopenClearsShortlist ==
-        // false, so this branch never ran for it) would never refill it at
-        // all, permanently losing a replacement resource once the budget was
-        // spent.
+        // The registry's ReopenCascade refills the shared seen-set and budget,
+        // once per cascade.
     }
     else
     {
-        // Keep the shortlist and profile population; only reset the
-        // measurement window. Clearing them was tried and reverted for depth
-        // (see the pre-extraction ReopenDepthIdentification): the shortlist
-        // is refilled only from ConsiderResource, which the barrier hook
-        // reaches only for resources not yet marked "seen" - a set this
-        // branch deliberately does NOT clear itself, since re-feeding every
-        // live resource to a DIFFERENT surface's search (one sharing the
-        // same "seen" set) could poison that search with duplicate
-        // structurally-identical entries. A cleared shortlist here could
-        // only ever be refilled by resources the engine happens to allocate
-        // AFTER the reopen - intermittent, worse than reproducible.
+        // Keep the shortlist and profiles; only restart measurement. The
+        // shortlist is refilled only from ConsiderResource, i.e. from resources
+        // not yet "seen", so a cleared one could be refilled only by resources
+        // allocated AFTER the reopen - the surface would be lost, intermittently.
         if (profileStore_ != nullptr)
         {
             profileStore_->ResetMeasurement();
         }
     }
 
-    // Clearing identified_ above is NOT what stops capture - the barrier
-    // hook gates on IsCandidate(), a set this function used to leave alone
-    // (see the long comment that used to live here, when that set was
-    // process-wide in resource_tracking.h rather than per-identifier).
+    // Clearing identified_ is not what stops capture - the barrier hook gates
+    // on IsCandidate().
     ForgetAllCandidates();
     // Rival-adoption state goes with the answer it was relative to.
     identifiedAlt_.store(nullptr, std::memory_order_release);

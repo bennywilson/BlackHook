@@ -38,33 +38,16 @@ extern "C" __declspec(dllexport) void MvFlushCapture() {
     mv::ShutdownCapture(/*processExiting=*/false);
 }
 
-// Test-only trigger for docs/REFACTOR_PLAN.md Phase 8's depth-reallocation
-// behaviour test: forces depth's own standalone reopen cascade, the same one
-// ValidateCandidate failing on the selected depth resource would trigger in
-// the real hook. A real D3D12 resource's descriptor is immutable once
-// created, so testhost cannot organically reproduce "the selected resource's
-// descriptor changed underneath us" - this reaches the identical code path
-// (SurfaceRegistry::ReopenCascade("depth", ...)) directly instead, so the
-// test verifies the actual recovery machinery rather than a synthetic stand-
-// in for it.
+// Test-only: depth's reopen cascade, as a changed descriptor would trigger it
+// (a real resource's descriptor cannot change, so testhost cannot cause one).
 extern "C" __declspec(dllexport) void MvForceReopenDepth() {
     mv::GetSurfaceRegistry().ReopenCascade(
         "depth", mv::ReopenReason::DescriptorChanged, "MvForceReopenDepth (test-only trigger)");
 }
 
-// Test-only trigger for docs/REFACTOR_PLAN.md Phase 8's mid-burst-reopen
-// behaviour test: reopens velocity directly, without touching the swapchain.
-// A real swapchain resize also changes the back buffer's own descriptor,
-// which the PRE-EXISTING (not Phase 8) DumpLayoutAccepts(color, ...) check
-// in capture.cpp usually notices - and ends the burst via BurstEndReason::
-// LayoutChanged - before velocity's own resize poll (every 30 frames) even
-// runs, since that check runs on every Present with no poll interval. That
-// makes a real resize an unreliable way to exercise SurfaceRegistry's OWN
-// mid-burst-reopen path (NotifySurfaceReopened -> BurstEndReason::
-// SurfaceReopened, finding 1.14) in isolation, since the older mechanism
-// usually wins the race. This reaches the identical reopen cascade a real
-// descriptor mismatch would trigger, with nothing about the back buffer
-// disturbed, so the two mechanisms can be told apart.
+// Test-only: velocity's reopen cascade, without touching the swapchain. A real
+// resize also changes the back buffer, and the colour layout check usually
+// ends the burst first (layout_changed); this exercises surface_reopened.
 extern "C" __declspec(dllexport) void MvForceReopenVelocity() {
     mv::GetSurfaceRegistry().ReopenCascade(
         "velocity", mv::ReopenReason::DescriptorChanged, "MvForceReopenVelocity (test-only trigger)");
@@ -102,16 +85,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             break;
         }
         case DLL_PROCESS_DETACH: {
-            // Only ever reached at process exit: nothing in this project calls
-            // FreeLibrary on this module (MvFlushCapture drains the writer
-            // queue without unloading - see testhost/main.cpp).
+            // Only ever reached at process exit: nothing unloads this module
+            // (MvFlushCapture drains the writer without unloading).
             mv::ShutdownCapture(/*processExiting=*/true);
             mv::StopOverlayHotkeyThread();
 
-            // WriteFile on the calling thread, not a wait on another one.
-            // Without it the last (up to) 500 lines of every batched log are
-            // lost, which is reliably the part you wanted when something went
-            // wrong at the end of a session.
+            // Without this the last (up to) 500 lines of every batched log -
+            // usually the ones you want - are lost.
             mv::FlushLogs();
             break;
         }

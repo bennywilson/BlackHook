@@ -5,23 +5,17 @@
 
 #include <string>
 
-// Surface profiles - docs/REFACTOR_PLAN.md sec 2.8, Phase 9.
+// Surface profiles: the SurfaceSpecs identification runs on, from
+// profiles/ue5.json (embedded into the DLL at configure time) plus any
+// MV_PROFILE_FILE (same name replaces). Which profile runs: MV_PROFILE, else
+// "ue<major>.<minor>-generic" from MV_ENGINE_VERSION, else the file's
+// default_profile. MV_IDENTIFY_FRAMES and MV_SURFACES then apply, logged as
+// overrides.
 //
-// The SurfaceSpecs velocity and depth identify against used to be C++
-// constants in velocity_identify.cpp/depth_identify.cpp. They now come from
-// profiles/ue5.json, embedded into this DLL at configure time; MV_PROFILE_FILE
-// names a further file whose profiles are added on top (same name replaces).
-// Which profile runs: MV_PROFILE, else "ue<major>.<minor>-generic" from
-// MV_ENGINE_VERSION, else the file's default_profile. MV_IDENTIFY_FRAMES then
-// overrides velocity's settle_frames for this run, and MV_SURFACES=normals,
-// specular enables optional surfaces (both logged as overrides).
-//
-// Every failure - malformed JSON, an unknown or missing field, an
-// out-of-range value, a named profile that does not exist - is logged and
-// DISABLES identification for the session. There is deliberately no
-// built-in fallback spec: a capture against a spec nobody chose is worse than
-// no capture, and the plan's negative test requires that a bad profile fail
-// loudly rather than fall back.
+// Any failure - malformed JSON, an unknown or missing field, an out-of-range
+// value, a missing profile - is logged and DISABLES identification for the
+// session. There is deliberately no built-in fallback: a capture against a
+// spec nobody chose is worse than none.
 
 namespace mv
 {
