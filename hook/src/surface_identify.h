@@ -108,12 +108,8 @@ inline bool IsDepthReadableState(int state)
     return (state & ~kReadable) == 0;
 }
 
-// The two tests above, generalised over TriggerEdge so BarrierProfileStore
-// can compute per-edge counts once per transition without knowing which
-// identifiers exist (docs/REFACTOR_PLAN.md sec 2.5 point 1 / finding 1.16).
-// SurfaceIdentifier::IsTriggerEdge/IsReverseTriggerEdge are thin wrappers
-// over these, scoped to spec_.trigger, kept for the liveness-tracking call
-// sites that only ever care about one identifier's own edge.
+// The two tests above per TriggerEdge, so per-edge counts are computed once
+// per transition, whatever identifiers exist.
 bool IsTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfter) noexcept;
 bool IsReverseTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfter) noexcept;
 
@@ -427,13 +423,10 @@ public:
     // shortlist; does not touch the store itself.
     void ConsiderResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
 
-    // Every transition barrier, AFTER the caller has already recorded it
-    // into the shared store exactly once via BarrierProfileStore::
-    // RecordTransition. `profiled` is that call's return value - whether the
-    // store actually has an entry for `resource`. Returns true when
-    // `resource` is the selected (or rival-adopted) one and this transition
-    // is its trigger edge - the caller should capture.
-    bool OnTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter, bool profiled) noexcept;
+    // Every transition barrier: liveness tracking for the selected and
+    // rival-adopted resources. `isTrigger` is this surface's trigger edge;
+    // `isCandidate` the caller's IsCandidate(resource), looked up once.
+    void OnTransition(ID3D12Resource* resource, uint64_t frame, bool isTrigger, bool isCandidate) noexcept;
 
     // Note: there is no per-identifier OnUavBarrier anymore. A UAV barrier
     // carries no identifier-specific state (only the shared uavBarriers
@@ -556,8 +549,6 @@ private:
         const D3D12_RESOURCE_DESC& desc, const BarrierProfile& profile, uint64_t triggerEdgeCount, int formatScore,
         const std::pair<UINT64, UINT>& modal, std::string* signalsLine) const noexcept;
     void Decide(uint64_t frame) noexcept;
-    bool IsTriggerEdge(int stateBefore, int stateAfter) const noexcept;
-    bool IsReverseTriggerEdge(int stateBefore, int stateAfter) const noexcept;
     void ForgetAllCandidates() noexcept;
 
     std::string ProfileLine(const BarrierProfile& profile) const;

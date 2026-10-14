@@ -339,16 +339,6 @@ void SurfaceIdentifier::SetMutualExclusion(MutualExclusionChecker* checker) noex
     mutualExclusion_ = checker;
 }
 
-bool SurfaceIdentifier::IsTriggerEdge(int stateBefore, int stateAfter) const noexcept
-{
-    return IsTriggerEdgeFor(spec_.trigger, stateBefore, stateAfter);
-}
-
-bool SurfaceIdentifier::IsReverseTriggerEdge(int stateBefore, int stateAfter) const noexcept
-{
-    return IsReverseTriggerEdgeFor(spec_.trigger, stateBefore, stateAfter);
-}
-
 bool SurfaceIdentifier::StructurallyPlausible(
     ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc, int* formatScore, const char** rejection) const noexcept
 {
@@ -576,26 +566,20 @@ void SurfaceIdentifier::ConsiderResource(ID3D12Resource* resource, const D3D12_R
     Log(std::string(spec_.logPrefix) + ": shortlisted (structure) " + DescLine(resource, desc) + " - now watching its barriers");
 }
 
-bool SurfaceIdentifier::OnTransition(
-    ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter, bool profiled) noexcept
+void SurfaceIdentifier::OnTransition(ID3D12Resource* resource, uint64_t frame, bool isTrigger, bool isCandidate) noexcept
 {
-    // Liveness of the selected resource and EVERY rival-adopted one, tracked
-    // outside the profile store since the store can be cleared on reopen and
-    // this must keep working across that. Only the trigger edge counts.
-    //
-    // "Every", not just the latest (identifiedAlt_): on Skyrunner UE rotates
-    // through 5+ allocations of SceneVelocity and 10+ of GBufferA. An
-    // allocation adopted earlier stays a candidate - so it is still CAPTURED
-    // from - but its edges used to leave this clock alone, and it is never
-    // offered as a rival again (it is already a candidate). Result: velocity
-    // read as "silent" while rendering, and bursts ended with
-    // velocity_pass_silent after 0-1061 frames. The candidate lookup runs only
-    // on trigger edges, a few per frame.
-    const bool isTrigger = IsTriggerEdge(stateBefore, stateAfter);
-    const bool isTracked = resource == identified_.load(std::memory_order_acquire) ||
-                           resource == identifiedAlt_.load(std::memory_order_acquire) ||
-                           (isTrigger && identified_.load(std::memory_order_acquire) != nullptr && IsCandidate(resource));
-    if (isTracked && isTrigger)
+    // Liveness of the selected resource and EVERY rival-adopted one (kept out of
+    // the profile store, which a reopen can clear). "Every", not just the
+    // latest: UE rotates through 5+ allocations of SceneVelocity and 10+ of
+    // GBufferA on Skyrunner, and an earlier-adopted one is still captured from -
+    // ignoring its edges made velocity read as silent while rendering.
+    if (!isTrigger)
+    {
+        return;
+    }
+    ID3D12Resource* selected = identified_.load(std::memory_order_acquire);
+    if (resource == selected || resource == identifiedAlt_.load(std::memory_order_acquire) ||
+        (selected != nullptr && isCandidate))
     {
         lastEdgeFrame_.store(frame, std::memory_order_relaxed);
         // The RIVAL-line cap is per stall episode: re-arm it when the pass resumes.
@@ -606,8 +590,6 @@ bool SurfaceIdentifier::OnTransition(
                 " - on one of the tracked targets, so nothing was reidentified.");
         }
     }
-
-    return isTracked && isTrigger && profiled;
 }
 
 int SurfaceIdentifier::CollectSignals(

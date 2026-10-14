@@ -122,6 +122,12 @@ void LogTo(const std::string& name, const std::string& message)
     }
 }
 
+bool DiagEnabled()
+{
+    static const bool enabled = GetEnvironmentVariableA("MV_DIAG", nullptr, 0) != 0;
+    return enabled;
+}
+
 void FlushLogs()
 {
     std::lock_guard<std::mutex> lock(LogMutex());

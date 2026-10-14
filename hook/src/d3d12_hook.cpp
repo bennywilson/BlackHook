@@ -267,7 +267,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 const int stateAfter = static_cast<int>(barriers[i].Transition.StateAfter);
                 registry.ConsiderResource(resource);
 
-                if (registry.IsAnyCandidate(resource))
+                if (mv::DiagEnabled() && registry.IsAnyCandidate(resource))
                 {
                     LogTo(
                         "candidates",
@@ -343,7 +343,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 ID3D12Resource* resource = barriers[i].UAV.pResource;
                 registry.ConsiderResource(resource);
                 registry.OnUavBarrier(resource);
-                if (registry.IsAnyCandidate(resource))
+                if (mv::DiagEnabled() && registry.IsAnyCandidate(resource))
                 {
                     LogTo(
                         "candidates",
@@ -359,8 +359,8 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
         }
     }
 
-    // Phase 10 diagnostic: what shares a ResourceBarrier call with what
-    // (plan sec 3.2 #1). One branch unless MV_SURFACES=normals.
+    // Which edges share one ResourceBarrier call: the shares_call_with_edge
+    // signal's input, plus MV_DIAG / MV_SNAPSHOT. One branch when none is in use.
     if (registry.WantsBarrierBatches())
     {
         registry.OnBarrierBatch(cmdList, barriers, numBarriers);
@@ -561,7 +561,10 @@ bool InstallD3D12Hooks()
         }
     }
     mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
-    mv::GetSurfaceRegistry().SetCandidateEdgeObserver(&mv::SnapshotCandidate); // no-op unless MV_SNAPSHOT
+    if (GetEnvironmentVariableA("MV_SNAPSHOT", nullptr, 0) != 0)
+    {
+        mv::GetSurfaceRegistry().SetCandidateEdgeObserver(&mv::SnapshotCandidate);
+    }
     mv::GetSurfaceRegistry().Configure();
 
     if (ok)

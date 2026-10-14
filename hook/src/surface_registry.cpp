@@ -112,6 +112,7 @@ void SurfaceRegistry::Configure() noexcept
         e.identifier->SetKnownSourceExclusion(&knownSources_);
         e.identifier->SetMutualExclusion(this);
     }
+    diag_ = DiagEnabled();
     velocity_ = Find("velocity");
     depth_ = Find("depth");
     optionals_.clear();
@@ -181,21 +182,16 @@ int SurfaceRegistry::OnBarrierTransition(
     ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter, SurfaceTrigger* out,
     int outCapacity) noexcept
 {
-    const bool profiled = profileStore_.RecordTransition(resource, frame, stateBefore, stateAfter);
+    profileStore_.RecordTransition(resource, frame, stateBefore, stateAfter);
 
     int count = 0;
     for (Entry& e : entries_)
     {
         SurfaceIdentifier* id = e.identifier;
-        // Liveness tracking (lastEdgeFrame_/silence reporting) - side effect
-        // only; the capture decision below mirrors the pre-Phase-8 dispatch,
-        // which never used this return value either (NoteTransition/
-        // NoteDepthTransition were called in void context at the one call
-        // site that existed).
-        id->OnTransition(resource, frame, stateBefore, stateAfter, profiled);
-
         const bool isThisEdge = IsTriggerEdgeFor(id->Spec().trigger, stateBefore, stateAfter);
-        if (id->IsCandidate(resource))
+        const bool isCandidate = id->IsCandidate(resource);
+        id->OnTransition(resource, frame, isThisEdge, isCandidate);
+        if (isCandidate)
         {
             if (!isThisEdge)
             {
@@ -240,7 +236,7 @@ void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
     {
         DumpBarrierProfiles();
     }
-    if (!optionals_.empty() && (frame == 600 || frame == kProfileDumpFrame))
+    if (diag_ && !optionals_.empty() && (frame == 600 || frame == kProfileDumpFrame))
     {
         DumpBatchStats(frame);
     }
@@ -304,7 +300,8 @@ void SurfaceRegistry::OnBarrierBatch(
         }
     }
 
-    if (optionals_.empty() || velocity_ == nullptr || depth_ == nullptr)
+    if (optionals_.empty() || velocity_ == nullptr || depth_ == nullptr ||
+        (!diag_ && candidateEdgeObserver_ == nullptr))
     {
         return;
     }
@@ -330,7 +327,7 @@ void SurfaceRegistry::OnBarrierBatch(
         const int before = static_cast<int>(t.StateBefore);
         const int after = static_cast<int>(t.StateAfter);
         rtToSrv += IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, before, after) ? 1 : 0;
-        for (size_t e = 0; e < entries_.size() && e < kMaxBatchSurfaces; ++e)
+        for (size_t e = 0; diag_ && e < entries_.size() && e < kMaxBatchSurfaces; ++e)
         {
             SurfaceIdentifier* id = entries_[e].identifier;
             if (trackedIn[e] == nullptr && IsTriggerEdgeFor(id->Spec().trigger, before, after) &&
@@ -372,6 +369,10 @@ void SurfaceRegistry::OnBarrierBatch(
                 {
                     candidateEdgeObserver_(optional->Spec().name, cmdList, t.pResource, static_cast<int>(t.StateAfter));
                 }
+            }
+            if (!diag_)
+            {
+                continue;
             }
             std::lock_guard<std::mutex> lock(batchMutex_);
             BatchStats& s = batchStats_[{optional, t.pResource}];

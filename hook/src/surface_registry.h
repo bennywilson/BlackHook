@@ -120,19 +120,16 @@ public:
     // Called once per presented frame.
     void OnFrame(uint64_t frame) noexcept;
 
-    // DIAGNOSTIC (Phase 10, plan sec 3.2 open question #1): one whole
-    // ResourceBarrier call, after OnBarrierTransition has seen each entry.
-    // Records, for every resource shortlisted by an OPTIONAL surface (normals,
-    // specular) taking its RT -> SRV edge, what ELSE changed state in the same
-    // call - each other surface's tracked resources, other RT -> SRV
-    // transitions - and logs the tallies at frames 600 and 2000. Decides
-    // nothing. A no-op unless an optional surface is registered
-    // (MV_SURFACES), so the default hot path pays one branch.
-    // Also feeds BarrierProfile::triggerEdgesSharingCallWith, the input of
-    // SignalId::SharesCallWithEdge, whenever a registered spec uses it.
+    // One whole ResourceBarrier call, after OnBarrierTransition has seen each
+    // entry. Feeds BarrierProfile::triggerEdgesSharingCallWith (the input of
+    // SignalId::SharesCallWithEdge) whenever a spec uses it. With MV_DIAG, also
+    // tallies what else changed state in the same call as each optional
+    // surface's shortlisted RT -> SRV edges, logged at frames 600 and 2000 -
+    // how GBufferA and GBufferB were told apart on Skyrunner. With MV_SNAPSHOT,
+    // hands those edges to the CandidateEdgeObserver. Otherwise one branch.
     bool WantsBarrierBatches() const noexcept
     {
-        return !optionals_.empty() || sharedCallSignals_;
+        return sharedCallSignals_ || (!optionals_.empty() && (diag_ || candidateEdgeObserver_ != nullptr));
     }
     void OnBarrierBatch(ID3D12GraphicsCommandList* cmdList, const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept;
 
@@ -217,6 +214,7 @@ private:
     SurfaceIdentifier* depth_ = nullptr;
     std::vector<SurfaceIdentifier*> optionals_; // every registered surface but velocity and depth
     bool sharedCallSignals_ = false; // any registered spec uses SignalId::SharesCallWithEdge
+    bool diag_ = false;              // MV_DIAG: keep and log the batch tallies
     CandidateEdgeObserver candidateEdgeObserver_ = nullptr;
     std::mutex batchMutex_;
     std::map<std::pair<SurfaceIdentifier*, ID3D12Resource*>, BatchStats> batchStats_;

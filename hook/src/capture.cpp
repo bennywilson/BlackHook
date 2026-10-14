@@ -1714,31 +1714,6 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 }
 
-// DIAGNOSTIC (Phase 10), per optional surface: why burst frames end up
-// without it. Built for normals on Skyrunner (641 of 2111 frames), where it
-// separated the two candidate causes:
-//   - frame attribution: copies are tagged with the Present count; an early
-//     edge (base pass) for frame N+1 recorded before Present(N) lands on frame
-//     N's slot after velocity - "afterVelocity*" below.
-//   - the selected pointer stops taking edges (another allocation took over):
-//     no trigger is tagged with that frame at all - "framesNoTrigger". This
-//     was the answer; rival adoption fixed it.
-// Guarded by g_mutex (both writers hold it). Reset when a burst arms; summary
-// logged at "burst recorded".
-struct OptionalDiag
-{
-    uint64_t triggers = 0;            // OnOptionalSurfaceReadable calls during a burst
-    uint64_t copied = 0;              // ...that recorded a copy
-    uint64_t copiedAfterVelocity = 0; // ...of which, into a slot velocity had already filled (suspect: next frame's edge)
-    uint64_t noSlot = 0;              // ...skipped, no slot
-    uint64_t secondEdge = 0;          // ...skipped, already copied, velocity not yet (expected with >1 edge a frame)
-    uint64_t afterVelocityDup = 0;    // ...skipped, it AND velocity already in the slot (frame-skew signature)
-    uint64_t framesWithout = 0;       // submitted burst frames without this surface
-    uint64_t framesNoTrigger = 0;     // ...of which, not one trigger was tagged with that frame
-    uint64_t lastTriggerFrame = ~0ull;
-};
-OptionalDiag g_optionalDiag[kSurfaceCount];
-
 int OptionalSurfaceIndex(const char* name)
 {
     for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
@@ -1777,40 +1752,12 @@ void OnOptionalSurfaceReadable(
 
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     Slot* slot = AcquireSlotForFrame(frame);
-    OptionalDiag& diag = g_optionalDiag[index];
-    const std::string name = kSurfaceSpecs[index].name;
-    ++diag.triggers;
-    diag.lastTriggerFrame = frame;
     // first_in_frame, one copy: the first RT -> SRV edge is the base pass
     // finishing the GBuffer target. No slot means the frame is skipped anyway
     // (the velocity path logs that).
-    if (slot == nullptr)
+    if (slot == nullptr || slot->surfaces[index].present)
     {
-        ++diag.noSlot;
         return;
-    }
-    const bool velocityAlready = slot->surfaces[kSurfaceVelocity].present;
-    if (slot->surfaces[index].present)
-    {
-        if (velocityAlready)
-        {
-            if (++diag.afterVelocityDup <= 3)
-            {
-                Log("capture: " + name + "-diag: frame " + std::to_string(frame) + " - a " + name +
-                    " edge arrived after this frame's velocity AND " + name +
-                    " were both recorded (frame-skew signature: it likely belongs to the next frame)");
-            }
-        }
-        else
-        {
-            ++diag.secondEdge;
-        }
-        return;
-    }
-    if (velocityAlready && ++diag.copiedAfterVelocity <= 3)
-    {
-        Log("capture: " + name + "-diag: frame " + std::to_string(frame) + " - first " + name +
-            " copy for this frame arrived AFTER its velocity copy (may be the next frame's)");
     }
 
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
@@ -1842,7 +1789,6 @@ void OnOptionalSurfaceReadable(
     surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
     ++surface.copies;
     surface.present = true;
-    ++diag.copied;
 }
 
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
@@ -2069,10 +2015,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.store(kBurstPresentBudget);
         g_burstEndReason.store(BurstEndReason::NotEnded, std::memory_order_relaxed);
         g_manifestDirty.store(true, std::memory_order_relaxed);
-        for (OptionalDiag& d : g_optionalDiag)
-        {
-            d = OptionalDiag{};
-        }
         // Frozen once, here, not re-read live per frame - see the field
         // comment (finding 1.14).
         g_depthRequiredForBurst.store(
@@ -2354,19 +2296,6 @@ void OnPresent(IDXGISwapChain* swapChain)
     slot->captureIndex = g_captureCounter.fetch_add(1);
     slot->state = SlotState::Submitted;
 
-    for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
-    {
-        if (GetSurfaceRegistry().Find(kSurfaceSpecs[i].name) != nullptr && !slot->surfaces[i].present)
-        {
-            OptionalDiag& d = g_optionalDiag[i];
-            ++d.framesWithout;
-            if (d.lastTriggerFrame == ~0ull || d.lastTriggerFrame < slot->frameIndex)
-            {
-                ++d.framesNoTrigger;
-            }
-        }
-    }
-
     const int remaining = g_framesRemaining.fetch_sub(1) - 1;
     if (remaining <= 0)
     {
@@ -2381,24 +2310,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         // necessarily on disk yet. Only ShutdownCapture guarantees that.
         Log("capture: burst recorded, " + std::to_string(g_captureCounter.load()) + " frames; writes still draining (" +
             std::to_string(g_droppedWrites.load()) + " dropped)");
-        for (int i = kFirstOptionalSurface; i < kSurfaceCount; ++i)
-        {
-            if (GetSurfaceRegistry().Find(kSurfaceSpecs[i].name) == nullptr)
-            {
-                continue;
-            }
-            const std::string name = kSurfaceSpecs[i].name;
-            const OptionalDiag& d = g_optionalDiag[i];
-            Log("capture: " + name + "-diag: burst summary - triggers=" + std::to_string(d.triggers) +
-                " copied=" + std::to_string(d.copied) + " (of which after velocity: " +
-                std::to_string(d.copiedAfterVelocity) + ") skipped: noSlot=" + std::to_string(d.noSlot) +
-                " secondEdge=" + std::to_string(d.secondEdge) + " afterVelocityDup=" +
-                std::to_string(d.afterVelocityDup) + " | frames without " + name + "=" +
-                std::to_string(d.framesWithout) + " (no trigger tagged with that frame at all: " +
-                std::to_string(d.framesNoTrigger) +
-                "). Many afterVelocity* = frame attribution; framesNoTrigger ~ framesWithout = the selected "
-                "resource stopped taking edges.");
-        }
         Log("capture: fence coverage - " + std::to_string(g_coverageStrong.load()) +
             " frames verified by command-list identity, " + std::to_string(g_coverageWeak.load()) +
             " consistent-but-unproven (identity not observable), " + std::to_string(g_coverageNone.load()) +

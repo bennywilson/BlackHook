@@ -53,7 +53,7 @@ if ($Overlay) {
 
 # One run: returns $true on exit code 0 with no FAIL line.
 function Invoke-Testhost([string]$Name, [string]$Dll, [string]$Arguments, [hashtable]$Env = @{}) {
-    foreach ($v in 'MV_PROFILE', 'MV_PROFILE_FILE', 'MV_ENGINE_VERSION', 'MV_SURFACES', 'MV_OVERLAY', 'MV_SNAPSHOT') {
+    foreach ($v in 'MV_PROFILE', 'MV_PROFILE_FILE', 'MV_ENGINE_VERSION', 'MV_SURFACES', 'MV_OVERLAY', 'MV_SNAPSHOT', 'MV_DIAG') {
         Remove-Item "Env:$v" -ErrorAction SilentlyContinue
     }
     $env:MV_AUTOCAPTURE = '1'
