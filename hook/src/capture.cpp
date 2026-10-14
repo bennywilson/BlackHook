@@ -1423,256 +1423,125 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
     return nullptr;
 }
 
-} // namespace
-
-static void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velocity, int stateAfter)
+// All slots in flight: the frame is skipped rather than stalled. Logged, since
+// it is otherwise indistinguishable from a wedged ring. Caller holds g_mutex.
+void LogNoFreeSlot()
 {
-    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || velocity == nullptr)
+    const uint64_t misses = g_noFreeSlot.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (misses > 3 && misses % 240 != 0)
     {
         return;
     }
-    if (g_originalResourceBarrier == nullptr)
+    std::string states;
+    for (const Slot& s : g_slots)
+    {
+        states += (states.empty() ? "" : ",");
+        switch (s.state)
+        {
+            case SlotState::Free:
+                states += "free";
+                break;
+            case SlotState::Recording:
+                states += "recording@f" + std::to_string(s.frameIndex) +
+                          (s.surfaces[kSurfaceVelocity].present ? "+vel" : "") +
+                          (s.surfaces[kSurfaceDepth].present ? "+depth" : "");
+                break;
+            case SlotState::Submitted:
+                states += "submitted@fence" + std::to_string(s.fenceValue);
+                break;
+        }
+    }
+    Log("capture: no free slot (" + std::to_string(misses) + " skipped so far, " +
+        std::to_string(g_framesRemaining.load(std::memory_order_relaxed)) + " frames still requested) - slots=[" +
+        states + "] fenceCompleted=" + std::to_string(g_fence != nullptr ? g_fence->GetCompletedValue() : 0) +
+        " nextFence=" + std::to_string(g_nextFenceValue));
+}
+
+} // namespace
+
+void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || resource == nullptr ||
+        g_originalResourceBarrier == nullptr || surface < 0 || surface >= kSurfaceCount || surface == kSurfaceColor ||
+        (surface == kSurfaceDepth && !DepthCaptureEnabled()))
     {
         return;
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
-
     if (!EnsureDevice(cmdList))
     {
         return;
     }
-
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     Slot* slot = AcquireSlotForFrame(frame);
-    // One velocity copy per frame; the buffer transitions twice per frame and
-    // we only want the RENDER_TARGET -> ALL_SHADER_RESOURCE edge.
-    if (slot != nullptr && slot->surfaces[kSurfaceVelocity].present)
-    {
-        return;
-    }
     if (slot == nullptr)
     {
-        // All slots in flight; skip rather than stall. Designed behaviour, but
-        // indistinguishable from a wedged ring without logging - a capture
-        // path that can stop silently and take F8 with it is worse than one
-        // that stalls loudly.
-        const uint64_t misses = g_noFreeSlot.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (misses <= 3 || misses % 240 == 0)
+        if (surface == kSurfaceVelocity)
         {
-            std::string states;
-            for (const Slot& s : g_slots)
-            {
-                states += (states.empty() ? "" : ",");
-                switch (s.state)
-                {
-                    case SlotState::Free:
-                        states += "free";
-                        break;
-                    case SlotState::Recording:
-                        states += "recording@f" + std::to_string(s.frameIndex) +
-                                  (s.surfaces[kSurfaceVelocity].present ? "+vel" : "") +
-                                  (s.surfaces[kSurfaceDepth].present ? "+depth" : "");
-                        break;
-                    case SlotState::Submitted:
-                        states += "submitted@fence" + std::to_string(s.fenceValue);
-                        break;
-                }
-            }
-            Log("capture: no free slot (" + std::to_string(misses) + " skipped so far, " +
-                std::to_string(g_framesRemaining.load(std::memory_order_relaxed)) +
-                " frames still requested) - slots=[" + states +
-                "] fenceCompleted=" + std::to_string(g_fence != nullptr ? g_fence->GetCompletedValue() : 0) +
-                " nextFence=" + std::to_string(g_nextFenceValue));
+            LogNoFreeSlot();
         }
         return;
     }
+    SurfaceCapture& capture = slot->surfaces[surface];
 
-    const D3D12_RESOURCE_DESC desc = velocity->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceVelocity, desc))
+    // Which of a frame's edges lands (kCaptureFacts arbitration).
+    if (surface == kSurfaceDepth)
     {
-        return;
+        // last_before_surface: depth goes readable several times a frame and the
+        // first edge can be a partial pass (on Skyrunner, the weapon alone), so
+        // keep re-copying until velocity has been copied - the depth the frame's
+        // velocity was rendered against. A title whose depth goes readable only
+        // AFTER velocity still gets its first edge (copies == 0).
+        const bool velocityDone = slot->surfaces[kSurfaceVelocity].present;
+        if (capture.copies >= kMaxDepthCopiesPerFrame || (velocityDone && capture.copies > 0))
+        {
+            return;
+        }
+        if (velocityDone && !g_depthAfterVelocityReported.exchange(true))
+        {
+            Log("capture: this title's depth buffer becomes readable only AFTER the velocity buffer "
+                "does, so the depth in the dump is from a pass that ran after velocity was finished. "
+                "For opaque geometry that is the same depth; if this title writes depth after its "
+                "velocity pass, it is not.");
+        }
     }
-    SurfaceCapture& surface = slot->surfaces[kSurfaceVelocity];
-    const bool firstVelocityUse = surface.readback == nullptr;
-    if (!EnsureReadback(surface, kSurfaceVelocity, desc))
+    else if (capture.present)
     {
-        return;
-    }
-    if (firstVelocityUse)
-    {
-        SnapshotDumpLayout(kSurfaceVelocity, surface);
-    }
-
-    RecordCopyToReadback(
-        cmdList,
-        velocity,
-        surface.readback.Get(),
-        surface.footprints,
-        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
-        g_originalResourceBarrier);
-
-    // Remember which command list this copy went onto so fence coverage can
-    // be checked, not assumed (see NoteSubmission). Stored as COM identity,
-    // not the raw interface pointer (see ComIdentity).
-    surface.recordedList = ComIdentity(cmdList);
-    surface.coverage = Coverage::None;
-    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
-    ++surface.copies;
-    surface.present = true;
-}
-
-static void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter)
-{
-    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || depth == nullptr)
-    {
-        return;
-    }
-    if (!DepthCaptureEnabled())
-    {
-        return;
-    }
-    if (g_originalResourceBarrier == nullptr)
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (!EnsureDevice(cmdList))
-    {
-        return;
-    }
-
-    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
-    Slot* slot = AcquireSlotForFrame(frame);
-    if (slot == nullptr || slot->surfaces[kSurfaceDepth].copies >= kMaxDepthCopiesPerFrame)
-    {
-        // No slot free means this frame is being skipped anyway; the velocity
-        // path logs that case in detail and there is nothing to add here.
-        return;
-    }
-    if (slot->surfaces[kSurfaceVelocity].present && slot->surfaces[kSurfaceDepth].copies > 0)
-    {
-        // Stop once velocity has been recorded, so the dump gets the LAST
-        // depth edge BEFORE velocity became readable - the depth the frame's
-        // velocity was rendered against. Also caps bandwidth: depth copies
-        // can be the bulk of per-frame write volume.
-        //
-        // The `copies > 0` half is a fallback for titles where depth
-        // becomes readable AFTER velocity (frame graph ordered differently
-        // than UE5's default prepass/base-pass) - without it such a title
-        // would silently capture no depth at all.
-        return;
-    }
-    if (slot->surfaces[kSurfaceVelocity].present && !g_depthAfterVelocityReported.exchange(true))
-    {
-        Log("capture: this title's depth buffer becomes readable only AFTER the velocity buffer "
-            "does, so the depth in the dump is from a pass that ran after velocity was finished. "
-            "For opaque geometry that is the same depth; if this title writes depth after its "
-            "velocity pass, it is not.");
-    }
-
-    const D3D12_RESOURCE_DESC desc = depth->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceDepth, desc))
-    {
-        return;
-    }
-    SurfaceCapture& surface = slot->surfaces[kSurfaceDepth];
-    const bool firstUse = surface.readback == nullptr;
-    if (!EnsureReadback(surface, kSurfaceDepth, desc))
-    {
-        return;
-    }
-    if (firstUse)
-    {
-        SnapshotDumpLayout(kSurfaceDepth, surface);
-    }
-
-    RecordCopyToReadback(
-        cmdList,
-        depth,
-        surface.readback.Get(),
-        surface.footprints,
-        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
-        g_originalResourceBarrier);
-    // Recorded on the GAME's command list, exactly like velocity, so it needs
-    // the same coverage key - it simply never had anywhere to put one.
-    surface.recordedList = ComIdentity(cmdList);
-    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
-    ++surface.copies;
-    surface.present = true;
-
-    // Depth edge count per frame depends on the title's frame graph (full
-    // prepass = 1, partial prepass = 2); "last one wins" only means what it
-    // says if this is observed rather than assumed. Logged sparingly.
-    const uint64_t seen = g_depthEdgeReports.fetch_add(1, std::memory_order_relaxed);
-    if (seen < 8)
-    {
-        Log("capture: depth copy " + std::to_string(surface.copies) + " of frame " + std::to_string(frame) +
-            " recorded (stateAfter=" + std::to_string(stateAfter) +
-            "). The last copy of a frame is the one that lands in the dump.");
-    }
-}
-
-static void OnOptionalSurfaceReadable(
-    int index, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
-{
-    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || resource == nullptr)
-    {
-        return;
-    }
-    if (g_originalResourceBarrier == nullptr)
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (!EnsureDevice(cmdList))
-    {
-        return;
-    }
-
-    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
-    Slot* slot = AcquireSlotForFrame(frame);
-    // first_in_frame, one copy: the first RT -> SRV edge is the base pass
-    // finishing the GBuffer target. No slot means the frame is skipped anyway
-    // (the velocity path logs that).
-    if (slot == nullptr || slot->surfaces[index].present)
-    {
-        return;
+        return; // first_in_frame: velocity's and the GBuffers' first RT -> SRV edge
     }
 
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    if (!DumpLayoutAccepts(index, desc))
+    if (!DumpLayoutAccepts(surface, desc))
     {
         return;
     }
-    SurfaceCapture& surface = slot->surfaces[index];
-    const bool firstUse = surface.readback == nullptr;
-    if (!EnsureReadback(surface, index, desc))
+    const bool firstUse = capture.readback == nullptr;
+    if (!EnsureReadback(capture, surface, desc))
     {
         return;
     }
     if (firstUse)
     {
-        SnapshotDumpLayout(index, surface);
+        SnapshotDumpLayout(surface, capture);
     }
+    RecordCopyToReadback(cmdList, resource, capture.readback.Get(), capture.footprints,
+                         static_cast<D3D12_RESOURCE_STATES>(stateAfter), g_originalResourceBarrier);
 
-    RecordCopyToReadback(
-        cmdList,
-        resource,
-        surface.readback.Get(),
-        surface.footprints,
-        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
-        g_originalResourceBarrier);
-    // On the game's list like depth, and like depth not graded for fence
-    // coverage yet (docs/REFACTOR_PLAN.md finding 1.2) - the manifest says so.
-    surface.recordedList = ComIdentity(cmdList);
-    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
-    ++surface.copies;
-    surface.present = true;
+    // Recorded on the GAME's list: whether our fence covers it is checked in
+    // NoteSubmission, by COM identity (see ComIdentity), not assumed.
+    capture.recordedList = ComIdentity(cmdList);
+    capture.coverage = Coverage::None;
+    capture.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
+    ++capture.copies;
+    capture.present = true;
+
+    if (surface == kSurfaceDepth && g_depthEdgeReports.fetch_add(1, std::memory_order_relaxed) < 8)
+    {
+        Log("capture: depth copy " + std::to_string(capture.copies) + " of frame " + std::to_string(frame) +
+            " recorded (stateAfter=" + std::to_string(stateAfter) +
+            "). The last copy of a frame is the one that lands in the dump.");
+    }
 }
 
 int SurfaceIndex(const char* name)
@@ -1685,22 +1554,6 @@ int SurfaceIndex(const char* name)
         }
     }
     return -1;
-}
-
-void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* resource, int stateAfter)
-{
-    if (surface == kSurfaceVelocity)
-    {
-        OnVelocityReadable(cmdList, resource, stateAfter);
-    }
-    else if (surface == kSurfaceDepth)
-    {
-        OnDepthReadable(cmdList, resource, stateAfter);
-    }
-    else if (surface >= kFirstOptionalSurface && surface < kSurfaceCount)
-    {
-        OnOptionalSurfaceReadable(surface, cmdList, resource, stateAfter);
-    }
 }
 
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
