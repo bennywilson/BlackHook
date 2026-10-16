@@ -714,8 +714,7 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
     catch (const std::exception& e)
     {
         Log(std::string("profile: FAILED - ") + e.what() +
-            ". Surface identification is DISABLED for this session: nothing will be identified and nothing "
-            "captured. There is deliberately no built-in fallback spec (docs/REFACTOR_PLAN.md Phase 9).");
+            ". Identification is disabled for this session; there is no built-in fallback.");
     }
     catch (...)
     {

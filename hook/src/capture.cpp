@@ -62,7 +62,7 @@ constexpr CaptureFacts kCaptureFacts[kSurfaceCount] = {
     {"vel", "render_target_to_shader_resource", "first_in_frame", ""},
     {"depth", "depth_write_to_readable", "last_before_surface",
      " (plane count comes from the desc: a D24S8 or D32S8 depth buffer is two planes, and copying only the "
-     "first would silently truncate it)"},
+     "first would truncate it)"},
     {"color", "present_back_buffer", "first_in_frame", ""},
     {"normals", "render_target_to_shader_resource", "first_in_frame", ""},
     {"specular", "render_target_to_shader_resource", "first_in_frame", ""},
@@ -304,12 +304,8 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
     }
     const int short_by = EndBurst(BurstEndReason::LayoutChanged);
     Log(std::string("capture: burst ENDED - the ") + name + " layout changed, " + DescToString(tracked.desc) + " -> " +
-        DescToString(desc) + ". This dump's manifest.json describes the first layout and has nowhere to record "
-        "a second, so continuing would write frames that every offline tool un-pads at the wrong row pitch - "
-        "producing a plausible image rather than an error. " +
-        std::to_string(short_by) +
-        " of the requested frames were not captured. Press F8 again with a FRESH MV_DUMP_DIR to capture at the new "
-        "layout; re-using this one would mix the two.");
+        DescToString(desc) + ". A dump holds one layout; " + std::to_string(short_by) +
+        " requested frames not captured. Press F8 again with a new MV_DUMP_DIR.");
     return false;
 }
 
@@ -386,9 +382,7 @@ bool DepthCaptureEnabled()
         const bool off = std::string(value, length) == "0";
         if (off)
         {
-            Log("capture: MV_CAPTURE_DEPTH=0 - scene depth will NOT be copied this session. The dump "
-                "will have no depth_*.bin and manifest.json will report depth as not present. This is "
-                "the bandwidth control test, not a normal capture.");
+            Log("capture: MV_CAPTURE_DEPTH=0 - depth is not captured this session.");
         }
         return !off;
     }();
@@ -433,9 +427,7 @@ bool WriteJobToDisk(const WriteJob& job)
     if (!job.renameTo.empty() && !MoveFileExA(job.path.c_str(), job.renameTo.c_str(), MOVEFILE_REPLACE_EXISTING))
     {
         Log("capture: failed to seal " + job.renameTo + " (rename from " + job.path +
-            ") err=" + std::to_string(GetLastError()) +
-            " - the dump's blobs are all on disk, but nothing names them; delete the stray .tmp "
-            "file and re-seal by pressing F8 again, or note this session's manifest is missing");
+            ") err=" + std::to_string(GetLastError()) + ". The frames are on disk but have no manifest.");
     }
     return true;
 }
@@ -1043,11 +1035,11 @@ bool DrainSlot(Slot& slot)
     if (!WriteQueueHasRoom(total))
     {
         const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
-        Log("capture: write queue has no room for frame " + std::to_string(slot.captureIndex) + " (" +
-            std::to_string(total / (1024 * 1024)) + "MB) - dropping the WHOLE frame BEFORE mapping anything, " +
-            std::to_string(n) +
-            " so far. A partial frame would be worse: nothing in the dump distinguishes 'depth was "
-            "dropped here' from 'depth was never captured at all'.");
+        if (n <= 3 || n % 100 == 0)
+        {
+            Log("capture: write queue full, dropping frame " + std::to_string(slot.captureIndex) + " (" +
+                std::to_string(total / (1024 * 1024)) + " MB) - " + std::to_string(n) + " dropped so far");
+        }
         return false;
     }
 
@@ -1316,10 +1308,8 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
         }
         if (velocityDone && !g_depthAfterVelocityReported.exchange(true))
         {
-            Log("capture: this title's depth buffer becomes readable only AFTER the velocity buffer "
-                "does, so the depth in the dump is from a pass that ran after velocity was finished. "
-                "For opaque geometry that is the same depth; if this title writes depth after its "
-                "velocity pass, it is not.");
+            Log("capture: depth becomes readable only after velocity on this title, so the dump's depth "
+                "comes from a pass after the velocity pass.");
         }
     }
     else if (capture.present)
@@ -1411,9 +1401,8 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
             {
                 // One fence must cover our copy and the velocity copy, so a
                 // second direct queue would give stale readbacks.
-                Log("capture: WARNING velocity command list submitted on a queue other than the "
-                    "one we fence on - readback for frame " +
-                    std::to_string(slot.frameIndex) + " is NOT covered by our fence");
+                Log("capture: WARNING velocity command list submitted on another queue - frame " +
+                    std::to_string(slot.frameIndex) + " is not covered by our fence");
             }
         }
     }
@@ -1439,12 +1428,9 @@ void NotifySurfaceReopened(const char* surfaceName)
         return;
     }
     const int short_by = EndBurst(BurstEndReason::SurfaceReopened);
-    Log("capture: burst ENDED - the " + name +
-        " search reopened mid-burst, so later frames would have been captured against a different resource (or "
-        "none) than earlier ones. " +
-        std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
-        " never landed. Ending rather than silently dropping frames until reidentification completes keeps the "
-        "dump homogeneous - press F8 again once the search has settled.");
+    Log("capture: burst ENDED - the " + name + " search reopened mid-burst. " + std::to_string(short_by) +
+        " of " + std::to_string(kCaptureFrames) + " requested frames not captured. Press F8 again once it has "
+        "settled.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,12 +1592,9 @@ void OnPresent(IDXGISwapChain* swapChain)
             velocity->IsSilent(presented, &silentFor))
         {
             const int short_by = EndBurst(BurstEndReason::VelocityPassSilent);
-            Log("capture: burst ENDED - the game has not rendered the velocity pass for " + std::to_string(silentFor) +
-                " frames, so there is nothing left to capture. " + std::to_string(short_by) + " of the requested " +
-                std::to_string(kCaptureFrames) +
-                " never landed and will not; press F8 again once you are back in gameplay. This is "
-                "the game's state, not a fault in the capture path - see the 'velocity pass has "
-                "STOPPED' line above.");
+            Log("capture: burst ENDED - no velocity pass for " + std::to_string(silentFor) + " frames (a menu?). " +
+                std::to_string(short_by) + " of " + std::to_string(kCaptureFrames) +
+                " requested frames not captured. Press F8 again in gameplay.");
         }
     }
 
@@ -1620,11 +1603,9 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.fetch_sub(1, std::memory_order_relaxed) <= 1)
     {
         const int short_by = EndBurst(BurstEndReason::PresentBudgetExhausted);
-        Log("capture: burst ENDED short - " + std::to_string(kBurstPresentBudget) + " frames presented and " +
-            std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
-            " never landed. The dump has what did. Ending rather than waiting: a burst that "
-            "cannot complete also holds the F8 hotkey down for the rest of the session. Check the "
-            "'no free slot' and 'WRITE QUEUE FULL' counts above for which limit was hit.");
+        Log("capture: burst ENDED - " + std::to_string(kBurstPresentBudget) + " frames presented, " +
+            std::to_string(short_by) + " of " + std::to_string(kCaptureFrames) +
+            " requested frames not captured. See the 'no free slot' and 'write queue full' lines.");
     }
 
     // 1. Drain any slots whose GPU work has completed.
@@ -1718,9 +1699,8 @@ void OnPresent(IDXGISwapChain* swapChain)
         const uint64_t n = g_incompleteFrames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 3)
         {
-            Log("capture: frame " + std::to_string(frame) + " has velocity but not " + missing +
-                " (a burst usually starts mid-frame). Dropping it so the dump stays homogeneous - " +
-                std::to_string(n) + " so far.");
+            Log("capture: frame " + std::to_string(frame) + " has velocity but no " + missing +
+                " (a burst starting mid-frame); not written. " + std::to_string(n) + " so far.");
         }
         slot->state = SlotState::Free;
         return;
@@ -1779,9 +1759,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         g_coverageNone.fetch_add(1, std::memory_order_relaxed);
         Log("capture: WARNING frame " + std::to_string(frame) +
-            " - nothing was submitted to the queue we fence on between recording the velocity copy "
-            "and this Present, so the fence below cannot cover it. This frame's velocity readback "
-            "is unsafe.");
+            " - nothing was submitted to the fenced queue since the velocity copy; its readback is unsafe.");
     }
 
     if (slot->allocator == nullptr)
@@ -1846,10 +1824,9 @@ void OnPresent(IDXGISwapChain* swapChain)
         // queue.
         Log("capture: burst recorded, " + std::to_string(g_captureCounter.load()) + " frames; writes still draining (" +
             std::to_string(g_droppedWrites.load()) + " dropped)");
-        Log("capture: fence coverage - " + std::to_string(g_coverageStrong.load()) +
-            " frames verified by command-list identity, " + std::to_string(g_coverageWeak.load()) +
-            " consistent-but-unproven (identity not observable), " + std::to_string(g_coverageNone.load()) +
-            " UNSAFE. Only the first category is proof the readback is not stale.");
+        Log("capture: fence coverage - " + std::to_string(g_coverageStrong.load()) + " verified, " +
+            std::to_string(g_coverageWeak.load()) + " probable (list identity not observable), " +
+            std::to_string(g_coverageNone.load()) + " UNSAFE");
     }
 }
 
@@ -1895,8 +1872,7 @@ void ShutdownCapture(bool processExiting)
             if (pending > 0)
             {
                 Log("capture: process exiting with " + std::to_string(pending) +
-                    " writes still queued - those frames are LOST. Wait for "
-                    "'write queue drained' before quitting.");
+                    " writes queued - those frames are LOST. Wait for 'write queue drained' before quitting.");
             }
             if (g_writerThread.joinable())
             {

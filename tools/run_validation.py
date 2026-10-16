@@ -47,7 +47,7 @@ STEPS = [
     ("warp_validate.py", ["warp_validate.py", dump_dir, figure_path],
      "Warp frame N-1 by frame N's field and score it, against three controls:\n"
      "a sign flip, the best possible single rigid translation, and a\n"
-     "deliberately mismatched frame's field."),
+     "mismatched frame's field."),
 ]
 
 

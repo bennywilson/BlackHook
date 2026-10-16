@@ -120,7 +120,7 @@ def build_manifest(dump_dir):
         "schema_version": 1,
         "reconstructed": {
             "by": "tools/legacy_meta.py",
-            "reason": "this dump predates manifest.json (docs/REFACTOR_PLAN.md Phase 4); every field "
+            "reason": "this dump predates manifest.json; every field "
                        "below was derived from meta.txt/meta_depth.txt/frames.csv rather than recorded "
                        "live by the capture that produced these blobs",
         },

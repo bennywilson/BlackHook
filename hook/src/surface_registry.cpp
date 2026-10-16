@@ -45,10 +45,8 @@ void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
     {
         if (!budgetExhaustionReported_.exchange(true))
         {
-            Log("resource-tracking: identification budget of " + std::to_string(kIdentifyBudget) +
-                " distinct resources is SPENT. No resource created from here on is examined, so a "
-                "texture the engine allocates now can never be found. Identification itself is long "
-                "finished; what is lost is the ability to notice a REPLACEMENT.");
+            Log("registry: identification budget of " + std::to_string(kIdentifyBudget) +
+                " resources is spent; resources created from now on are not examined until a reopen.");
         }
         return;
     }
@@ -395,11 +393,9 @@ void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
     for (SurfaceIdentifier* optional : optionals_)
     {
         const std::string prefix = std::string(optional->Spec().name) + "-diag:";
-        Log(prefix + " frame " + std::to_string(frame) + " - per " + optional->Spec().name +
-            "-shortlisted resource, what shared its RT->SRV ResourceBarrier call: each other surface's TRACKED "
-            "resources (selected or rival-adopted) taking their own trigger edge, any depth edge, and the count of "
-            "other RT->SRV transitions. Counted only once velocity and depth were both selected. On Skyrunner, "
-            "GBufferA was told from a same-format post-process target by anyDepth (50% vs 0%).");
+        Log(prefix + " frame " + std::to_string(frame) + ": for each " + optional->Spec().name +
+            "-shortlisted resource, the share of its RT->SRV edges in a ResourceBarrier call with each other "
+            "surface's tracked resources and with any depth edge (counted once velocity and depth are selected).");
         for (const auto& [key, s] : batchStats_)
         {
             if (key.first != optional)

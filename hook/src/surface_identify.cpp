@@ -771,11 +771,9 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         // no scene during it (a menu). Retry with a longer window.
         const int attempt = attempt_.fetch_add(1) + 1;
         Log(std::string(spec_.logPrefix) + ": NO candidate after " + std::to_string(frame) + " frames (attempt " +
-            std::to_string(attempt) + "). Structural shortlist had " + std::to_string(shortlist.size()) +
-            " entries; none of them was produced and then consumed on at least half the frames. Retrying with a "
-            "longer window. If this repeats, either the title was not rendering a scene during the window (a "
-            "menu will do this), or this surface's pass does not look like anything measured so far - read the "
-            "observed transitions below and mv_barrier_profile.log.");
+            std::to_string(attempt) + "): none of " + std::to_string(shortlist.size()) +
+            " shortlisted resources was produced and consumed on half the frames. Retrying with a longer window. "
+            "If this repeats, check that a scene was rendering, then the transitions below.");
         for (const ComPtr<ID3D12Resource>& held : shortlist)
         {
             BarrierProfile profile;
@@ -846,26 +844,21 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         {
             Log(std::string(spec_.logPrefix) + ": AMBIGUOUS - the top two survivors score " +
                 std::to_string(survivors[0].score) + " and " + std::to_string(survivors[1].score) +
-                " with comparable usage, which is not enough to pick between them. Refusing to capture rather "
-                "than guessing: a wrong pick produces a dump that decodes to plausible garbage, which is the "
-                "most expensive failure mode this project has.");
+                " with comparable usage. Not picking either; nothing is captured.");
             decisionMade_.store(true, std::memory_order_relaxed);
             return;
         }
 
         if (spec_.ambiguityRule == AmbiguityRule::ScoreMargin)
         {
-            Log(std::string(spec_.logPrefix) + ": picking the top-scoring survivor by a margin of " +
-                std::to_string(survivors[0].score - survivors[1].score) +
-                " points. This is a ranked choice among several matches, not a unique one.");
+            Log(std::string(spec_.logPrefix) + ": picking the top survivor by " +
+                std::to_string(survivors[0].score - survivors[1].score) + " points.");
         }
         else
         {
-            Log(std::string(spec_.logPrefix) + ": picking the top candidate on usage - " +
+            Log(std::string(spec_.logPrefix) + ": picking the top survivor on usage: " +
                 std::to_string(survivors[0].triggerEdgeCount) + " trigger edges against " +
-                std::to_string(survivors[1].triggerEdgeCount) +
-                " for the runner-up over the same window. This is a ranked choice among structurally "
-                "indistinguishable candidates, not a unique match.");
+                std::to_string(survivors[1].triggerEdgeCount) + ".");
         }
     }
 
@@ -906,10 +899,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         " | score=" + std::to_string(winner.score) + " | survivors=" + std::to_string(survivors.size()));
     if (survivors.size() == 1)
     {
-        Log(std::string(spec_.logPrefix) +
-            ": this was the ONLY resource in the process that passed this surface's structural gate (format, "
-            "flags, dimensions) AND is produced then consumed each frame. The behavioural signals above are "
-            "corroboration; they are not what made it unique.");
+        Log(std::string(spec_.logPrefix) + ": the only survivor of the structural and behaviour gates.");
     }
 }
 
@@ -1021,8 +1011,7 @@ void SurfaceIdentifier::MarkCandidate(ID3D12Resource* resource, const D3D12_RESO
     if (mutualExclusion_ != nullptr && !mutualExclusion_->TryClaim(resource, this))
     {
         Log(std::string(spec_.logPrefix) + ": REFUSING to claim " + DescLine(resource, desc) +
-            " - another surface already holds it as a candidate. Two surfaces capturing the same resource "
-            "would double-count it in the dump; whichever claimed it first keeps it.");
+            " - another surface holds it");
         return;
     }
     std::unique_lock lock(candidateMutex_);
@@ -1122,8 +1111,8 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
             if (!evidenceRejectReported_.exchange(true))
             {
                 Log(std::string(spec_.logPrefix) + ": NOT a rival - " + DescLine(resource, desc) +
-                    " takes the edge while the selected one is stalled, but lacks the barrier-batch evidence the "
-                    "selection was made on (shares_call_with_edge). Same descriptor, different pass. (Logged once.)");
+                    " takes the edge but lacks the shares_call_with_edge evidence the selection rests on. (Logged "
+                    "once.)");
             }
             return false;
         }
@@ -1167,27 +1156,20 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
         {
             if (!adoptLimitReported_.exchange(true))
             {
-                Log(std::string(spec_.logPrefix) + ": a further " + spec_.name +
-                    " target would have been adopted, but the limit of " + std::to_string(spec_.rivalMaxAdoptions) +
-                    " is spent - NOT adopting. Adopting without bound cannot be told apart from adopting the wrong "
-                    "resources, so this stops and says so instead. Restart to reset it.");
+                Log(std::string(spec_.logPrefix) + ": adoption limit of " +
+                    std::to_string(spec_.rivalMaxAdoptions) + " reached - no longer following new " + spec_.name +
+                    " allocations. Restart to reset.");
             }
             return false;
         }
 
         const int identifiedFormat = identifiedFormat_.load(std::memory_order_relaxed);
         identifiedAlt_.store(resource, std::memory_order_release);
-        Log(std::string(spec_.logPrefix) + ": ADOPTED a second " + spec_.name + " target - " +
-            DescLine(resource, desc) + " has taken its trigger edge on " + std::to_string(run) +
-            " consecutive frames while the selected one (fmt=" + std::to_string(identifiedFormat) +
-            ") took none. Same extent, same structural filter" +
-            (static_cast<int>(desc.Format) == identifiedFormat
-                 ? std::string(", same format: a reallocation to a new address with an identical descriptor")
-                 : std::string(", different format: unconfirmed - every prior adoption has been same-format")) +
-            (selectedEvidenceMask_.load(std::memory_order_relaxed) != 0
-                 ? std::string(", and the same barrier-batch evidence")
-                 : std::string()) +
-            ". BOTH are now captured from, whichever takes the edge - the pass moved, it did not stop.");
+        Log(std::string(spec_.logPrefix) + ": ADOPTED " + DescLine(resource, desc) + " - it took the trigger edge on " +
+            std::to_string(run) + " consecutive frames while the selected one was idle" +
+            (static_cast<int>(desc.Format) == identifiedFormat ? std::string(" (same format)")
+                                                               : std::string(" (DIFFERENT format)")) +
+            ". Both are captured from.");
         return true;
     }
 
@@ -1200,21 +1182,14 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
     {
         return false;
     }
-    Log(std::string(spec_.logPrefix) + ": RIVAL " + spec_.name +
-        "-format edge while the identified resource is stalled - ptr=" +
-        std::to_string(reinterpret_cast<uintptr_t>(resource)) + " " + std::to_string(desc.Width) + "x" +
-        std::to_string(desc.Height) + " fmt=" + std::to_string(static_cast<int>(desc.Format)) +
-        " took its trigger edge on frame " + std::to_string(frame) + ", " + std::to_string(FramesSinceEdge(frame)) +
-        " frames into the stall. The identified resource is " +
-        std::to_string(identifiedWidth_.load(std::memory_order_relaxed)) + "x" +
-        std::to_string(identifiedHeight_.load(std::memory_order_relaxed)) + ". If this repeats, the engine moved the " +
-        spec_.name + " pass to another target rather than stopping it.");
+    Log(std::string(spec_.logPrefix) + ": RIVAL " + std::to_string(reinterpret_cast<uintptr_t>(resource)) + " " +
+        std::to_string(desc.Width) + "x" + std::to_string(desc.Height) + " fmt=" +
+        std::to_string(static_cast<int>(desc.Format)) + " took the trigger edge on frame " + std::to_string(frame) +
+        ", " + std::to_string(FramesSinceEdge(frame)) + " frames after the selected one last did.");
     if (n + 1 == spec_.rivalMaxReports)
     {
-        Log(std::string(spec_.logPrefix) + ": further rival-edge reports suppressed (cap " +
-            std::to_string(spec_.rivalMaxReports) +
-            " per stall episode, re-armed when the pass resumes). Absence of more lines is the cap, not the absence "
-            "of rivals.");
+        Log(std::string(spec_.logPrefix) + ": further RIVAL lines suppressed until the pass resumes (cap " +
+            std::to_string(spec_.rivalMaxReports) + ").");
     }
     return false;
 }
@@ -1249,8 +1224,7 @@ bool SurfaceIdentifier::ForgetKnownSource(ID3D12Resource* resource) noexcept
     if (dropped)
     {
         Log(std::string(spec_.logPrefix) + ": dropped " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
-            " from the shortlist - it is a swapchain back buffer (known by construction), noted after it was "
-            "shortlisted. No search may hold one.");
+            " from the shortlist: it is a swapchain back buffer");
     }
     return SelectedRaw() == resource;
 }
@@ -1266,16 +1240,13 @@ void SurfaceIdentifier::ForgetAllCandidates() noexcept
     if (dropped != 0)
     {
         Log(std::string(spec_.logPrefix) + ": dropped " + std::to_string(dropped) +
-            " candidate(s) because the search reopened - capture stops here and does not resume until a new "
-            "decision is reached");
+            " candidate(s); nothing is captured until the next decision");
     }
 }
 
 void SurfaceIdentifier::Reopen(ReopenReason /*reason*/, const char* detail) noexcept
 {
-    Log(std::string(spec_.logPrefix) + ": REOPENING the search - " + detail +
-        ". The previously selected resource is no longer the thing it was identified as, so anything captured from "
-        "it now would be sized from a stale footprint. Nothing is captured until a new decision is reached.");
+    Log(std::string(spec_.logPrefix) + ": REOPENING the search - " + detail + ".");
     identified_.store(nullptr, std::memory_order_release);
     identifiedWidth_.store(0, std::memory_order_relaxed);
     identifiedHeight_.store(0, std::memory_order_relaxed);
@@ -1341,8 +1312,7 @@ bool SurfaceIdentifier::NoteBackBufferSize(uint64_t width, uint32_t height) noex
     }
     Log(std::string(spec_.logPrefix) + ": back buffer resized " + std::to_string(previousWidth) + "x" +
         std::to_string(previousHeight) + " -> " + std::to_string(width) + "x" + std::to_string(height) +
-        ". UE rebuilds its scene textures at the new extent, so the selected resource is abandoned rather than "
-        "changed - its own descriptor stays valid, which is why nothing else here notices.");
+        "; UE rebuilds its scene textures at the new extent.");
     return true;
 }
 
@@ -1366,14 +1336,9 @@ bool SurfaceIdentifier::IsSilent(uint64_t frame, uint64_t* framesSilent) noexcep
     // of frames.
     if (!silenceReported_.exchange(true))
     {
-        Log(std::string(spec_.logPrefix) + ": the pass has STOPPED. The identified resource has not taken its "
-            "trigger edge for " +
-            std::to_string(frame - last) + " presented frames (last on frame " + std::to_string(last) + ", now at " +
-            std::to_string(frame) +
-            "), while the game carries on presenting. That is what a menu, a "
-            "pause, or the end of a run looks like from in here - the scene is no longer being drawn. "
-            "It is NOT a reason to reidentify: on the one title where this was measured the same "
-            "resource resumed 271,123 frames later.");
+        Log(std::string(spec_.logPrefix) + ": the pass has STOPPED - no trigger edge for " +
+            std::to_string(frame - last) + " frames (last on frame " + std::to_string(last) +
+            "). A menu or pause looks like this; the same resource usually resumes.");
     }
     return true;
 }
