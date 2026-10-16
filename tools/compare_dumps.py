@@ -89,8 +89,7 @@ def blob_hash(dump_dir, prefix, capture_index):
 
 
 # manifest.json fields that differ between two runs of the SAME build, so
-# comparing them would make the oracle fail on every run (measured: it did,
-# from Phase 4 until this list existed). Two kinds:
+# comparing them would make the oracle fail on every run. Two kinds:
 #   - provenance: which build/profile, and when. Differs by design across the
 #     change under test; shown, not judged. A profile that changes behaviour
 #     shows up in the blobs and in the fields that ARE compared.

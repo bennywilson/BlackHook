@@ -40,7 +40,7 @@ for and injects into the real renderer process it spawns,
 `Skyrunner-Win64-Shipping.exe`, the same way it does for Oxi's own
 `*-Win64-Shipping.exe` child.
 
-With the game running, **F8** captures a 60-frame burst to
+With the game running, **F8** captures a 2400-frame burst (~20 s) to
 `temp\dumps\mv_dump\` (or `MV_DUMP_DIR`; the capture script sets a fresh
 `temp\dumps\<game>_<stamp>\`). Wait for `capture: write queue drained` in
 `temp\logs\mv_hook.log` before quitting — `capture: burst recorded` does not
@@ -65,6 +65,11 @@ set MV_DUMP_DIR=%CD%\temp\dumps\testhost
 temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
 ```
 
+`tools\run_testhost_suite.ps1` runs every testhost mode (`-Overlay` adds the
+GPU-validation overlay runs; `-Baseline <old mv_hook.dll>` adds the byte
+oracle, `tools/compare_dumps.py`, which a change meant to keep captured bytes
+identical must pass).
+
 ### Surface profiles
 
 What identification searches for — format tables, flags, thresholds, signal
@@ -78,16 +83,39 @@ value) disables identification for the session and says why in
 `mv_hook.log`; there is no built-in fallback. `manifest.json` records which
 profile a dump was captured under.
 
-**Normals (experimental, off by default).** `MV_SURFACES=normals` (or
-`Invoke-MvCapture.ps1 -Surfaces normals`) also searches for UE5's GBufferA and
-captures it as `normals_NNNNN.bin`. Its encoding is unverified, so the
-manifest says `"encoding": {"kind": "unknown"}` and `mvtools.decode_normals`
-refuses. Verified on one title only (Skyrunner, UE 5.2): GBufferA is told
-apart from a same-format post-process target because it becomes readable in
-the same `ResourceBarrier` call as scene depth, and UE's several allocations
-of it are followed by rival adoption - normals landed on 2087 of 2121 burst
-frames. Read the `normals:` lines in `mv_hook.log` before trusting it on any
-other title.
+**Normals and specular (experimental, off by default).**
+`MV_SURFACES=normals,specular` (or `Invoke-MvCapture.ps1 -Surfaces
+normals,specular`) also searches for UE5's GBufferA and GBufferB (metallic,
+specular, roughness, shading model) and captures them as `normals_NNNNN.bin`
+/ `specular_NNNNN.bin`. Their encodings are unverified, so the manifest says
+`"encoding": {"kind": "unknown"}` and `mvtools.decode_normals` refuses;
+`tools/gbuffer_sheet.py` shows the raw channels. Verified on one title only
+(Skyrunner, UE 5.2): each is told apart from same-format look-alikes because
+it becomes readable in the same `ResourceBarrier` call as scene depth, and
+UE's several allocations of each are followed by rival adoption. Read the
+`normals:` / `specular:` lines in `mv_hook.log` before trusting either on
+another title.
+
+**Overlay.** F7 cycles: off, SceneVelocity, SceneVelocity over gameplay, and
+a GBuffer grid (frame | depth / normals | specular). `MV_OVERLAY=<n>` starts
+in mode n.
+
+**Investigating a new title.** `MV_DIAG=1` logs which surfaces share a
+`ResourceBarrier` call (`<surface>-diag:` lines) and writes
+`mv_candidates.log`. `MV_SNAPSHOT=<surface>` copies one frame of each of that
+surface's candidates to `snapshot_*.bin` (view with `gbuffer_sheet.py
+--snapshots`) - how GBufferB was told from GBufferC.
+
+**Known limits.**
+- Rival adoption stops after `max_adoptions` (64) per session; on Skyrunner
+  normals adopts ~8-10 allocations every 2-3 minutes, so a long session runs
+  out and stops following.
+- Rival adoption tracks one rival at a time: a look-alike taking the same
+  edge every frame resets the run and blocks adoption.
+- With all five surfaces (~37 MB/frame) the writer drops ~55% of a burst's
+  frames to backpressure; drops are whole frames, counted in the manifest.
+- No normals or specular decode: neither encoding is verified against engine
+  source.
 
 ## Results
 

@@ -92,18 +92,11 @@ def _parse_planes(layout_obj):
 @dataclass(frozen=True)
 class IdentifiedSurface:
     """A surface whose identity came from the structural+behavioural search
-    (velocity, depth, and - when MV_SURFACES=normals - normals).
+    (velocity, depth, and the optional normals/specular).
 
-    Deliberately has no .score/.margin/.signals/.survivors attributes: the
-    hook does not track that state anywhere queryable yet (see the commit
-    that added manifest writing, docs/REFACTOR_PLAN.md Phase 4c-2) - it
-    exists only as local variables inside SurfaceIdentifier::Decide()
-    (hook/src/surface_identify.cpp) that get logged and discarded. Adding
-    placeholder fields for it here would invite exactly the kind of
-    silent-plausible-wrong reading this project's own README warns about
-    (the format-enum bug, the missing sqrt in the velocity decode - both
-    looked fine until checked against a primary source). It arrives once
-    Phase 6-7's SurfaceIdentifier owns that state.
+    Deliberately has no .score/.margin/.signals attributes: the hook logs its
+    identification evidence (mv_hook.log) but does not write it to the
+    manifest, and placeholder fields would invite a plausible-but-wrong read.
     """
     name: str
     present: bool
@@ -293,9 +286,8 @@ def load_dump(dump_dir, *, allow_unsealed=False):
         legacy = os.path.join(dump_dir, "meta.txt")
         if os.path.exists(legacy):
             raise ValueError(
-                f"{dump_dir} is a pre-manifest dump (meta.txt but no manifest.json). Re-capture with a "
-                f"hook built after docs/REFACTOR_PLAN.md Phase 4 - load_dump() only reads manifest.json "
-                f"and does not fall back to the old format.")
+                f"{dump_dir} is a pre-manifest dump (meta.txt but no manifest.json). Backfill one with "
+                f"legacy_meta.py, or re-capture - load_dump() only reads manifest.json.")
         raise ValueError(f"{dump_dir} has no manifest.json - not a dump this loader recognises")
 
     with open(manifest_path) as f:
@@ -391,13 +383,9 @@ def _rows(path, width, height, row_pitch, bytes_per_pixel):
 def velocity_channels(meta):
     """(channels, bytes per pixel) for the captured velocity format.
 
-    Read from meta.txt rather than asserted. The previous version hardcoded
-    4 channels and 8 bytes per pixel and asserted the format was
-    R16G16B16A16_UNORM, which is what the one title this was developed against
-    happens to use - a title without Lumen, distance fields or ray tracing gets
-    PF_G16R16 (2 channels, 4 bytes) from the same engine code, and would have
-    failed here with an AssertionError naming a number, at the very end of the
-    pipeline, long after the expensive part.
+    Read from the capture, not assumed: a title without Lumen, distance fields
+    or ray tracing gets PF_G16R16 (2 channels, 4 bytes) from the same engine
+    code that gives others R16G16B16A16_UNORM.
     """
     fmt = meta["velocity_format"]
     if fmt not in VELOCITY_FORMATS:
@@ -551,9 +539,9 @@ def engine_version(meta=None):
     ENGINE_VERSION is a module global, which is fine for one title at a time and
     silently wrong the moment two dumps from different engine versions are
     analysed in the same session - the second one gets whatever the first one
-    set. The hook now writes engine_version_major/minor into meta.txt when
-    MV_ENGINE_VERSION was set for the capture, so the dump carries its own
-    answer and the global is only a fallback.
+    set. The manifest records the engine version when MV_ENGINE_VERSION was
+    set for the capture, so the dump carries its own answer and the global is
+    only a fallback.
     """
     if meta and "engine_version_major" in meta and "engine_version_minor" in meta:
         return (meta["engine_version_major"], meta["engine_version_minor"])

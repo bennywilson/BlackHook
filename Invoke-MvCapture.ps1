@@ -10,7 +10,7 @@
       * MV_DUMP_DIR / MV_ENGINE_VERSION reach the render process only by
         INHERITANCE from the shell that launches the game. Setting them against
         an already-running game does nothing, and the failure is silent - the
-        capture just lands in the wrong place, or meta.txt records no engine
+        capture just lands in the wrong place, or the manifest records no engine
         version and the offline decode falls back to a default for channels 2/3.
         This script sets them before Start-Process, so they are inherited.
 
@@ -37,8 +37,7 @@
         enumerates the target's modules and refuses to make it worse.
 
     See DEBUGGING.md ("Something double-injects mv_hook.dll into Skyrunner,
-    unprompted") and NEXT.md ("Things that will bite") for the incidents
-    behind each of these.
+    unprompted") for the incidents behind these.
 
 .PARAMETER Game
     Path to the game executable to launch - the launcher (Valfreyja.exe,
@@ -47,7 +46,7 @@
     (Skyrunner-Win64-Shipping.exe) of something already running.
 
 .PARAMETER EngineVersion
-    major.minor, e.g. 5.2. Recorded into meta.txt and required by the offline
+    major.minor, e.g. 5.2. Recorded in manifest.json and required by the offline
     decode for channels 2/3, which 5.2 and 5.7 pack differently. Inferred from
     the executable name for titles this repo knows; otherwise you must pass it,
     because a wrong value here silently corrupts V.z and bHasPixelAnimation.
@@ -60,8 +59,8 @@
 
 .PARAMETER Surfaces
     Optional surfaces to capture as well, comma-separated: "normals" (UE5's
-    GBufferA) and "specular" (GBufferB - experimental, still being
-    identified). Read their lines in the hook log before trusting the result.
+    GBufferA) and "specular" (GBufferB), both experimental. Read their lines in
+    the hook log before trusting the result.
 
 .PARAMETER DumpDir
     Where captures go. Defaults to a fresh timestamped directory under the
@@ -277,7 +276,7 @@ if (-not $AttachOnly) {
     if (-not $resolvedVersion) {
         Fail ("cannot infer MV_ENGINE_VERSION from '$gameLeaf', and it was not supplied.`n" +
               "       Pass -EngineVersion <major.minor>. This is not a formality: 5.2 and 5.7 pack V.z and`n" +
-              "       bHasPixelAnimation into channels 2/3 differently, and the offline decode trusts meta.txt.")
+              "       bHasPixelAnimation into channels 2/3 differently, and the offline decode trusts the manifest.")
     }
     if (-not $EngineVersion) {
         Write-Note "MV_ENGINE_VERSION=$resolvedVersion (inferred from '$gameLeaf')"
@@ -424,7 +423,7 @@ if (-not $hookState.Ok) {
     } else {
         Write-Warn2 'These are DIFFERENT files from the one about to be injected. Injecting would map a second independent copy, double-patching the same vtables.'
     }
-    Write-Warn2 'Something on this machine injects the main-checkout mv_hook.dll into fresh Skyrunner processes unprompted - see NEXT.md, "Things that will bite".'
+    Write-Warn2 'Something on this machine injects the main-checkout mv_hook.dll into fresh Skyrunner processes unprompted - see DEBUGGING.md.'
 
     if (-not $Force) {
         Fail ("refusing to inject on top of an existing copy.`n" +
@@ -445,6 +444,9 @@ if ($DryRun) {
 
 Write-Step "Injecting $Hook"
 
+$logPath = Join-Path $tempRoot 'logs\mv_hook.log'
+# The log is appended across sessions: only lines written after injection count.
+$logLinesBefore = if (Test-Path -LiteralPath $logPath) { @(Get-Content -LiteralPath $logPath).Count } else { 0 }
 $code = Invoke-Injector @($targetName, $Hook)
 if ($code -ne 0) {
     Fail "mv_injector exited $code - see its output above."
@@ -453,7 +455,6 @@ Write-Ok 'Injection reported success.'
 
 # -------------------------------------------------- confirm from the log ----
 
-$logPath = Join-Path $tempRoot 'logs\mv_hook.log'
 Write-Step 'Confirming from the hook log'
 Write-Note $logPath
 
@@ -463,8 +464,8 @@ $deadline = (Get-Date).AddSeconds(15)
 $sawInit  = $false
 while ((Get-Date) -lt $deadline) {
     if (Test-Path -LiteralPath $logPath) {
-        $tail = @(Get-Content -LiteralPath $logPath -Tail 40 -ErrorAction SilentlyContinue)
-        if ($tail -match 'InitThread running') { $sawInit = $true; break }
+        $new = @(Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue | Select-Object -Skip $logLinesBefore)
+        if ($new -match 'InitThread running') { $sawInit = $true; break }
     }
     Start-Sleep -Milliseconds 500
 }
@@ -486,12 +487,12 @@ if (-not $AttachOnly) {
 }
 Write-Host "    hook log    : $logPath"
 Write-Host ''
-Write-Host '    F7  cycle the in-game overlay      F8  capture a 60-frame burst'
+Write-Host '    F7  cycle the in-game overlay      F8  capture a 2400-frame burst'
 Write-Host ''
 Write-Host '    Wait for "capture: write queue drained" in the log before quitting the game -'
 Write-Host '    "burst recorded" does NOT mean flushed, and quitting early truncates the dump.'
 Write-Host ''
-Write-Host '    A burst can report a clean frame count and still be short on disk (see NEXT.md).'
+Write-Host '    Backpressure can drop frames; manifest.json counts them.'
 Write-Host '    Count what actually landed before trusting the log:'
 if (-not $AttachOnly) {
     Write-Host "        (Get-ChildItem '$DumpDir' -Filter vel_*.bin).Count"

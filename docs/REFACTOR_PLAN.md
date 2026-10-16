@@ -1,5 +1,15 @@
 # Surface migration plan
 
+> **Status: done** (branch `Clean-up`). Kept as the design record; the code
+> differs from it where live evidence said so: every surface is a plain
+> `SurfaceIdentifier` configured by profile data (rival adoption moved into the
+> base class, no subclasses); `CaptureSystem` (sec 2.6) was never built -
+> `capture.cpp` keeps file-scope state behind one entry point per event; a
+> second optional surface, `specular` (GBufferB), was added; the surface names
+> live in one table (`hook/src/capture.h`). Finding 1.2 (depth/GBuffer fence
+> coverage not graded) and sec 6 #4 (`DrainSlot` on the render thread) remain
+> open.
+
 A design for moving the hook from three hardcoded, hand-triplicated capture
 paths to a single `Surface` abstraction, without rewriting what works.
 
