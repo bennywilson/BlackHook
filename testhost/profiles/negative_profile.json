@@ -1,4 +1,4 @@
-// The negative profile test, loaded by `mv_testhost --phase9-negative` through
+// The negative profile test, loaded by `mv_testhost --negative-profile` through
 // MV_PROFILE_FILE and MV_PROFILE.
 //
 // Narrows velocity's format table to the wrong entry: the real SceneVelocity is
@@ -13,7 +13,7 @@
   "profiles": {
     "test-velocity-wrong-format": {
       "extends": "ue5-generic",
-      "description": "Phase 9 negative test: velocity narrowed to R16G16_UNORM only.",
+      "description": "Negative test: velocity narrowed to R16G16_UNORM only.",
       "surfaces": {
         "velocity": {
           "formats": [

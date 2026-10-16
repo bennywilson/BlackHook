@@ -14,7 +14,7 @@
 // USAGE
 //   mv_testhost.exe [--hook <dll>] [--frames N] [--no-gbv] [--pipeline oxi|skyrunner]
 //                   [--ambiguous] [--normals] [--specular] [--velocity-realloc]
-//                   [--phase8-tests] [--phase9-negative]
+//                   [--reopen-tests] [--negative-profile]
 //   mv_testhost.exe --wpo-encode-test <output_dir>
 //
 //   --pipeline skyrunner  velocity's 5-transition pass through UNORDERED_ACCESS,
@@ -23,8 +23,8 @@
 //   --ambiguous           adds a perfect twin; identification must refuse
 //   --normals/--specular  GBufferA/GBufferB look-alikes and decoys (MV_SURFACES)
 //   --velocity-realloc    SceneVelocity through three allocations (rival adoption)
-//   --phase8-tests        resize, depth reallocation, mid-burst reopen
-//   --phase9-negative     a profile narrowed to the wrong format must find nothing
+//   --reopen-tests        resize, depth reallocation, mid-burst reopen
+//   --negative-profile     a profile narrowed to the wrong format must find nothing
 //
 // `MV_AUTOCAPTURE=1` makes the hook start a burst by itself.
 // `tools/run_testhost_suite.ps1` runs every mode. --wpo-encode-test
@@ -255,8 +255,8 @@ int main(int argc, char** argv) {
     int frames = 240;
     bool gpuValidation = true;
     bool ambiguous = false;
-    bool phase8Tests = false;
-    bool phase9Negative = false;
+    bool reopenTests = false;
+    bool negativeProfile = false;
     bool normals = false;
     bool velocityRealloc = false;
     bool specular = false;
@@ -279,10 +279,10 @@ int main(int argc, char** argv) {
             pipeline = argv[++i];
         } else if (arg == "--wpo-encode-test" && i + 1 < argc) {
             wpoEncodeTestDir = argv[++i];
-        } else if (arg == "--phase8-tests") {
-            phase8Tests = true;
-        } else if (arg == "--phase9-negative") {
-            phase9Negative = true;
+        } else if (arg == "--reopen-tests") {
+            reopenTests = true;
+        } else if (arg == "--negative-profile") {
+            negativeProfile = true;
         } else if (arg == "--normals") {
             normals = true;
         } else if (arg == "--velocity-realloc") {
@@ -310,10 +310,10 @@ int main(int argc, char** argv) {
 
     // The hook reads these once, in InstallD3D12Hooks, so before LoadLibrary.
     const char* const kNegativeProfile = "test-velocity-wrong-format";
-    if (phase9Negative) {
-        SetEnvironmentVariableA("MV_PROFILE_FILE", MV_TESTHOST_PROFILE_DIR "/phase9_negative.json");
+    if (negativeProfile) {
+        SetEnvironmentVariableA("MV_PROFILE_FILE", MV_TESTHOST_PROFILE_DIR "/negative_profile.json");
         SetEnvironmentVariableA("MV_PROFILE", kNegativeProfile);
-        printf("[testhost] Phase 9 negative test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
+        printf("[testhost] Negative profile test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
                "identification must find NO candidate and must not fall back\n", kNegativeProfile);
     }
     if (normals || specular) {
@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
                surfaces);
     }
     // Every path below that expects identification to select nothing.
-    const bool expectNothingSelected = ambiguous || phase9Negative;
+    const bool expectNothingSelected = ambiguous || negativeProfile;
     std::string dumpDir;
     if (char value[MAX_PATH]{}; GetEnvironmentVariableA("MV_DUMP_DIR", value, MAX_PATH) != 0) {
         dumpDir = value;
@@ -702,7 +702,7 @@ int main(int argc, char** argv) {
 
     int totalErrors = 0;
 
-    // One frame, as a lambda so --phase8-tests can keep rendering after the
+    // One frame, as a lambda so --reopen-tests can keep rendering after the
     // initial window.
     // --normals: GBufferA allocation 1 alone until identification has settled,
     // then the two alternate in 30-frame stretches.
@@ -878,7 +878,7 @@ int main(int argc, char** argv) {
                 printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED" : "");
             }
-            if (phase9Negative) {
+            if (negativeProfile) {
                 // The narrowed profile is the one that ran (a load failure also
                 // selects nothing), nothing was selected (no fallback), and the
                 // hook logged it.
@@ -896,7 +896,7 @@ int main(int argc, char** argv) {
                        identificationPassed
                            ? "PASS - a profile narrowed to the wrong format found NO candidate, said so, and did not "
                              "fall back"
-                           : "FAIL - Phase 9 negative test (see the three lines above)");
+                           : "FAIL - negative profile test (see the three lines above)");
             } else if (ambiguous) {
                 // Two indistinguishable candidates: refusal is the only right
                 // answer.
@@ -1069,7 +1069,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- --phase8-tests: resize, depth reallocation, mid-burst reopen ------
+    // ---- --reopen-tests: resize, depth reallocation, mid-burst reopen ------
     //
     // `MV_AUTOCAPTURE` starts one burst, and both test 3 and a real resize end it
     // (a resize through the colour layout check, before velocity's 30-frame
@@ -1079,12 +1079,12 @@ int main(int argc, char** argv) {
     bool midBurstReopenEndedBurst = true;
     bool resizeTestPassed = true;
     bool depthReopenRecoveryPassed = true;
-    if (phase8Tests && hookModule != nullptr && !expectNothingSelected && identificationPassed &&
+    if (reopenTests && hookModule != nullptr && !expectNothingSelected && identificationPassed &&
         depthIdentificationPassed) {
-        printf("\n[testhost] ==== Phase 8 behaviour tests ====\n");
+        printf("\n[testhost] ==== reopen tests ====\n");
         const std::string& dir = dumpDir;
         if (GetEnvironmentVariableA("MV_AUTOCAPTURE", nullptr, 0) == 0 || dir.empty()) {
-            printf("[testhost]   FAIL - --phase8-tests requires MV_AUTOCAPTURE=1 and MV_DUMP_DIR set (same as the "
+            printf("[testhost]   FAIL - --reopen-tests requires MV_AUTOCAPTURE=1 and MV_DUMP_DIR set (same as the "
                    "dump-contents check) - nothing to observe without an active burst\n");
             midBurstReopenEndedBurst = false;
             resizeTestPassed = false;
@@ -1253,7 +1253,7 @@ int main(int argc, char** argv) {
 
     // ---- Test 3 (continued): the sealed manifest says why the burst ended.
     // A substring search: no JSON library in this tree for one field.
-    if (phase8Tests && hookModule != nullptr && midBurstReopenEndedBurst) {
+    if (reopenTests && hookModule != nullptr && midBurstReopenEndedBurst) {
         if (dumpDir.empty()) {
             printf("[testhost] test 3 (mid-burst reopen ends the burst): FAIL - MV_DUMP_DIR not set\n");
             midBurstReopenEndedBurst = false;
@@ -1386,15 +1386,15 @@ int main(int argc, char** argv) {
         printf("[testhost] %s\n", specularIdentificationPassed ? "PASS - specular identification"
                                                                : "FAIL - specular identification");
     }
-    if (phase8Tests) {
-        printf("[testhost] %s\n", resizeTestPassed ? "PASS - Phase 8 test 1 (resize stops capture until reidentified)"
-                                                     : "FAIL - Phase 8 test 1 (resize stops capture until reidentified)");
+    if (reopenTests) {
+        printf("[testhost] %s\n", resizeTestPassed ? "PASS - reopen test 1 (resize stops capture until reidentified)"
+                                                     : "FAIL - reopen test 1 (resize stops capture until reidentified)");
         printf("[testhost] %s\n",
-               depthReopenRecoveryPassed ? "PASS - Phase 8 test 2 (depth reallocation recovers)"
-                                          : "FAIL - Phase 8 test 2 (depth reallocation recovers)");
+               depthReopenRecoveryPassed ? "PASS - reopen test 2 (depth reallocation recovers)"
+                                          : "FAIL - reopen test 2 (depth reallocation recovers)");
         printf("[testhost] %s\n",
-               midBurstReopenEndedBurst ? "PASS - Phase 8 test 3 (mid-burst reopen ends the burst)"
-                                        : "FAIL - Phase 8 test 3 (mid-burst reopen ends the burst)");
+               midBurstReopenEndedBurst ? "PASS - reopen test 3 (mid-burst reopen ends the burst)"
+                                        : "FAIL - reopen test 3 (mid-burst reopen ends the burst)");
     }
 
     CloseHandle(fenceEvent);
@@ -1402,7 +1402,7 @@ int main(int argc, char** argv) {
     const int exitCode =
         (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed &&
          normalsIdentificationPassed && specularIdentificationPassed &&
-         (!phase8Tests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
+         (!reopenTests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
             ? 0
             : 1;
     printf("[testhost] exiting with code %d\n", exitCode);

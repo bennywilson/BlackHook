@@ -39,12 +39,12 @@ $runs = [ordered]@{
     'normals'           = '--no-gbv --normals'
     'normals-skyrunner' = '--no-gbv --normals --pipeline skyrunner'
     'normals-ambiguous' = '--no-gbv --normals --ambiguous'
-    'normals-phase8'    = '--no-gbv --normals --phase8-tests'
-    'phase8'            = '--no-gbv --phase8-tests'
+    'normals-reopen'    = '--no-gbv --normals --reopen-tests'
+    'reopen'            = '--no-gbv --reopen-tests'
     'velocity-realloc'  = '--no-gbv --velocity-realloc --frames 900'
     'specular'          = '--no-gbv --specular'
     'normals-specular'  = '--no-gbv --normals --specular'
-    'phase9-negative'   = '--no-gbv --phase9-negative'
+    'negative-profile'  = '--no-gbv --negative-profile'
 }
 if ($Overlay) {
     $runs['overlay-oxi']       = '--normals --specular'
