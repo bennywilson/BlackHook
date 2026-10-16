@@ -24,3 +24,5 @@ old/
 
 # Local copies of third-party games used for capture (not redistributable)
 testgames/
+# Claude Code local settings
+.claude/
