@@ -1,283 +1,155 @@
-# VelocityBufferTest
+# UnrealHook
 
-Injects a DLL into a running Unreal Engine 5 game, hooks D3D12 via vtable
-patching, and locates the engine's `SceneVelocity` (motion vector) buffer.
-The target is packaged **Shipping**, which strips resource names, so 
-identification has to work from structure and behaviour alone. Once found,
-the buffer is copied back to the CPU without stalling the game and decoded
-into a per-pixel motion field, which is then checked against independent ground truth rather than just visualised and trusted.
+A DLL injected into a running Unreal Engine 5 game (D3D12, Shipping build) that
+finds the engine's scene textures without resource names and captures them
+every frame: `SceneVelocity` (motion vectors), scene depth, the back buffer, and
+optionally GBufferA (normals) and GBufferB (specular). Python tools decode the
+captures and check the motion field against the images.
 
-Development ran against two targets: "Oxi", a UE5.7.1 project of my own
-and "Skyrunner", a third-party UE5.2 title I do not have source code access to.
-The second run is the one that matters most and it falsified several assumptions
-the Oxi work made about SceneVelocity.
+Tested on Skyrunner (UE 5.2) and Oxi (UE 5.7).
 
-Full detail is kept in `DEBUGGING.md`.
-
-Output of verification tests can be found in `results/` (see below for more)
-
-## Build and run
+## Build
 
 ```
 cmake -B temp/build -S .
 cmake --build temp/build --config Release --target mv_hook mv_injector mv_testhost
 ```
 
-Everything the repo generates goes under the gitignored `temp/`:
-`temp/build/`, `temp/logs/` (`mv_hook.log`, `mv_barrier_profile.log`),
-`temp/dumps/` (captures) and `temp/out/` (videos, previews). The hook
-learns this path at CMake configure time; `MV_DUMP_DIR` still overrides the
-dump location. Layout is in `tools/paths.py`.
+Everything generated goes under the gitignored `temp/`: `build/`, `logs/`
+(`mv_hook.log`), `dumps/` and `out/`. The layout is in `tools/paths.py`.
+
+## Capture
 
 ```powershell
 .\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe
-.\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe -DumpDir temp\dumps\run7
+.\Invoke-MvCapture.ps1 <game.exe> -EngineVersion 5.7 -Surfaces normals,specular
 ```
 
-`testgames/` is gitignored; put a local copy of the game there.
-`Valfreyja.exe` is the launcher — pass that path in. The script itself waits
-for and injects into the real renderer process it spawns,
-`Skyrunner-Win64-Shipping.exe`, the same way it does for Oxi's own
-`*-Win64-Shipping.exe` child.
+The script launches the game, waits for its `*-Win64-Shipping` render process,
+and injects the hook. It sets the environment the hook reads at startup (below),
+so the game must be launched through it. `-AttachOnly` injects into a running
+process, without that environment. `testgames/` is gitignored; put local copies
+of games there.
 
-With the game running, **F8** captures a 2400-frame burst (~20 s) to
-`temp\dumps\mv_dump\` (or `MV_DUMP_DIR`; the capture script sets a fresh
-`temp\dumps\<game>_<stamp>\`). Wait for `capture: write queue drained` in
-`temp\logs\mv_hook.log` before quitting — `capture: burst recorded` does not
-mean flushed. Then run the offline validation:
+In game, **F8** captures a 2400-frame burst (~20 s) into a fresh
+`temp\dumps\<game>_<stamp>\`. Wait for `capture: write queue drained` in
+`temp\logs\mv_hook.log` before quitting.
 
+A dump holds one file per surface per frame (`vel_00042.bin`, `depth_`,
+`color_`, `normals_`, `specular_`), `frames.csv` (capture index to game frame)
+and `manifest.json` (layouts, formats, why the burst ended, dropped-frame
+counts). The manifest is written when the burst has drained; tools refuse a dump
+without one.
+
+### Environment
+
+| Variable | Effect |
+|---|---|
+| `MV_ENGINE_VERSION` | `5.2`, `5.7`, ... Selects the profile `ue<major>.<minor>-generic` and is recorded in the manifest; the velocity decode depends on it. |
+| `MV_PROFILE` | Use this profile instead. `MV_PROFILE_FILE=<path>` adds profiles from a file. |
+| `MV_SURFACES` | `normals`, `specular` or `normals,specular`: also identify and capture these. |
+| `MV_DUMP_DIR` | Dump directory (default `temp\dumps\mv_dump\`). |
+| `MV_AUTOCAPTURE` | Start a burst one second after injection, without F8. |
+| `MV_CAPTURE_DEPTH=0` | Do not capture depth. |
+| `MV_OVERLAY` | Start the overlay in this mode (see below). |
+| `MV_IDENTIFY_FRAMES` | Override velocity's settling window, in frames. |
+| `MV_DIAG` | Log which surfaces share a `ResourceBarrier` call and write `mv_candidates.log`. |
+| `MV_SNAPSHOT` | `<surface>`: copy one frame of each of that surface's candidates to `snapshot_*.bin`. |
+
+The script's parameters map onto these (`-EngineVersion`, `-SurfaceProfile`,
+`-Surfaces`, `-DumpDir`, `-AutoCapture`, `-NoCaptureDepth`).
+
+### Overlay
+
+**F7** cycles: off, `SceneVelocity` as the engine's visualizer shows it,
+`SceneVelocity` over the frame, and a 2x2 grid of frame, depth, normals and
+specular. A quadrant whose surface was not refreshed that frame gets a red
+border.
+
+## How identification works
+
+What to look for is data in [`profiles/ue5.json`](profiles/ue5.json), embedded
+in the DLL at build time. Each surface has:
+
+- a **structural gate**: the formats the engine can create it with, required and
+  forbidden resource flags, and its size (velocity within 2x the back buffer;
+  every other surface at velocity's exact size);
+- **behaviour**, measured over a settling window and scored: the barrier edge
+  that finishes it (`RENDER_TARGET` to shader-readable, or `DEPTH_WRITE` to
+  readable for depth), how often it takes that edge, whether it is written by
+  compute, and for the GBuffers whether it becomes readable in the same
+  `ResourceBarrier` call as scene depth.
+
+The top survivor must win by a margin, or identification refuses to pick
+(`AMBIGUOUS` in the log). UE keeps several allocations of each scene texture
+and switches between them; a surface follows a new one by **rival adoption**
+when it takes the edge on 8 consecutive frames while the selected one is idle.
+A profile describes what to search for, and cannot name a resource. An invalid
+profile disables identification and says why in the log.
+
+Each surface is copied at its trigger edge, the one point where the transient
+resource is complete and not yet reused. The copy goes on the game's own command
+list into a 4-slot readback ring, so the game never waits on the GPU. Disk
+writes happen on a background thread; under backpressure whole frames are
+dropped and counted.
+
+The velocity encode is `sign(V) * sqrt(abs(V))` (`VELOCITY_ENCODE_GAMMA` in
+`Common.ush`), so a linear decode is wrong everywhere. Channels 2 and 3 hold the
+two halves of one float32 (the DeviceZ delta), and 5.7 uses one bit of channel 3
+for `bHasPixelAnimation`. `tools/mvtools.py` decodes all of this.
+
+## Tools
+
+Run from `tools/`; each takes a dump directory.
+
+| Tool | |
+|---|---|
+| `run_validation.py <dump> <title>` | Every check below; writes `results/validation_<title>.txt`. |
+| `warp_validate.py` | Warps frame N-1 by the decoded field and scores it against frame N, against three controls. |
+| `check_decode.py`, `derive_scale.py`, `region_match.py` | Decoded motion against block-matched image motion. |
+| `make_video.py` | Video of the motion field beside the gameplay. |
+| `gbuffer_sheet.py` | Contact sheet of colour, normals and specular (`--snapshots` for `MV_SNAPSHOT` files). |
+| `inspect_velocity.py` | Sanity check of a velocity capture. |
+| `barrier_signature.py` | Barrier patterns of every resource (needs a 2000-frame session). |
+| `compare_dumps.py <a> <b>` | Byte-compares two dumps frame by frame. |
+
+## Testing
+
+`mv_testhost` runs the hook under the D3D12 debug layer and GPU-based validation
+(needs the Windows **Graphics Tools** feature), against placed render targets
+built to look like a UE5 frame: the real `SceneVelocity`, depth and GBuffers
+among decoys that each fail one filter. It checks the selected resources by
+pointer, the dump contents, and zero debug-layer errors.
+
+```powershell
+.\tools\run_testhost_suite.ps1                     # every mode
+.\tools\run_testhost_suite.ps1 -Overlay            # plus the overlay under GPU-based validation
+.\tools\run_testhost_suite.ps1 -Baseline <old mv_hook.dll>   # plus a byte comparison against that build
 ```
-cd tools
-python run_validation.py <dump_dir> <title>   # everything -> results/validation_<title>.txt
-python make_video.py <dump_dir>               # -> temp/out/motion_field.mp4
-python barrier_signature.py                   # needs a >=2000-frame session
-```
-
-Each tool defaults to `temp\dumps\mv_dump` when no dump dir is given.
-
-To exercise the capture path under the D3D12 debug layer + GPU-based
-validation instead of a real game (requires the Windows **Graphics Tools**
-optional feature):
-
-```
-set MV_AUTOCAPTURE=1
-set MV_DUMP_DIR=%CD%\temp\dumps\testhost
-temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
-```
-
-`tools\run_testhost_suite.ps1` runs every testhost mode (`-Overlay` adds the
-GPU-validation overlay runs; `-Baseline <old mv_hook.dll>` adds the byte
-oracle, `tools/compare_dumps.py`, which a change meant to keep captured bytes
-identical must pass).
-
-### Surface profiles
-
-What identification searches for — format tables, flags, thresholds, signal
-weights — is data in [`profiles/ue5.json`](profiles/ue5.json), embedded into
-the DLL at build time. The hook picks a profile from `MV_PROFILE`, else
-`ue<major>.<minor>-generic` from `MV_ENGINE_VERSION` (the capture script sets
-this), else `ue5-generic`. `MV_PROFILE_FILE=<path>` adds profiles from a file
-without rebuilding. A profile can only describe what to look for, never name
-a resource. Anything wrong with a profile (unknown name, misspelt field, bad
-value) disables identification for the session and says why in
-`mv_hook.log`; there is no built-in fallback. `manifest.json` records which
-profile a dump was captured under.
-
-**Normals and specular (experimental, off by default).**
-`MV_SURFACES=normals,specular` (or `Invoke-MvCapture.ps1 -Surfaces
-normals,specular`) also searches for UE5's GBufferA and GBufferB (metallic,
-specular, roughness, shading model) and captures them as `normals_NNNNN.bin`
-/ `specular_NNNNN.bin`. Their encodings are unverified, so the manifest says
-`"encoding": {"kind": "unknown"}` and `mvtools.decode_normals` refuses;
-`tools/gbuffer_sheet.py` shows the raw channels. Verified on one title only
-(Skyrunner, UE 5.2): each is told apart from same-format look-alikes because
-it becomes readable in the same `ResourceBarrier` call as scene depth, and
-UE's several allocations of each are followed by rival adoption. Read the
-`normals:` / `specular:` lines in `mv_hook.log` before trusting either on
-another title.
-
-**Overlay.** F7 cycles: off, SceneVelocity, SceneVelocity over gameplay, and
-a GBuffer grid (frame | depth / normals | specular). `MV_OVERLAY=<n>` starts
-in mode n.
-
-**Investigating a new title.** `MV_DIAG=1` logs which surfaces share a
-`ResourceBarrier` call (`<surface>-diag:` lines) and writes
-`mv_candidates.log`. `MV_SNAPSHOT=<surface>` copies one frame of each of that
-surface's candidates to `snapshot_*.bin` (view with `gbuffer_sheet.py
---snapshots`) - how GBufferB was told from GBufferC.
-
-**Known limits.**
-- Rival adoption stops after `max_adoptions` (64) per session; on Skyrunner
-  normals adopts ~8-10 allocations every 2-3 minutes, so a long session runs
-  out and stops following.
-- Rival adoption tracks one rival at a time: a look-alike taking the same
-  edge every frame resets the run and blocks adoption.
-- With all five surfaces (~37 MB/frame) the writer drops ~55% of a burst's
-  frames to backpressure; drops are whole frames, counted in the manifest.
-- No normals or specular decode: neither encoding is verified against engine
-  source.
 
 ## Results
 
-Everything below is already in `results/` and reproducible without a running
-game — `results/validation_*.txt` is generated verbatim by
-`run_validation.py` against capture dumps kept outside the repo (raw dumps
-are large and gitignored), and `mv_testhost` needs nothing but the built DLL.
-Re-running both against the same inputs reproduces every number here exactly.
-
 ![motion field, Skyrunner](results/motion_field_still_skyrunner.png)
 
-Left: the game's own back buffer. Middle: `SceneVelocity` as written by the
-engine — dynamic/WPO objects only, correctly sparse. Right: the field
-composited over the frame.
+Left: the game's back buffer. Middle: `SceneVelocity` as the engine wrote it
+(dynamic and WPO objects only). Right: the two composited.
 
-| test | result | source |
+| Test | Result | Source |
 |---|---|---|
-| identification, third-party title | 1 of 755 profiled resources, 3 separate injections, confirmed against RenderDoc's `CreatePlacedResource` call | `results/validation_skyrunner*.txt` |
-| `mv_testhost` debug-layer harness | 0 errors over 240 hooked frames, correct resource picked out of 4 structural look-alikes every run; refuses to pick between 2 indistinguishable candidates when told to | run directly, no game needed |
-| warp-and-difference, 120-frame capture | 102/103 pairs improved, +37.7% mean error reduction, beats the best possible rigid shift by 59.9% | `results/validation_skyrunner.txt`, `results/warp_validation_skyrunner.png` |
-| warp-and-difference, 60-frame capture (video above) | 47/47 pairs improved, +53.6% mean error reduction | `results/validation_skyrunner_video.txt` |
-| decode vs. block-matched image motion | corr X +0.99, Y +0.94; engine decode beats a linear decode by ~4-6px RMS | `results/decode_scatter_skyrunner*.png` |
+| Identification on Skyrunner | 1 of 755 profiled resources, confirmed against RenderDoc | `results/validation_skyrunner*.txt` |
+| Warp-and-difference, 120 frames | 102/103 pairs improved, mean error -37.7%, beats the best rigid shift by 59.9% | `results/validation_skyrunner.txt` |
+| Warp-and-difference, 60 frames | 47/47 pairs improved, mean error -53.6% | `results/validation_skyrunner_video.txt` |
+| Decode vs block-matched motion | correlation X 0.99, Y 0.94; 4-6 px RMS better than a linear decode | `results/decode_scatter_skyrunner*.png` |
 
-To check any of these yourself:
+## Known limits
 
-```
-temp\build\testhost\Release\mv_testhost.exe --hook %CD%\temp\build\hook\Release\mv_hook.dll --frames 240
-cd tools && python run_validation.py <dump_dir> <title>   # writes results/validation_<title>.txt
-```
-
-The full debugging narrative behind these numbers — including the wrong
-turns, the format-enum bug, and the properties of Oxi's velocity buffer that
-turned out not to generalise to Skyrunner — is in `DEBUGGING.md`.
-
-## How it works
-
-**Identification.** Neither a pure descriptor match nor pure runtime behaviour
-transfers between titles, so the two are used as separate tools:
-
-- **Structure** is a hard gate derived from engine rules rather than a copied
-  tuple: the formats `FVelocityRendering::GetFormat` can return, the create
-  flags `GetCreateFlags` implies, `mips=1/arraySize=1/samples=1/layout=UNKNOWN`,
-  and a resolution ranked (not matched) from an observed histogram, bounded at
-  up to 2x the back buffer per dimension rather than capped at it — UE rounds
-  render targets up, so the velocity buffer is routinely *larger* than the back
-  buffer which an early version of the filter missed.
-- **Behaviour** — barrier transition patterns over a settling window — is
-  scored evidence layered on top of the structural gate, logged per candidate
-  with a reason for the winner.
-
-On Oxi, behaviour was decisive and structure only broke a tie; on Skyrunner,
-structure alone was already unique and most of the "invariants" measured on
-Oxi (exactly 2 barrier events/frame, never entering `UNORDERED_ACCESS`,
-destination state `ALL_SHADER_RESOURCE`) turned out false of Skyrunner's own
-velocity buffer. The capture deliberately fails on frames where the ranking 
-can't separate candidates by a clear margin.
-
-**Extraction.** The buffer is a *transient placed* resource whose heap memory
-gets aliased by other resources later in the frame, so it can only be safely
-read at the `RENDER_TARGET -> shader-resource` barrier — after the last
-render-target write (confirmed against RenderDoc's own event ordering) and
-before the memory is reused. The copy is recorded on the game's own command
-list; a 4-slot async ring means the CPU never waits on the GPU (a full ring
-skips the frame rather than stalling); a single fence, checked at runtime by
-command-list identity rather than assumed, covers the copy; and all disk I/O
-happens on a background writer thread with a bounded, drop-and-log queue.
-Subresource/plane counts and footprints are read from the resource desc every
-frame rather than cached, so a swapchain resize or a byte-identical
-reallocation to a new address (both observed live) don't silently invalidate
-the readback.
-
-**Units and precision.** The single biggest correctness bug in the project was
-treating the encoding as linear. `Common.ush` applies
-`sign(V) * sqrt(abs(V))` before packing (`VELOCITY_ENCODE_GAMMA`, unconditional
-on SM5+ D3D12), so a linear decode is wrong everywhere and worst near zero,
-where the curve is steepest. This was found by reading the engine source
-(and later, on Skyrunner where no matching source tree exists locally,
-by reading the shipping binary's own disassembled pixel shader — the encode
-is legible directly in the compiled HLSL) rather than by fitting constants to
-captured data. A prior attempt to fit constants against a single capture
-produced numbers that worked on that one clip and were physically meaningless
-elsewhere. Channels 2/3 turned out to be the two halves of one packed float32
-(`V.z`, the DeviceZ delta) rather than two independent channels — viewed
-separately, one half looks bimodal (it's the sign bit) and the other looks
-like noise, which is why it took months to read as a single value.
-
-**Validation** runs several independent tests, each weaker or stronger for
-different reasons:
-- *Warp-and-difference*: warp frame N-1 by the decoded field, score against
-  frame N, with three controls (sign-flipped field, best rigid global shift,
-  mismatched frame) that must rank worse than the real field. This only means
-  something on footage with several pixels/frame of true motion — on
-  near-static Oxi captures it correctly reports that no warp beats not
-  warping, which says nothing about the decode; on a moderate-speed Skyrunner
-  capture it passes at 102/103 pairs improved, beating the best rigid shift by
-  60%.
-- *Block matching* (pyramidal, sub-pixel) as an independent, non-buffer ground
-  truth for per-pixel and per-region comparison against the decode.
-
-An analytical reference reconstructed from depth and the engine's View
-uniform buffer (`View_ClipToPrevClip`) was also built and, on Skyrunner,
-measured the decode at slope 1.0000/0.9997 against 18M pixels — the strongest
-result in the project, because it never looks at the image at all. That
-capture path (reading the View buffer out of the process via root constant
-buffer view addresses) turned out to have an unresolved intermittent bug —
-~42% of frames in a later, higher-churn capture regressed at the right offset
-but the wrong scale, and the investigation in `DEBUGGING.md` ("The View buffer
-regresses at the right offset and the wrong scale") ruled out every mechanism
-this project had the tooling to test without settling on a cause. Rather than
-ship an extraction path with a known, unexplained failure mode, it has been
-removed: `hook/src/view_cb.*`, `tools/reproject.py` and the dense/full-screen
-mode of `make_video.py` are gone, and validation now reports only on the
-sparse `SceneVelocity` buffer as written by the engine.
-
-**Debugging** Two rules run through the whole log: re-derive constants
-from primary sources instead of trusting recalled or fitted values, and leave
-wrong turns in the record instead of editing them out once the right answer is
-known. Two concrete cases:
-- The velocity buffer's format was transcribed early on as
-  `R16G16B16A16_FLOAT` (DXGI enum 10) instead of the actual `_UNORM` (11). The
-  wrong filter didn't fail loudly as it matched a real pool of 4 HDR render
-  targets that cycled states exactly like a velocity buffer would, so three
-  separate rounds of otherwise-correct analysis ran against the wrong
-  candidate set before we re-checked the constant against `dxgiformat.h`.
-  The tell, in hindsight, was that all 4 survivors were descriptor-identical —
-  the signature of a pool, not a specific resource.
-- Porting to Skyrunner falsified properties the Oxi barrier survey had
-  written up as facts about `SceneVelocity` itself: Oxi's velocity buffer
-  showed exactly 2 barrier events/frame with zero exceptions over 53,324
-  frames and never entered `UNORDERED_ACCESS`; Skyrunner's shows 5
-  events/frame, transitions to `NON_PIXEL_SHADER_RESOURCE` instead of
-  `ALL_SHADER_RESOURCE`, and does enter `UNORDERED_ACCESS`. Every one of those,
-  kept as a hard rule, would reject the correct buffer on the other title —
-  which is why identification now treats structure as the only hard gate and
-  behaviour as scored evidence rather than a second set of invariants.
-
-**Where AI helped, and where it was overridden.**
-
-- **Helped:** well-specified boilerplate — the D3D12 bootstrap to obtain
-  vtable pointers, readback/fence plumbing, the ring-buffer/writer-thread
-  structure, Python decode/plot code — plus bulk log analysis (grouping ~1M
-  barrier events by transition pattern).
-- **Overridden:** anything that was a specific numeric claim about the
-  engine. Recalled `D3D12_RESOURCE_STATES` values that were simply wrong,
-  caught only by checking `d3d12.h`. A recollection of the velocity decode
-  constants that quietly omitted the `sqrt` term, caught by reading the
-  actual shader source rather than trusting the recollection. A fence
-  "coverage" check that compared raw COM interface pointers, falsified by the
-  debug layer on its first run because it wraps interfaces at a different
-  address per hook site.
-- **Wrong diagnoses, not just wrong numbers.** A few times a plausible-sounding
-  root cause for an observed bug turned out to be false and had to be caught
-  by evidence rather than argument — e.g. a live overlay that appeared to
-  freeze on certain frames while the game kept running was first attributed to
-  the engine skipping the velocity pass when nothing in view has non-camera
-  motion to write; a screenshot showing WPO-animated foliage filling half the
-  frame while the overlay was already stale ruled that out immediately. The
-  real cause, found afterward, was unrelated. `DEBUGGING.md` has more of
-  these, including one case where the correct diagnosis was reached, then
-  abandoned when an initial fix attempt built on it failed, and only
-  reconfirmed later.
-
-The pattern was consistent: reliable for structure and throughput, unreliable
-for specific facts — and those are exactly the things that fail silently and
-plausibly rather than loudly.
+- Normals and specular are verified on Skyrunner only, and their encodings are
+  not: the manifest says `"encoding": {"kind": "unknown"}` and
+  `mvtools.decode_normals` refuses.
+- Rival adoption stops after 64 adoptions per surface per session. On Skyrunner
+  normals adopts about 8 every 2-3 minutes, so long sessions run out.
+- Rival adoption follows one rival at a time: a look-alike taking the same edge
+  every frame blocks it.
+- With all five surfaces (~44 MB per frame) most of a burst is dropped to write
+  backpressure; about a quarter to a half of the frames reach disk.
+- Fence coverage is verified for the velocity copy only.
