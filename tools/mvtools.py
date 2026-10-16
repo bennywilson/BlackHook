@@ -18,7 +18,7 @@ import numpy as np
 
 # DXGI formats seen in captures, from dxgiformat.h (Windows SDK 10.0.26100.0).
 # R16G16B16A16_FLOAT is 10 and R16G16B16A16_UNORM is 11; mistaking one for the
-# other cost this project more than any other error (DEBUGGING.md).
+# other cost this project more than any other error.
 DXGI_R16G16B16A16_UNORM = 11
 DXGI_R16G16B16A16_UINT = 12
 DXGI_R10G10B10A2_UNORM = 24
@@ -93,7 +93,7 @@ class IdentifiedSurface:
     subresources: Optional[int] = None
     planes: tuple = ()
     coverage: Optional[dict] = None       # velocity: {"strong","weak","none"}
-    coverage_note: Optional[str] = None   # depth: "not evaluated - ..."
+    coverage_note: Optional[str] = None   # depth: "fence coverage is not evaluated ..."
     reason: Optional[str] = None          # set only when not present
     detail: Optional[str] = None          # normals: why not present, in words
     encoding: Optional[dict] = None       # normals: {"kind": "unknown"} until verified

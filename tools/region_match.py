@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover
 
 # A linear decode with fitted constants, as a control: if the encoding is
 # square-root, it tracks badly at large displacements and acceptably at small
-# ones (DEBUGGING.md).
+# ones.
 LEGACY_UV_PER_UNIT_X = -0.1758
 LEGACY_UV_PER_UNIT_Y = +0.1991
 

@@ -53,7 +53,7 @@ struct Named
 };
 
 // Formats by name: DXGI 10 (R16G16B16A16_FLOAT) mistaken for 11 (_UNORM) cost
-// this project more than any other error (DEBUGGING.md). Only formats a UE5
+// this project more than any other error. Only formats a UE5
 // velocity, depth or GBuffer target can use; any other is a profile error until
 // added here.
 constexpr Named<DXGI_FORMAT> kFormats[] = {

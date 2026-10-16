@@ -66,7 +66,7 @@ public:
     //
     // The budget bounds how many distinct resources `GetDesc()` is called on.
     // On a resource met in a barrier that is believed safe but not proven (a
-    // `GetDesc()` at view creation crashed a game; DEBUGGING.md). UE's
+    // `GetDesc()` at view creation crashed a game). UE's
     // transient allocator creates resources all session, so the budget runs
     // out; that is logged, and a reopen refills it. The seen set holds bare
     // pointers, so a recycled address reads as already seen: a resource can be

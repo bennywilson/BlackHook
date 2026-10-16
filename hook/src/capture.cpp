@@ -311,7 +311,7 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 
 // ---------------------------------------------------------------------------
 // Background writer. Disk I/O stays off the render thread: a synchronous write
-// per frame is a stall, and stalls have exposed bugs in games (DEBUGGING.md).
+// per frame is a stall, and stalls have exposed bugs in games.
 // The render thread only copies the bytes out and hands them over.
 // ---------------------------------------------------------------------------
 
@@ -698,7 +698,7 @@ void TruncateFramesCsv()
 }
 
 // ---------------------------------------------------------------------------
-// manifest.json (schema: docs/REFACTOR_PLAN.md sec 4.1). Depth's layout lists
+// manifest.json. Depth's layout lists
 // both planes: D24S8 and D32S8 keep depth in plane 0 and stencil in plane 1,
 // with different formats and row pitches.
 
@@ -928,7 +928,7 @@ std::string BuildManifest()
         {
             // Rides the game's list like velocity's, but its coverage is
             // not graded.
-            j += ",\n      \"coverage_note\": \"not evaluated - see docs/REFACTOR_PLAN.md finding 1.2\"\n";
+            j += ",\n      \"coverage_note\": \"fence coverage is not evaluated for this surface\"\n";
         }
         j += std::string("    }") + (i + 1 < kSurfaceCount ? ",\n" : "\n");
     }
@@ -961,9 +961,7 @@ std::string BuildManifest()
 
     j += "  \"frames\": {\n";
     j += "    \"file\": \"frames.csv\",\n";
-    j += "    \"columns\": [\"capture_index\", \"game_frame_index\"],\n";
-    j += "    \"note\": \"wider columns (layout_epoch, surfaces_mask, coverage) arrive in Phase 5; this "
-         "dump's frames.csv is the 2-column format\"\n";
+    j += "    \"columns\": [\"capture_index\", \"game_frame_index\"]\n";
     j += "  },\n";
 
     j += "  \"integrity\": {\n";

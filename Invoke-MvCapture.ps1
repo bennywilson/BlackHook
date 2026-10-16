@@ -19,7 +19,7 @@
       refused without -Force.
     - A target that already has an mv_hook.dll loaded is refused: the same path
       only bumps a reference count, and a different path patches the vtables
-      twice (DEBUGGING.md, "Something double-injects mv_hook.dll").
+      twice. Something on this machine has injected the hook unasked before.
 
 .PARAMETER Game
     The game's launcher (Valfreyja.exe); the renderer is found from it. With
@@ -384,7 +384,7 @@ if (-not $hookState.Ok) {
     } else {
         Write-Warn2 'These are DIFFERENT files from the one about to be injected. Injecting would map a second independent copy, double-patching the same vtables.'
     }
-    Write-Warn2 'Something on this machine injects the main-checkout mv_hook.dll into fresh Skyrunner processes unprompted - see DEBUGGING.md.'
+    Write-Warn2 'Something on this machine injects the main-checkout mv_hook.dll into fresh Skyrunner processes unprompted.'
 
     if (-not $Force) {
         Fail ("refusing to inject on top of an existing copy.`n" +
