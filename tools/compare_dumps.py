@@ -1,35 +1,22 @@
 """Are two capture dumps equivalent?
 
-The regression oracle for the Surface migration (docs/REFACTOR_PLAN.md): every
-phase that is supposed to change no behaviour is verified by capturing a dump
-before and after and running this.
+Checks that a change left captured bytes alone: capture a dump with the build
+before and after it, and compare.
 
-WHAT IS AND IS NOT REPRODUCIBLE, because it decides how this compares:
+Two runs never capture the same frames: when all four ring slots are in flight
+the hook skips a frame, and that depends on timing (two 240-frame testhost runs
+captured 84 and 86). The content of a given game frame is reproducible (61 of
+61 shared frames byte-identical across velocity, depth and colour), so frames
+are matched by the game frame index in frames.csv, not by capture index.
 
-A dump is NOT byte-identical run to run, and no refactor will make it so. Which
-frames land depends on slot contention - all four ring slots being in flight
-makes the hook skip a frame by design (see g_noFreeSlot in capture.cpp) - and
-that is a function of GPU/CPU timing, not of the code under test. Two runs of
-mv_testhost at 240 frames were measured at 84 and 86 captured frames.
-
-What IS reproducible is the CONTENT of a given game frame. Measured across two
-runs sharing 61 game frames: velocity, depth and colour all byte-identical, 61
-of 61, for all three. So the comparison keys on the game frame index that
-frames.csv records - not on the capture index, which is just a counter of what
-was drained and means nothing across runs.
-
-Consequence worth stating: this proves equivalence on the frames both runs
-happened to capture. A phase that broke capture for, say, only the first frame
-after a reopen could hide in the frames one run missed. The intersection size is
-therefore printed and gated - a comparison over a handful of frames is reported
-as WEAK rather than passed.
+This proves equivalence only on frames both runs captured, so the number of
+shared frames is printed, and below `--min-common` the result is WEAK.
 
 Usage:
     python compare_dumps.py <before_dir> <after_dir>
     python compare_dumps.py <before_dir> <after_dir> --min-common 40
 
-Exit code 0 if equivalent, 1 if not, 2 if the comparison was too weak to mean
-anything.
+Exit code 0 if equivalent, 1 if not, 2 if too few frames were shared.
 """
 import argparse
 import hashlib
@@ -56,12 +43,8 @@ def surfaces(*manifests):
 
 
 def load_frame_map(dump_dir):
-    """game frame index -> capture index.
-
-    Inverted deliberately. The capture index is a counter of what this run
-    managed to drain and is not comparable across runs; the game frame index is
-    the engine's own clock and is.
-    """
+    """game frame index -> capture index. The game frame index is comparable
+    across runs; the capture index is not."""
     path = os.path.join(dump_dir, "frames.csv")
     if not os.path.exists(path):
         return None
@@ -88,13 +71,10 @@ def blob_hash(dump_dir, prefix, capture_index):
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
-# manifest.json fields that differ between two runs of the SAME build, so
-# comparing them would make the oracle fail on every run. Two kinds:
-#   - provenance: which build/profile, and when. Differs by design across the
-#     change under test; shown, not judged. A profile that changes behaviour
-#     shows up in the blobs and in the fields that ARE compared.
-#   - timing: how many frames the writer drained vs dropped under backpressure
-#     is GPU/CPU timing, the same reason frames are keyed on game frame index.
+# manifest.json fields that differ between two runs of the same build, shown but
+# not compared:
+#   - provenance: which build and profile, and when;
+#   - timing: frames drained or dropped under backpressure.
 RUN_VARYING = {
     "producer.commit", "producer.configured_utc", "producer.built",
     "session.started_utc", "session.sealed_utc",
@@ -125,10 +105,8 @@ def diff_metadata(before_meta, after_meta):
             f"manifest.json missing: before={before_meta is not None} after={after_meta is not None}"
             " (written when a burst SEALS - a short testhost run never gets there)")
         return problems, varying
-    # A surface entry with present:false describes data that does not exist -
-    # e.g. normals, which a newer hook lists as "not_enabled" and an older one
-    # does not list at all. Neither side has blobs for it, so it is not dump
-    # content; shown, not compared. A PRESENT surface is compared in full.
+    # A surface with present:false has no data (normals is "not_enabled" in a
+    # newer dump and absent from an older one), so it is shown, not compared.
     for side, meta in (("before", before_meta), ("after", after_meta)):
         for name, surface in list(meta.get("surfaces", {}).items()):
             if isinstance(surface, dict) and not surface.get("present", False):

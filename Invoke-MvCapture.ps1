@@ -1,86 +1,59 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Launch a UE5 game with the motion-vector capture environment set correctly,
-    wait for its real render process, and inject mv_hook.dll into it.
+    Launch a UE5 game with the capture environment set, wait for its render
+    process, and inject mv_hook.dll into it.
 
 .DESCRIPTION
-    Every step this automates is a documented way to lose a session:
-
-      * MV_DUMP_DIR / MV_ENGINE_VERSION reach the render process only by
-        INHERITANCE from the shell that launches the game. Setting them against
-        an already-running game does nothing, and the failure is silent - the
-        capture just lands in the wrong place, or the manifest records no engine
-        version and the offline decode falls back to a default for channels 2/3.
-        This script sets them before Start-Process, so they are inherited.
-
-      * The launcher is not the renderer. Valfreyja.exe spawns
-        Skyrunner-Win64-Shipping.exe; Oxi.exe spawns Oxi-Win64-Shipping.exe.
-        Injecting into the launcher hooks a process with no D3D12 device.
-        This script waits for the *-Win64-Shipping child and injects there.
-
-      * Some titles exit immediately unless their working directory is their
-        own folder. Start-Process is given -WorkingDirectory accordingly.
-
-      * Injecting into a process that is still starting up has crashed a
-        target before. This script waits -SettleSeconds after the render
-        process appears.
-
-      * A reinjection restarts the capture index at 0 and overwrites
-        vel_00000.bin. The default dump directory here is timestamped and
-        fresh, and a non-empty one is refused without -Force.
-
-      * mv_hook.dll already loaded in the target changes what injection means
-        (same path = a reference-count bump, no second DllMain; different path
-        = a second independent copy double-patching the same vtables). On a
-        shared machine this happens without anyone asking. This script
-        enumerates the target's modules and refuses to make it worse.
-
-    See DEBUGGING.md ("Something double-injects mv_hook.dll into Skyrunner,
-    unprompted") for the incidents behind these.
+    - The MV_* variables reach the game only by inheritance from the process
+      that launches it, so the script sets them before Start-Process. Set
+      against a running game they do nothing.
+    - The launcher is not the renderer: Valfreyja.exe starts
+      Skyrunner-Win64-Shipping.exe. The script waits for the *-Win64-Shipping
+      process and injects there.
+    - Some titles exit at once unless started in their own folder, so the
+      working directory is set.
+    - Injecting while the process is still starting has crashed a game, so the
+      script waits -SettleSeconds first.
+    - Each injection restarts the capture index at 0, so the default dump
+      directory is new and timestamped, and a directory with captures in it is
+      refused without -Force.
+    - A target that already has an mv_hook.dll loaded is refused: the same path
+      only bumps a reference count, and a different path patches the vtables
+      twice (DEBUGGING.md, "Something double-injects mv_hook.dll").
 
 .PARAMETER Game
-    Path to the game executable to launch - the launcher (Valfreyja.exe,
-    Oxi.exe) is correct here; the child renderer is found automatically. With
-    -AttachOnly this may instead be a bare process name
-    (Skyrunner-Win64-Shipping.exe) of something already running.
+    The game's launcher (Valfreyja.exe); the renderer is found from it. With
+    -AttachOnly, the name of a running process (Skyrunner-Win64-Shipping.exe).
 
 .PARAMETER EngineVersion
-    major.minor, e.g. 5.2. Recorded in manifest.json and required by the offline
-    decode for channels 2/3, which 5.2 and 5.7 pack differently. Inferred from
-    the executable name for titles this repo knows; otherwise you must pass it,
-    because a wrong value here silently corrupts V.z and bHasPixelAnimation.
-    Also picks the surface profile: 5.2 -> ue5.2-generic (profiles/ue5.json).
+    major.minor, e.g. 5.2. Recorded in manifest.json and needed to decode
+    velocity channels 2 and 3, which 5.2 and 5.7 pack differently; a wrong
+    value gives a wrong V.z and bHasPixelAnimation. Inferred for titles listed
+    below, otherwise required. Also picks the profile (5.2 -> ue5.2-generic).
 
 .PARAMETER SurfaceProfile
-    Surface profile name from profiles/ue5.json, overriding the one derived
-    from EngineVersion. A name that does not exist disables identification
-    (the hook log says so) rather than falling back.
+    A profile from profiles/ue5.json, instead of the one EngineVersion picks. An
+    unknown name disables identification and the hook log says so.
 
 .PARAMETER Surfaces
-    Optional surfaces to capture as well, comma-separated: "normals" (UE5's
-    GBufferA) and "specular" (GBufferB), both experimental. Read their lines in
-    the hook log before trusting the result.
+    Optional surfaces to capture as well: "normals" (GBufferA), "specular"
+    (GBufferB), or both. Check their lines in the hook log on a new title.
 
 .PARAMETER DumpDir
-    Where captures go. Defaults to a fresh timestamped directory under the
-    repo's gitignored temp\dumps\.
+    Where captures go. Default: a new timestamped directory in temp\dumps\.
 
 .PARAMETER Hook
-    Path to mv_hook.dll. Defaults to the repo's Release build in temp\build\.
+    Path to mv_hook.dll. Default: the Release build in temp\build\.
 
 .PARAMETER RenderProcess
-    Process-name pattern for the real renderer. Defaults to *-Win64-Shipping,
-    the UE5 shipping-build convention.
+    Process-name pattern of the renderer. Default *-Win64-Shipping.
 
 .PARAMETER SettleSeconds
-    How long to wait after the render process appears before injecting.
-    Default 8. Racing startup has crashed a target.
+    Wait after the render process appears before injecting. Default 8.
 
 .PARAMETER AttachOnly
-    Do not launch anything; inject into an already-running process. The MV_*
-    environment variables CANNOT be applied this way - the script says so
-    rather than pretending they took effect.
+    Inject into a running process without launching. The MV_* variables
+    cannot reach it this way, and the script says so.
 
 .EXAMPLE
     .\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe
@@ -88,6 +61,7 @@
 .EXAMPLE
     .\Invoke-MvCapture.ps1 .\testgames\skyrunner\Valfreyja.exe -DumpDir D:\mv_captures\run7 -AutoCapture
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
@@ -110,9 +84,8 @@ param(
     [switch] $NoCaptureDepth,
     [switch] $Force,
 
-    # Do everything except the injection itself: launch, find the render
-    # process, settle, and run the already-loaded check. Use it to confirm the
-    # script picks the process you expect before committing to a real session.
+    # Everything up to the injection: launch, find the render process, settle,
+    # and check for a loaded hook. Confirms the target before a real session.
     [switch] $DryRun
 )
 
@@ -157,17 +130,15 @@ if (-not (Test-Path -LiteralPath $Hook)) {
     Fail ("mv_hook.dll not found at $Hook`n" + $buildHint)
 }
 
-# The injector writes this exact path into the target with WriteProcessMemory
-# for the remote LoadLibraryW call - it must be absolute, or LoadLibraryW
-# resolves it against the GAME's working directory, not ours.
+# The injector passes this path to LoadLibraryW in the target, so it must be
+# absolute; a relative path resolves against the game's working directory.
 $Hook       = (Resolve-Path -LiteralPath $Hook).Path
 $injectorEx = (Resolve-Path -LiteralPath $injectorEx).Path
 
 # --------------------------------------------------------- engine version ---
 
-# Only titles this repo has actually established a version for. Anything else
-# must be supplied: guessing here silently mis-decodes channels 2 and 3, which
-# is a failure mode this project has already paid for once.
+# Titles with a known engine version. Any other must be given: a wrong guess
+# mis-decodes velocity channels 2 and 3.
 $knownEngineVersions = @{
     'valfreyja'                  = '5.2'
     'skyrunner-win64-shipping'   = '5.2'
@@ -212,9 +183,8 @@ function Get-MatchingProcesses {
 function Get-HookModules {
     param([System.Diagnostics.Process]$Process)
 
-    # Can legitimately fail (elevated target, or the process is mid-teardown).
-    # A failure here is "unknown", not "none" - the caller must not read an
-    # empty result as proof the target is clean.
+    # Can fail (an elevated target, or one shutting down). Failure means
+    # "unknown", not "none": the caller must not read it as a clean target.
     try {
         $mods = $Process.Modules | Where-Object { $_.ModuleName -like '*mv_hook*' }
         return @{ Ok = $true; Modules = @($mods) }
@@ -228,16 +198,12 @@ function Invoke-Injector {
 
     Write-Note "$injectorEx $($Arguments -join ' ')"
 
-    # $stdout must be CAPTURED, not left on the output stream. A PowerShell
-    # function returns everything written to that stream, so an uncaptured
-    # native command's stdout gets concatenated with the exit code below and
-    # the caller receives an array - which then compares "-ne 0" as true and
-    # turns a successful injection into a reported failure. That is not
-    # hypothetical: it is exactly what this function did on its first live run.
+    # Capture $stdout: a function returns everything written to the output
+    # stream, so uncaptured native output would be returned along with the exit
+    # code, and the caller's "-ne 0" check would report failure on success.
     #
-    # stderr is deliberately NOT redirected here. It flows straight to the
-    # console, which is what we want, and 2>&1 under PS 5.1 wraps each stderr
-    # line in an ErrorRecord and flips $? even when the process exits 0.
+    # stderr goes straight to the console. Redirecting it (2>&1) under PS 5.1
+    # wraps each line in an ErrorRecord and sets $? false even on exit code 0.
     $stdout = & $injectorEx @Arguments
     $exit   = $LASTEXITCODE
 
@@ -249,9 +215,8 @@ function Invoke-Injector {
 
 Write-Step 'Pre-flight'
 
-# RenderDoc's global hook wraps ID3D12GraphicsCommandList and doubles every
-# barrier observation, producing a tidier profile than the truth - it has
-# already contaminated one set of measurements in this project.
+# RenderDoc's global hook wraps ID3D12GraphicsCommandList, so every barrier is
+# seen twice and the barrier profiles are wrong.
 $renderDoc = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'qrenderdoc*' -or $_.Name -like 'renderdoccmd*' })
 if ($renderDoc.Count -gt 0) {
     Write-Warn2 "RenderDoc is running (pid $($renderDoc[0].Id)). If its GLOBAL hook is enabled, every barrier is observed twice and the identification profile is wrong. Turn the global hook off, not just this window."
@@ -269,8 +234,7 @@ if ($AttachOnly) {
 
 $gameLeaf = Split-Path -Leaf $Game
 
-# Engine version is required for a launch, since that is the only moment it can
-# still be applied.
+# The engine version is needed at launch, the only time it can be set.
 $resolvedVersion = Resolve-EngineVersion -ExeName $gameLeaf -Supplied $EngineVersion
 if (-not $AttachOnly) {
     if (-not $resolvedVersion) {
@@ -316,9 +280,8 @@ $launchWatermark = $null
 if (-not $AttachOnly) {
     Write-Step "Launching $gameLeaf"
 
-    # Set these in THIS process so Start-Process passes them down. Start-Process
-    # inherits the caller's environment block unless -UseNewEnvironment is given,
-    # which is exactly why that switch must not be used here.
+    # Set in this process, so Start-Process passes them on (it inherits the
+    # environment unless -UseNewEnvironment is given).
     $env:MV_DUMP_DIR       = $DumpDir
     $env:MV_ENGINE_VERSION = $resolvedVersion
     if ($SurfaceProfile) { $env:MV_PROFILE       = $SurfaceProfile } else { Remove-Item Env:\MV_PROFILE       -ErrorAction SilentlyContinue }
@@ -329,8 +292,8 @@ if (-not $AttachOnly) {
     $workingDir = Split-Path -Parent $Game
     Write-Note "working directory: $workingDir  (some titles exit immediately without this)"
 
-    # Watermark slightly before launch: process start times have coarse
-    # resolution, and a child that starts in the same tick must not be missed.
+    # Slightly before launch: process start times are coarse, and a child
+    # started in the same tick must still count.
     $launchWatermark = (Get-Date).AddSeconds(-2)
 
     $startArgs = @{
@@ -348,9 +311,8 @@ if (-not $AttachOnly) {
 # ------------------------------------------------- find the render process --
 
 if ($AttachOnly) {
-    # Attaching: accept a process that was already running, and match on the
-    # name actually passed rather than the launch-time default - otherwise the
-    # message names one pattern while the search uses another.
+    # Attaching: accept a process already running, and match the name passed
+    # in rather than the launch pattern.
     $pattern = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path -Leaf $Game))
     if ($PSBoundParameters.ContainsKey('RenderProcess')) { $pattern = $RenderProcess }
     Write-Step "Looking for the render process (pattern: $pattern)"
@@ -375,9 +337,8 @@ if ($AttachOnly) {
     }
 }
 
-# mv_injector matches the target by NAME and takes whichever the snapshot
-# returns first. With two matches that is a coin flip, so refuse rather than
-# inject into an arbitrary one.
+# mv_injector picks its target by name and takes the first match, so with two
+# matches the script refuses.
 if ($candidates.Count -gt 1) {
     Write-Warn2 "more than one process matches '$RenderProcess':"
     foreach ($c in $candidates) { Write-Warn2 "      pid $($c.Id)  $($c.Name)" }
@@ -458,8 +419,8 @@ Write-Ok 'Injection reported success.'
 Write-Step 'Confirming from the hook log'
 Write-Note $logPath
 
-# The injector can only report that LoadLibraryW returned non-NULL. That the
-# hook actually came up is a separate claim, and it is in the log.
+# The injector only knows LoadLibraryW returned non-NULL; the log says whether
+# the hook started.
 $deadline = (Get-Date).AddSeconds(15)
 $sawInit  = $false
 while ((Get-Date) -lt $deadline) {

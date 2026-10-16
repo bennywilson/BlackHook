@@ -36,8 +36,8 @@ struct ProfileError : std::runtime_error
     throw ProfileError(message);
 }
 
-// SurfaceSpec carries const char* (it is plain data, copied around freely).
-// The strings behind them live here for the rest of the process.
+// `SurfaceSpec` holds `const char*`; the strings behind them live here for the
+// rest of the process.
 const char* Intern(const std::string& s)
 {
     static std::deque<std::string> pool;
@@ -52,10 +52,10 @@ struct Named
     T value;
 };
 
-// Names, not numbers: confusing DXGI 10 (R16G16B16A16_FLOAT) with 11
-// (_UNORM) is the error that cost this project the most (DEBUGGING.md). Only
-// formats a UE5 velocity/depth/GBuffer target can plausibly use; anything else
-// is a profile error until someone adds it here on purpose.
+// Formats by name: DXGI 10 (R16G16B16A16_FLOAT) mistaken for 11 (_UNORM) cost
+// this project more than any other error (DEBUGGING.md). Only formats a UE5
+// velocity, depth or GBuffer target can use; any other is a profile error until
+// added here.
 constexpr Named<DXGI_FORMAT> kFormats[] = {
     {"R16G16B16A16_FLOAT", DXGI_FORMAT_R16G16B16A16_FLOAT},
     {"R16G16B16A16_UNORM", DXGI_FORMAT_R16G16B16A16_UNORM},
@@ -63,9 +63,8 @@ constexpr Named<DXGI_FORMAT> kFormats[] = {
     {"R10G10B10A2_UNORM", DXGI_FORMAT_R10G10B10A2_UNORM},
     {"R8G8B8A8_UNORM", DXGI_FORMAT_R8G8B8A8_UNORM},
     {"B8G8R8A8_UNORM", DXGI_FORMAT_B8G8R8A8_UNORM},
-    // UE creates its 8-bit GBuffers TYPELESS (so it can view them as sRGB or
-    // linear): on Skyrunner every 8-bit scene-extent render target is
-    // B8G8R8A8_TYPELESS (90).
+    // UE creates its 8-bit GBuffers TYPELESS, to view them as sRGB or linear.
+    // On Skyrunner every 8-bit scene-extent render target is B8G8R8A8_TYPELESS.
     {"B8G8R8A8_TYPELESS", DXGI_FORMAT_B8G8R8A8_TYPELESS},
     {"B8G8R8A8_UNORM_SRGB", DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
     {"R8G8B8A8_TYPELESS", DXGI_FORMAT_R8G8B8A8_TYPELESS},
@@ -138,9 +137,9 @@ const char* FormatName(DXGI_FORMAT format)
     return "?";
 }
 
-// One JSON object's fields, read strictly: every read marks its key, and
-// RejectUnknown() then fails on anything left over - a misspelt key must not
-// quietly leave a value at zero.
+// One JSON object's fields, read strictly: each read marks its key, and
+// `RejectUnknown()` fails on any key left over, so a misspelt field cannot
+// leave a value at zero.
 class Fields
 {
 public:
@@ -314,8 +313,8 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         const std::string signalName = sf.String("signal");
         signal.id = Lookup(kSignals, signalName, "signal", sf.Path("signal"));
         signal.weight = static_cast<int>(sf.Int("weight", -100, 100));
-        // Parameters exist only on shares_call_with_edge; on any other signal
-        // RejectUnknown() below refuses them, so they cannot be set and ignored.
+        // Parameters exist only on `shares_call_with_edge`; on any other signal
+        // `RejectUnknown()` refuses them.
         if (signal.id == SignalId::SharesCallWithEdge)
         {
             signal.edge = Lookup(kTriggers, sf.String("edge"), "edge", sf.Path("edge"));
@@ -324,8 +323,8 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         sf.RejectUnknown();
         for (uint8_t j = 0; j < spec.signalCount; ++j)
         {
-            // Two shares_call_with_edge entries on different edges are
-            // distinct evidence; any other repeat is a mistake.
+            // Two `shares_call_with_edge` entries on different edges are
+            // separate evidence; any other repeat is a mistake.
             if (spec.signals[j].id == signal.id &&
                 (signal.id != SignalId::SharesCallWithEdge || spec.signals[j].edge == signal.edge))
             {
@@ -348,7 +347,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         spec.rivalFramesBeforeAdopt = static_cast<uint64_t>(rival.Int("frames_before_adopt", 1, 100000));
         spec.rivalMaxAdoptions = static_cast<int>(rival.Int("max_adoptions", 0, 100000));
         spec.rivalMaxReports = static_cast<int>(rival.Int("max_reports", 0, 100000));
-        // Optional; absent == false (velocity's long-standing behaviour).
+        // Optional; absent means false.
         if (const json* same = rival.Optional("same_descriptor"))
         {
             if (!same->is_boolean())
@@ -363,7 +362,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
     // --- lifecycle ---------------------------------------------------------
     spec.reopenClearsShortlist = f.Bool("reopen_clears_shortlist");
 
-    // Optional; absent == enabled.
+    // Optional; absent means enabled.
     spec.enabled = true;
     if (const json* enabled = f.Optional("enabled"))
     {
@@ -424,9 +423,9 @@ void AddProfiles(ProfileSet& set, const std::string& text, const std::string& so
     top.RejectUnknown();
 }
 
-// The named profile with its "extends" chain applied, as an RFC 7386 merge
-// patch over the base: objects merge field by field, arrays replace whole -
-// so narrowing a format list is just restating it.
+// The named profile with its "extends" chain applied as an RFC 7386 merge
+// patch: objects merge field by field and arrays are replaced, so narrowing a
+// format list means restating it.
 json Resolve(const ProfileSet& set, const std::string& name, int depth)
 {
     if (depth > 8)
@@ -564,8 +563,8 @@ void Load()
     const json& surfacesJson = profile.Required("surfaces");
     Fields surfaces(surfacesJson, profile.Path("surfaces"));
     // velocity and depth are required and always on: every dump is keyed off
-    // velocity, and depth's extent link and burst atomicity assume it. Any
-    // other surface name is a mistake worth hearing about.
+    // velocity, and depth is sized from it and required per burst. Any other
+    // surface name is an error.
     g_profile.velocity = ParseSurface(surfaces.Required("velocity"), "velocity", surfaces.Path("velocity"));
     g_profile.depth = ParseSurface(surfaces.Required("depth"), "depth", surfaces.Path("depth"));
     for (const SurfaceSpec* spec : {&g_profile.velocity, &g_profile.depth})
@@ -604,9 +603,8 @@ void Load()
         g_profile.overrides = "velocity.settle_frames=" + std::to_string(frames) + " (MV_IDENTIFY_FRAMES)";
     }
 
-    // MV_SURFACES: comma-separated optional surfaces to switch on for this run.
-    // A name that is not optional, or that this profile has no spec for, is an
-    // error, not a no-op.
+    // MV_SURFACES: comma-separated optional surfaces to turn on. A name that is
+    // not optional, or has no spec in this profile, is an error.
     std::istringstream optIn(EnvVar("MV_SURFACES"));
     std::string surface;
     while (std::getline(optIn, surface, ','))
@@ -662,7 +660,7 @@ void Load()
     };
     for (const SurfaceSpec* spec : all)
     {
-        // Follow the chain: a loop would recurse forever in the reopen cascade.
+        // A loop would recurse forever in the reopen cascade.
         size_t hops = 0;
         for (const SurfaceSpec* s = spec; s->extentFrom != nullptr; ++hops)
         {

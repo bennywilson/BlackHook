@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Runs every mv_testhost mode against the built hook, one at a time, each with a timeout.
@@ -18,6 +17,7 @@
     .\tools\run_testhost_suite.ps1
     .\tools\run_testhost_suite.ps1 -Overlay -Baseline temp\base\temp\build\hook\Release\mv_hook.dll
 #>
+#Requires -Version 5.1
 param(
     [switch] $Overlay,
     [string] $Baseline,

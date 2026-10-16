@@ -1,38 +1,23 @@
 """Test the SceneVelocity decode against measured motion, per pixel.
 
-What this replaces, and why, because the old version's number is quoted in
-places and should not be trusted:
+Regresses per pixel, over the written region, against block matching
+(blockmatch.py). Three questions:
 
-The previous derive_scale.py regressed the per-frame *spatial mean* of the raw
-velocity channels against the per-frame spatial mean of Farneback optical flow
-- about 18 scalar pairs for a whole capture. Two things are wrong with that.
-The mask spans objects moving in different directions, so averaging attenuates
-each side by a different factor and the resulting slope is not an estimator of
-anything per-pixel. And Farneback is unreliable on exactly this footage (large,
-smooth, low-texture surfaces), where it reports near-zero and looks confident.
-Its output, -193/+207 px per UNORM unit, is what the "~10x disagreement with
-Common.ush" was built on.
+  1. What is the exponent? Fit  measured_px = k * |code_offset|^p  in log-log.
+     p ~ 1 means the encoding is linear in the stored code; p ~ 2 means the code
+     is a square root of the displacement (VELOCITY_ENCODE_GAMMA on). The
+     engine source says 2 (Common.ush:2062); fitting it checks what the
+     shipping shaders did.
 
-This version regresses per pixel, over the written region, against block
-matching (blockmatch.py) rather than optical flow. It asks three questions:
+  2. Is the decode unbiased? Regress measured against
+     `mvtools.decode_velocity`. A correct decode gives slope 1, intercept 0.
+     Nothing here feeds back into the constants.
 
-  1. WHAT IS THE EXPONENT?  Fit  measured_px = k * |code_offset|^p  in log-log.
-     This is the part that does not assume the answer. p ~ 1 means the encoding
-     is linear in the stored code; p ~ 2 means the stored code is a square root
-     of the displacement, i.e. VELOCITY_ENCODE_GAMMA is on. The engine says 2
-     (Common.ush:2062); the point of fitting it is to not have to take the
-     engine's word for it, since the shipping binary's shaders are what
-     actually ran, not the source tree on disk.
+  3. How does a linear decode compare? The same regression with linear
+     constants.
 
-  2. IS THE DECODE UNBIASED?  Regress measured against mvtools.decode_velocity.
-     A correct decode gives slope 1, intercept 0. This is a validation, not a
-     fit: nothing here feeds back into the constants.
-
-  3. HOW DOES THE OLD LINEAR DECODE COMPARE?  Same regression against the
-     legacy constants, so the improvement is a number rather than a claim.
-
-Needs a capture with real motion. On a near-static capture the log-log fit has
-no dynamic range and the script says so instead of returning a number.
+Needs a capture with real motion; on a near-static one the log-log fit has no
+range, and the script says so.
 
 Usage:  python derive_scale.py [dump_dir] [stride]
 """
@@ -54,10 +39,9 @@ cw, ch = dump.surface("color").width, dump.surface("color").height
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
 
-# Block-matching parameters. SEARCH bounds the measurable displacement; WINDOW
-# is the correlation window. MIN_CONFIDENCE drops pixels where the SAD minimum
-# is not distinct enough to localise - flat walls, sky, the inside of a smooth
-# surface - which is precisely where optical flow would have silently returned
+# Block matching. SEARCH bounds the measurable displacement; WINDOW is the
+# correlation window. MIN_CONFIDENCE drops pixels whose SAD minimum is not
+# distinct (flat walls, sky, smooth surfaces), where optical flow would report
 # a confident zero.
 SEARCH = 12
 WINDOW = 17
@@ -72,11 +56,9 @@ def gray(i):
     return (np.clip(c, 0, 1) * 255).astype(np.float32).mean(axis=2)
 
 
-# Dense block matching is the expensive part of this project's tooling: every
-# pair costs 2*(2*SEARCH+1)^2 box-filtered full-resolution passes. Pooling more
-# than a dozen pairs adds hundreds of thousands of pixels to a regression that
-# already has hundreds of thousands, so it buys precision that is far below the
-# systematic uncertainty and costs minutes. Capped rather than left to grow.
+# Dense block matching is the slow part: 2*(2*SEARCH+1)^2 full-resolution
+# passes per pair. A dozen pairs already give hundreds of thousands of pixels;
+# more add minutes and no useful precision.
 MAX_PAIRS = 12
 
 pairs, adjacency_note = mvtools.consecutive_pairs(dump_dir, indices)
@@ -94,11 +76,9 @@ for prev_i, cur_i in pairs:
     raw = mvtools.load_velocity_raw(vel_path, meta)
     flow_uv = mvtools.decode_velocity(vel_path, meta)
 
-    # Everything is compared at output resolution: that is where the imagery
-    # is, and therefore where the ground truth is measurable. The velocity
-    # buffer is at render resolution, so it is the one that gets resampled -
-    # nearest-neighbour, because bilinear across the edge of a written region
-    # blends real values with the cleared value and invents motion.
+    # Compared at output resolution, where the images are. The velocity buffer
+    # is resampled, nearest-neighbour: bilinear at the edge of a written region
+    # would blend in the cleared value and show motion that is not there.
     def up(a, interp=cv2.INTER_NEAREST):
         return cv2.resize(a, (cw, ch), interpolation=interp)
 
@@ -109,12 +89,10 @@ for prev_i, cur_i in pairs:
     measured, confidence, clipped = blockmatch.dense(
         gray(cur_i), gray(prev_i), search=SEARCH, window=WINDOW)
     good = mask & (confidence > MIN_CONFIDENCE)
-    # Drop matches pinned to the edge of the search window - those are clipped,
-    # not measured, and would flatten the high end of the fit. blockmatch now
-    # reports this directly: with coarse-to-fine matching the total displacement
-    # legitimately exceeds the window, so testing |flow| < SEARCH here would
-    # throw away every fast-moving pixel - which on a title moving 15-70px per
-    # frame is all of them, leaving a fit over nothing but the slowest 1%.
+    # Drop matches pinned to the edge of the search window: they are clipped,
+    # not measured. `blockmatch` reports this itself; testing |flow| < SEARCH
+    # instead would drop every pixel faster than the window, on a title moving
+    # 15-70 px per frame nearly all of them.
     good &= ~clipped
     if good.sum() < 2000:
         continue
@@ -139,12 +117,9 @@ print(f"measured displacement: |x| p50={np.percentile(np.abs(meas_x),50):.2f}px 
       f"|y| p50={np.percentile(np.abs(meas_y),50):.2f}px "
       f"p99={np.percentile(np.abs(meas_y),99):.2f}px")
 
-# A regression needs the independent variable to vary. Below a couple of pixels
-# of real motion the whole capture sits inside block matching's own noise, and
-# every fit below will return a slope near zero with R^2 near zero - which is a
-# statement about the footage, not about the decode. Say so loudly rather than
-# letting a reader take the numbers at face value; a previous version of this
-# script reported exactly such a slope as if it were a measured constant.
+# Below a couple of pixels of real motion the capture sits inside block
+# matching's noise, and every fit returns slope ~0 and R^2 ~0: a fact about the
+# footage, not the decode. Warn instead of reporting it as a constant.
 DEGENERATE = p99 < 2.0
 if DEGENERATE:
     print("\n" + "=" * 72)
@@ -234,11 +209,8 @@ for ax, name, dec, leg, meas in (
         h.set_alpha(1.0)
 fig.suptitle("SceneVelocity decode vs measured image motion, per pixel")
 fig.tight_layout()
-# MV_RESULT_TAG names the title this run came from. Without it, running any
-# tool against a second game silently overwrites the first game's committed
-# figures - the same class of loss as the capture that was overwritten and
-# could not be regenerated, and this one is easy to not notice because the file
-# still exists and still looks plausible.
+# MV_RESULT_TAG names the title, so a run on another game does not overwrite
+# the first game's committed figures.
 _tag = os.environ.get("MV_RESULT_TAG", "")
 out = os.path.join(RESULTS, f"decode_scatter{'_' + _tag if _tag else ''}.png")
 fig.savefig(out, dpi=110)

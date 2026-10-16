@@ -14,12 +14,11 @@
 #include <utility>
 #include <vector>
 
-// Finding a scene texture without knowing its descriptor: a structural gate
-// (format table, flags, extent) and then behaviour over a settling window
-// (barrier patterns, scored as evidence, never as a hard rule - every rule
-// measured on one title was false on another). Everything that differs between
-// surfaces is data in a SurfaceSpec, loaded from profiles/ue5.json; there are
-// no per-surface subclasses. SurfaceRegistry (surface_registry.h) owns the
+// Finds a scene texture without knowing its descriptor: a structural gate
+// (format table, flags, extent), then behaviour over a settling window
+// (barrier patterns, scored as evidence; every hard rule measured on one title
+// was false on another). What differs between surfaces is data in a
+// `SurfaceSpec`, loaded from `profiles/ue5.json`. `SurfaceRegistry` owns the
 // identifiers and feeds them from one barrier walk.
 
 namespace mv
@@ -39,8 +38,8 @@ enum class ReopenReason : uint8_t
     DependencyReopened, // e.g. depth reopening because velocity's own search reopened
 };
 
-// Which barrier edge means "this surface was just produced and is about to
-// be consumed" - the one moment a transient/placed resource is safe to copy.
+// The barrier edge that finishes a surface: the one moment the transient
+// resource is complete and safe to copy.
 enum class TriggerEdge : uint8_t
 {
     RenderTargetToShaderResource, // velocity, GBuffers
@@ -49,15 +48,15 @@ enum class TriggerEdge : uint8_t
 constexpr int kTriggerEdgeCount = 2;
 
 // True for any non-empty subset of the shader-resource state bits. UE5's RDG
-// maps SRVMask -> ALL_SHADER_RESOURCE (0x40|0x80) and pixel-shader-only reads
-// (SRVGraphics) -> PIXEL_SHADER_RESOURCE (0x80).
+// maps `SRVMask` to `ALL_SHADER_RESOURCE` (0x40|0x80) and pixel-shader reads
+// (`SRVGraphics`) to `PIXEL_SHADER_RESOURCE` (0x80).
 inline bool IsShaderResourceState(int state)
 {
     return state != 0 && (state & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE) == state;
 }
 
-// True for the states a depth buffer is read in: DEPTH_READ or any subset of
-// the shader-resource bits (UE5 consumes depth both ways).
+// True for the states depth is read in: `DEPTH_READ`, or any subset of the
+// shader-resource bits (UE5 reads depth both ways).
 inline bool IsDepthReadableState(int state)
 {
     if (state == 0)
@@ -69,8 +68,7 @@ inline bool IsDepthReadableState(int state)
     return (state & ~kReadable) == 0;
 }
 
-// The two tests above per TriggerEdge, so per-edge counts are computed once
-// per transition, whatever identifiers exist.
+// The two tests above, per `TriggerEdge`.
 bool IsTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfter) noexcept;
 bool IsReverseTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfter) noexcept;
 
@@ -81,8 +79,8 @@ struct FormatCandidate
     const char* name;
 };
 
-// One weighted piece of evidence, on top of the format-score baseline (see
-// SurfaceSpec::formatScoreGate).
+// One weighted piece of evidence on top of the format-score baseline (see
+// `SurfaceSpec::formatScoreGate`).
 enum class SignalId : uint8_t
 {
     AtModalResolution,
@@ -92,11 +90,11 @@ enum class SignalId : uint8_t
     NeverEntersUnorderedAccess,
     StrictTwoEventsPerFrame,
     NoContinuityViolations,
-    // At least `minPercent` of this resource's trigger edges arrive in the
-    // same ResourceBarrier call as an `edge`-type transition on some OTHER
-    // resource. Measured on Skyrunner: GBufferA/GBufferB become readable
-    // together with scene depth (the passes that read them read depth too);
-    // same-format post-process targets never do.
+    // At least `minPercent` of this resource's trigger edges arrive in the same
+    // `ResourceBarrier` call as an `edge`-type transition on another resource.
+    // On Skyrunner, GBufferA and GBufferB become readable together with scene
+    // depth (the passes that read them read depth too); same-format
+    // post-process targets never do.
     SharesCallWithEdge,
 };
 
@@ -113,14 +111,14 @@ enum class AmbiguityRule : uint8_t
 {
     // Top two survivors must differ by at least `ambiguityMargin` points.
     ScoreMargin,
-    // Separated if scores differ OR the winner's trigger-edge count exceeds
-    // the runner-up's by at least `ambiguityMargin` percent (depth: 150 ==
-    // 1.5x - scene depth takes several edges a frame, CustomDepth at most one).
+    // Separated if the scores differ, or if the winner's trigger-edge count is
+    // at least `ambiguityMargin` percent of the runner-up's (depth: 150; scene
+    // depth takes several edges a frame, CustomDepth at most one).
     EdgeCountRatio,
 };
 
-// Data-only; each field maps to one field of a profile in profiles/ue5.json
-// (parsed by surface_profile.cpp), which documents them.
+// Data only. Each field maps to one field of a profile in `profiles/ue5.json`,
+// which documents them.
 struct SurfaceSpec
 {
     const char* name;
@@ -135,16 +133,16 @@ struct SurfaceSpec
     UINT minHeight;                // 0 == no minimum
     uint8_t maxBackBufferMultiple; // 0 == unbounded
 
-    // Another surface whose live extent this one must match (SurfaceRegistry
-    // wires it, and reopens this one when that one reopens). nullptr for velocity.
+    // The surface whose live extent this one must match; `SurfaceRegistry`
+    // wires it and reopens this one with it. nullptr for velocity.
     const char* extentFrom;
 
     // --- behaviour ------------------------------------------------------
     TriggerEdge trigger;
     uint64_t minFramesObserved;
     uint64_t settleFrames;
-    // The format table's score counts toward the total only at or above this
-    // gate. velocity: 4 (desktop-tier only); others: 0 (always counts).
+    // The format table's score counts toward the total only at or above this.
+    // velocity: 4 (desktop formats only); others: 0 (always counts).
     int formatScoreGate;
     SignalWeight signals[8];
     uint8_t signalCount;
@@ -159,18 +157,18 @@ struct SurfaceSpec
     bool rivalSameDescriptor; // a rival must have the selected one's exact format and flags
 
     // --- lifecycle -----------------------------------------------------
-    // true: a reopen throws away the shortlist and profiles and rescans.
-    // false: keeps them and resets counters only (see Reopen()).
+    // true: a reopen discards the shortlist and profiles and rescans.
+    // false: a reopen keeps them and resets the counters (see `Reopen()`).
     bool reopenClearsShortlist;
 
-    // false: never registered - no identification, no capture, and the
-    // manifest says "not_enabled". MV_SURFACES opts optional surfaces in.
+    // false: not registered. Nothing is identified or captured, and the
+    // manifest says "not_enabled". `MV_SURFACES` turns optional surfaces on.
     bool enabled;
 };
 
-// Per-resource barrier bookkeeping, shared by every identifier: a transition
-// costs one map lookup and one lock however many surfaces exist. The counts
-// that differ between surfaces are indexed by TriggerEdge.
+// Per-resource barrier counts, shared by every identifier: a transition costs
+// one lookup and one lock however many surfaces exist. The counts that differ
+// between surfaces are indexed by `TriggerEdge`.
 struct BarrierProfile
 {
     UINT64 width = 0;
@@ -188,9 +186,9 @@ struct BarrierProfile
     uint64_t reverseEdgeCountByEdge[kTriggerEdgeCount]{};
     int lastReadableStateByEdge[kTriggerEdgeCount] = {-1, -1};
     // [own][other]: this resource's `own`-type trigger edges that arrived in
-    // the same ResourceBarrier call as an `other`-type edge on a different
-    // resource. Fed by SurfaceRegistry::OnBarrierBatch, and only while some
-    // registered spec uses SignalId::SharesCallWithEdge (zero otherwise).
+    // the same `ResourceBarrier` call as an `other`-type edge on a different
+    // resource. Fed by `SurfaceRegistry::OnBarrierBatch` only while some spec
+    // uses `SignalId::SharesCallWithEdge`.
     uint64_t triggerEdgesSharingCallWith[kTriggerEdgeCount][kTriggerEdgeCount]{};
     uint64_t uavBarriers = 0;
     bool sawUnorderedAccess = false;
@@ -207,7 +205,7 @@ struct BarrierProfile
     int pairsUsed = 0;
 };
 
-// The one map of BarrierProfiles, owned by SurfaceRegistry and shared with
+// The one map of `BarrierProfile`s, owned by `SurfaceRegistry` and shared with
 // every identifier.
 class BarrierProfileStore
 {
@@ -216,29 +214,29 @@ public:
     void EnsureProfiled(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
 
     // Records one transition. False if `resource` has no profile (never
-    // seeded, or kMaxProfiledResources was reached first).
+    // seeded, or `kMaxProfiledResources` was reached).
     bool RecordTransition(ID3D12Resource* resource, uint64_t frame, int stateBefore, int stateAfter) noexcept;
 
     void RecordUav(ID3D12Resource* resource) noexcept;
 
-    // One `own`-type trigger edge of `resource` shared its ResourceBarrier
+    // One `own`-type trigger edge of `resource` shared its `ResourceBarrier`
     // call with an `other`-type edge on a different resource.
     void RecordSharedCall(ID3D12Resource* resource, TriggerEdge own, TriggerEdge other) noexcept;
 
-    // Copies out the current profile, if one exists.
+    // Copies out the profile, if there is one.
     bool Get(ID3D12Resource* resource, BarrierProfile* out) const noexcept;
 
-    // Resets every profile's counters (keeping width/height/format/flags), for
-    // the empty-survivors retry. Safe although shared: a dependent surface
-    // decides only after its extent source has, and a decided identifier never
-    // re-enters Decide(), so no reset lands mid-decision.
+    // Resets every profile's counters, keeping the descs, for the
+    // empty-survivors retry. Safe although shared: a dependent decides only
+    // after its source has, and a decided identifier never re-enters
+    // `Decide()`, so no reset lands mid-decision.
     void ResetMeasurement() noexcept;
 
-    // Drops every profile (a reopen with reopenClearsShortlist). A dependent's
-    // own reopen keeps its shortlist and simply re-measures.
+    // Drops every profile (a reopen with `reopenClearsShortlist`). A
+    // dependent's own reopen keeps its shortlist and re-measures.
     void Clear() noexcept;
 
-    // For the one-time survey dump (SurfaceRegistry::DumpBarrierProfiles).
+    // For the one-time survey dump (`SurfaceRegistry::DumpBarrierProfiles`).
     template <typename Fn>
     void ForEach(Fn&& fn) const
     {
@@ -255,18 +253,17 @@ private:
     std::unordered_map<ID3D12Resource*, BarrierProfile> profiles_;
 };
 
-// Resources a documented API names - the swapchain's back buffers, which ARE
-// the colour surface - and that no search may therefore select. Fed every
-// Present, checked on every structural-gate evaluation. Lock-free: a handful
-// of entries, written far less often than read.
+// Resources a documented API names, so no search may select them: the
+// swapchain's back buffers, which are the colour surface. Fed every Present,
+// checked on every structural-gate evaluation. Lock-free: a handful of entries,
+// written far less often than read.
 class KnownSourceSet
 {
 public:
     static constexpr int kMaxKnownSources = 8;
 
-    // True if `resource` was not already in the set - the caller must then
-    // purge it from anything that shortlisted it before it was known. Evicts
-    // round-robin when full (see the definition).
+    // True if `resource` was new; the caller then purges it from any shortlist
+    // that took it first. Evicts round-robin when full (see the definition).
     bool Note(ID3D12Resource* resource) noexcept;
     bool Contains(ID3D12Resource* resource) const noexcept;
 
@@ -278,18 +275,18 @@ private:
 class SurfaceIdentifier;
 
 // At most one identifier may hold a given resource as a candidate.
-// Implemented by SurfaceRegistry, the only thing that sees every identifier.
+// Implemented by `SurfaceRegistry`, the only thing that sees every identifier.
 class MutualExclusionChecker
 {
 public:
     virtual ~MutualExclusionChecker() = default;
 
-    // True if no OTHER identifier holds `resource` as a candidate.
+    // True if no other identifier holds `resource` as a candidate.
     virtual bool TryClaim(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept = 0;
 
-    // The name of the OTHER identifier holding `resource` as a candidate, or
-    // nullptr. Decide() drops such a resource BEFORE ranking: otherwise it
-    // either wins and the claim is refused forever, or ties and makes a
+    // The name of another identifier holding `resource` as a candidate, or
+    // nullptr. `Decide()` drops such a resource before ranking; otherwise it
+    // could win and have its claim refused forever, or tie and make a
     // separable choice AMBIGUOUS. The case that needs it: velocity's own buffer
     // passes the normals gates (both trigger on RT -> shader-resource).
     virtual const char* HeldByOther(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept = 0;
@@ -308,7 +305,7 @@ public:
         return spec_;
     }
 
-    // Wiring, done once by SurfaceRegistry::Configure() before hooks go live.
+    // Wiring, done once by `SurfaceRegistry::Configure()` before hooks go live.
     void SetProfileStore(BarrierProfileStore* store) noexcept;
     void SetExtentSource(const SurfaceIdentifier* source) noexcept;
     void SetKnownSourceExclusion(const KnownSourceSet* excluded) noexcept;
@@ -318,66 +315,62 @@ public:
     // seeded its profile. Records the structural shortlist.
     void ConsiderResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
 
-    // Every transition barrier: liveness tracking for the selected and
-    // rival-adopted resources. `isTrigger` is this surface's trigger edge;
-    // `isCandidate` the caller's IsCandidate(resource), looked up once.
+    // Every transition barrier: liveness of the selected and rival-adopted
+    // resources. `isTrigger`: this surface's trigger edge. `isCandidate`: the
+    // caller's `IsCandidate(resource)`.
     void OnTransition(ID3D12Resource* resource, uint64_t frame, bool isTrigger, bool isCandidate) noexcept;
 
-    // Called once per presented frame: runs the decision when the settling
-    // window has elapsed (or, for a surface with an extent dependency, as
-    // soon as that dependency resolves - see SetExtentSource).
+    // Once per presented frame: decides when the settling window has elapsed,
+    // or, for a dependent surface, as soon as its source has an extent.
     void OnFrame(uint64_t frame) noexcept;
 
     ID3D12Resource* Selected() const noexcept;
     IdentifyState State() const noexcept;
     bool Extent(UINT64* width, UINT* height) const noexcept;
 
-    // The resources this surface captures from: the selected one plus any
-    // rival-adopted ones. Held by reference; cleared by Reopen().
+    // The resources this surface captures from: the selected one and any
+    // rival-adopted ones. Held by reference; cleared by `Reopen()`.
     bool IsCandidate(ID3D12Resource* resource) const noexcept;
-    // True if `resource` passed the structural gate and is being watched. For
-    // the MV_DIAG / MV_SNAPSHOT paths; nothing decides on it.
+    // True if `resource` passed the structural gate and is being watched. Used
+    // by the `MV_DIAG` and `MV_SNAPSHOT` paths only.
     bool IsShortlisted(ID3D12Resource* resource) noexcept;
-    // Re-checks that a candidate still has the desc it was accepted with,
-    // dropping (and logging) it if not. Call before doing anything that
-    // depends on its layout or its assumed resource state.
+    // Re-checks that a candidate still has the desc it was accepted with, and
+    // drops it (logged) if not. Call before relying on its layout or state.
     bool ValidateCandidate(ID3D12Resource* resource) noexcept;
     // Adds `resource` as a candidate unless another identifier holds it
-    // (refused, and logged).
+    // (refused and logged).
     void MarkCandidate(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) noexcept;
 
-    // `resource` has just become known by construction (a swapchain back
-    // buffer). Drops it - and our reference to it - from this identifier's
-    // shortlist and candidate set, in case it was shortlisted before it was
-    // known. Returns true if it was this identifier's SELECTED resource,
-    // which the caller must treat as a wrong identification and reopen.
+    // `resource` is a swapchain back buffer. Drops it, and the reference to
+    // it, from the shortlist and candidates. True if it was the selected
+    // resource, which the caller must treat as a wrong identification and
+    // reopen.
     bool ForgetKnownSource(ID3D12Resource* resource) noexcept;
 
     // Starts the search again; `detail` goes into the log line. The registry
-    // refills the shared seen-set/budget once per cascade (ReopenCascade).
+    // refills the shared seen-set and budget (`ReopenCascade`).
     void Reopen(ReopenReason reason, const char* detail) noexcept;
 
-    // The swapchain's back-buffer size, when known - used to bound candidate
-    // size (spec.maxBackBufferMultiple). Returns true when the size CHANGED
-    // after a decision was already made or was in progress; the caller
-    // should then reopen (SurfaceRegistry::ReopenCascade).
+    // The back-buffer size, which bounds candidate size
+    // (`spec.maxBackBufferMultiple`). True when it changed after a decision was
+    // made or started; the caller should then reopen.
     bool NoteBackBufferSize(uint64_t width, uint32_t height) noexcept;
 
-    // True if the selected resource hasn't taken its trigger edge in over
-    // kQuietFramesBeforeSilent frames while the game keeps presenting.
+    // True if the selected resource has not taken its trigger edge for
+    // `kQuietFramesBeforeSilent` frames while the game keeps presenting.
     bool IsSilent(uint64_t frame, uint64_t* framesSilent) noexcept;
 
     // Frames since the selected resource last took its trigger edge.
     uint64_t FramesSinceEdge(uint64_t frame) const noexcept;
 
-    // Rival adoption: some OTHER resource took this surface's trigger edge.
-    // Returns true to have the caller adopt it as an additional candidate -
-    // UE keeps several physical copies of its scene textures and switches
-    // between them in stretches, so a surface pinned to one pointer captures
-    // only while that copy is in use. Off unless the spec has a "rival" block.
-    // A rival must carry the shares_call_with_edge evidence the selection was
-    // made on (RivalHasSelectedEvidence), or normals would adopt the
-    // same-format post-process target that takes its edge every frame.
+    // Another resource took this surface's trigger edge. True to have the
+    // caller adopt it as an extra candidate: UE keeps several copies of each
+    // scene texture and switches between them, so a surface tied to one would
+    // capture only while that copy is in use. Off unless the spec has a
+    // "rival" block. A rival must carry the `shares_call_with_edge` evidence
+    // the selection was made on (`RivalHasSelectedEvidence`), or normals would
+    // adopt a same-format post-process target that takes its edge every
+    // frame.
     bool OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame) noexcept;
 
 private:
@@ -389,8 +382,8 @@ private:
     std::string DescLine(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) const noexcept;
 
     bool SharesCallSignalPresent(const BarrierProfile& p, const SignalWeight& sw) const noexcept;
-    // -1: not enough edges observed to judge yet. 0: fails. 1: carries every
-    // shares_call_with_edge signal the selected resource carried.
+    // -1: too few edges to judge yet. 0: fails. 1: carries every
+    // `shares_call_with_edge` signal the selected resource carried.
     int RivalHasSelectedEvidence(ID3D12Resource* resource) const noexcept;
     struct Survivor
     {
@@ -453,10 +446,8 @@ private:
     std::atomic<int> attempt_{0};
 
     // --- rival adoption (see OnUnmatchedEdge) ------------------------------
-    // The latest adopted rival. Every adoption observed live has had the
-    // selected resource's exact width and format: a reallocation to a new
-    // address. (DEBUGGING.md, "the width story was wrong", for the diagnosis
-    // this replaced.)
+    // The latest adopted rival. Every adoption seen live had the selected
+    // resource's exact width and format: a reallocation to a new address.
     std::atomic<ID3D12Resource*> identifiedAlt_{nullptr};
     std::atomic<int> rivalReports_{0};
     std::atomic<uint64_t> rivalRunLength_{0};
@@ -465,7 +456,7 @@ private:
     std::atomic<int> adoptions_{0};
     std::atomic<bool> adoptLimitReported_{false};
     std::atomic<bool> evidenceRejectReported_{false};
-    // bit i: spec_.signals[i] (a shares_call_with_edge signal) held for the
+    // Bit i: `spec_.signals[i]` (a `shares_call_with_edge` signal) held for the
     // selected resource. Written at selection, read from the barrier hook.
     std::atomic<uint32_t> selectedEvidenceMask_{0};
 };

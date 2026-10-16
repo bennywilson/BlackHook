@@ -1,8 +1,5 @@
-"""Sanity-check a captured velocity buffer before trusting it.
-
-Reports how much of the buffer was actually written, and the distribution of
-decoded displacements - the first thing to look at when deciding whether a
-capture contains real motion or whether the game was sitting still.
+"""Sanity-check a captured velocity buffer: how much of it was written, and
+the distribution of decoded displacements (did the capture see real motion?).
 """
 import os
 import sys
@@ -15,8 +12,8 @@ dump = mvtools.load_dump(dump_dir)
 meta = dump.meta
 print("meta:", meta)
 
-# State the two things the decode depends on that are NOT in the pixel data, so
-# every run of this tool says out loud which assumptions produced its numbers.
+# The two things the decode depends on that are not in the pixel data, printed
+# on every run.
 channels, bpp = mvtools.velocity_channels(meta)
 version = mvtools.engine_version(meta)
 if "engine_version_major" in meta:
@@ -50,14 +47,10 @@ for i in indices[:: max(1, len(indices) // 6)]:
         m = mag[written]
         print(f"              motion(px): mean={m.mean():8.3f} p50={np.percentile(m,50):8.3f} "
               f"p95={np.percentile(m,95):8.3f} max={m.max():8.3f}")
-        # Channels 2 and 3 are the two halves of one float32 (the DeviceZ
-        # delta), so their individual ranges say nothing. Report the value they
-        # encode instead - printing raw_ch2/raw_ch3 ranges is what made them
-        # look like a bimodal channel and a noise channel for so long.
-        #
-        # A PF_G16R16 title has no channels 2/3 at all, because the same engine
-        # predicate (NeedVelocityDepth) picks both the format and whether V.z is
-        # encoded. That is a fact about the capture, not a failure.
+        # Channels 2 and 3 are the halves of one float32 (the DeviceZ delta),
+        # so report the value they encode, not their separate ranges. A
+        # PF_G16R16 capture has no channels 2/3: `NeedVelocityDepth` decides
+        # both the format and whether V.z is encoded.
         if channels < 4:
             print("              V.z: not encoded - this is a 2-channel PF_G16R16 capture, so "
                   "NeedVelocityDepth() was false on this title")

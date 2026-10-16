@@ -1,17 +1,15 @@
 // D3D12 validation harness for the capture path.
 //
 // The capture path cannot run under the debug layer inside a Shipping game, so
-// this stands up a device with the debug layer AND GPU-based validation, builds
-// a line-up of PLACED render targets (UE5's scene textures come from its
-// transient allocator), loads mv_hook.dll into itself and renders frames. The
-// hook cannot tell the difference. Two independent verdicts:
-//   - zero debug-layer errors over the run, and
-//   - identification picked the RIGHT resource out of the line-up, checked by
-//     pointer (MvIdentifiedSurface), not by "a dump appeared" - that was true
-//     throughout the days the filter was selecting the wrong resource.
-// Each decoy is rejected by exactly one filter, so no filter can be quietly
-// load-bearing. Then the dump itself is checked (every frame carries every
-// surface it should).
+// this creates a device with the debug layer and GPU-based validation, builds a
+// line-up of placed render targets (UE5's scene textures come from its
+// transient allocator), loads mv_hook.dll into itself and renders frames. It
+// checks:
+//   - zero debug-layer errors over the run;
+//   - that identification picked the right resource out of the line-up, by
+//     pointer (`MvIdentifiedSurface`). Each decoy fails exactly one filter, so
+//     every filter is tested;
+//   - the dump: every frame carries every surface it should.
 //
 // USAGE
 //   mv_testhost.exe [--hook <dll>] [--frames N] [--no-gbv] [--pipeline oxi|skyrunner]
@@ -19,18 +17,19 @@
 //                   [--phase8-tests] [--phase9-negative]
 //   mv_testhost.exe --wpo-encode-test <output_dir>
 //
-//   --pipeline skyrunner  velocity's 5-transition, UNORDERED_ACCESS pass measured
-//                         on a UE 5.2 title (default oxi: the strict 2-cycle)
-//   --ambiguous           adds a perfect twin; the only right answer is to refuse
+//   --pipeline skyrunner  velocity's 5-transition pass through UNORDERED_ACCESS,
+//                         as measured on a UE 5.2 title (default oxi: a strict
+//                         2-cycle)
+//   --ambiguous           adds a perfect twin; identification must refuse
 //   --normals/--specular  GBufferA/GBufferB look-alikes and decoys (MV_SURFACES)
 //   --velocity-realloc    SceneVelocity through three allocations (rival adoption)
 //   --phase8-tests        resize, depth reallocation, mid-burst reopen
 //   --phase9-negative     a profile narrowed to the wrong format must find nothing
 //
-// MV_AUTOCAPTURE=1 makes the hook start a burst by itself (no one to press F8);
-// tools/run_testhost_suite.ps1 runs every mode. --wpo-encode-test is separate
-// (wpo_encode_test.cpp): it renders a synthetic velocity grid through the
-// engine's encode for tools/wpo_synthetic_test.py, without the hook.
+// `MV_AUTOCAPTURE=1` makes the hook start a burst by itself.
+// `tools/run_testhost_suite.ps1` runs every mode. --wpo-encode-test
+// (wpo_encode_test.cpp) renders a synthetic velocity grid through the engine's
+// encode for `tools/wpo_synthetic_test.py`, without the hook.
 
 #include <windows.h>
 
@@ -52,7 +51,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Deliberately not any title's resolution: the hook must derive it.
+// Not any title's resolution: the hook must derive it.
 constexpr UINT64 kVelocityWidth = 1120;
 constexpr UINT kVelocityHeight = 630;
 constexpr DXGI_FORMAT kVelocityFormat = DXGI_FORMAT_R16G16B16A16_UNORM;
@@ -61,28 +60,27 @@ constexpr UINT kBackBufferCount = 3;
 constexpr UINT kWidth = 1280;
 constexpr UINT kHeight = 720;
 
-// What every look-alike is cleared to, so all four channels decode to
-// something checkable:
-//   x, y = 0.5  -> exactly UE5's encoded zero motion (32767/65535): 0.00000 px.
-//   z, w        -> the halves of a float32, as VELOCITY_ENCODE_DEPTH packs
-//                  them: 0x3580 and 0 reassemble to +9.5367e-07, the ~1e-6
-//                  magnitude a real DeviceZ delta has (not a NaN).
+// What every look-alike is cleared to, so all four channels decode to known
+// values:
+//   x, y = 0.5  UE5's encoded zero motion (32767/65535): decodes to 0 px.
+//   z, w        the halves of a float32, as `VELOCITY_ENCODE_DEPTH` packs them:
+//               0x3580 and 0 make +9.5367e-07, the ~1e-6 size of a real
+//               DeviceZ delta.
 constexpr float kVelocityClear[4] = {0.5f, 0.5f, 13696.0f / 65535.0f, 0.0f};
 
-// How each look-alike behaves at the barrier level. The decoys are chosen so
-// that each one is rejected by exactly one of the two independent filters - a
-// filter that is right for the wrong reason fails here rather than in a game.
+// How each look-alike behaves at the barrier level. Each decoy is rejected by
+// exactly one of the two filters (structure, behaviour).
 enum class Behaviour {
     Velocity,       // RT -> shader-resource -> RT. Exactly 2 events per frame.
-    // RT -> SRV in ONE ResourceBarrier call with scene depth's DEPTH_WRITE ->
-    // DEPTH_READ: how GBufferA and GBufferB become readable on Skyrunner.
+    // RT -> SRV in one `ResourceBarrier` call with scene depth's
+    // `DEPTH_WRITE` -> `DEPTH_READ`: how GBufferA and GBufferB become readable on
+    // Skyrunner.
     ReadWithDepth,
     ComputeWritten, // goes through UNORDERED_ACCESS and takes a UAV barrier
     ExtraPass,      // the same RT <-> SRV cycle, but twice per frame
     // SceneVelocity as measured on a UE 5.2 title: five transitions a frame,
-    // through UNORDERED_ACCESS:
+    // through `UNORDERED_ACCESS`:
     //     RT->UAV   UAV->NON_PS_SRV   NON_PS_SRV->RT   RT->NON_PS_SRV   ...->RT
-    // Every behavioural rule once measured on the first title rejects it.
     VelocityComputeAssisted,
 };
 
@@ -96,16 +94,16 @@ struct LookAlike {
     bool shouldBeSelected;          // as velocity
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     bool shouldBeNormals = false;   // --normals: the one normals must select
-    // --normals: 0 = renders every frame. 1/2 = one of two allocations of
-    // GBufferA that take turns in stretches, as measured on Skyrunner (see
-    // gbufferAllocationActive below): 1 first, 2 must be ADOPTED as a rival.
+    // --normals: 0 renders every frame. 1 and 2 are two allocations of GBufferA
+    // taking turns (`gbufferAllocationActive`): 1 is selected, 2 must be adopted
+    // as a rival.
     int allocation = 0;
-    // --velocity-realloc: 0 = n/a. 1/2/3 = three allocations of SceneVelocity
-    // that take turns (see velocityAllocationActive) - 1 is selected, 2 and 3
-    // adopted as rivals, then 2 again for longer than the silence threshold.
+    // --velocity-realloc: 0 n/a. 1, 2 and 3 are allocations of SceneVelocity
+    // taking turns (`velocityAllocationActive`): 1 is selected, 2 and 3 adopted,
+    // then 2 again for longer than the silence threshold.
     int velocityAllocation = 0;
-    // A TYPELESS resource (UE's 8-bit GBuffers) needs a typed format for its
-    // RTV and clear value; UNKNOWN means "same as format".
+    // A TYPELESS resource (UE's 8-bit GBuffers) needs a typed format for its RTV
+    // and clear value. `UNKNOWN`: same as `format`.
     DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
     bool shouldBeSpecular = false; // --specular: the one specular must select
 
@@ -114,9 +112,9 @@ struct LookAlike {
     UINT rtvIndex = 0;
 };
 
-// The depth line-up: each decoy excluded by exactly one of format, the
-// ALLOW_DEPTH_STENCIL / DENY_SHADER_RESOURCE pair, and the extent. TYPELESS like
-// UE5's scene depth, so the copy exercises the two-plane path.
+// The depth line-up: each decoy fails exactly one of format, the
+// `ALLOW_DEPTH_STENCIL` / `DENY_SHADER_RESOURCE` pair, and the extent. TYPELESS
+// like UE5's scene depth, so the copy exercises the two-plane path.
 struct DepthLookAlike {
     const char* name;
     const char* why;
@@ -125,8 +123,8 @@ struct DepthLookAlike {
     UINT height;
     bool denyShaderResource;
     bool shouldBeSelected;
-    // DEPTH_WRITE -> readable edges per frame: the only thing separating scene
-    // depth from CustomDepth (same extent, format and flags in UE5).
+    // `DEPTH_WRITE` -> readable edges per frame: the only difference between scene
+    // depth and CustomDepth (same extent, format and flags in UE5).
     int edgesPerFrame;
 
     ComPtr<ID3D12Heap> heap;
@@ -142,9 +140,8 @@ bool Check(HRESULT hr, const char* what) {
     return true;
 }
 
-// Pulls everything the debug layer has said since the last call and prints it.
-// Returns the number of messages at ERROR severity or worse - the number that
-// decides whether this harness passed.
+// Prints everything the debug layer reported since the last call. Returns the
+// number of messages at ERROR severity or worse.
 int DrainInfoQueue(ID3D12InfoQueue* infoQueue, const char* phase) {
     if (infoQueue == nullptr) {
         return 0;
@@ -178,9 +175,10 @@ int DrainInfoQueue(ID3D12InfoQueue* infoQueue, const char* phase) {
     return errors;
 }
 
-// A 2D texture PLACED at offset 0 of its own heap, the heap shaped as RenderDoc
-// showed SceneVelocity's on a UE 5.2 title: no restriction flags (tier 2) and
-// CREATE_NOT_ZEROED - the aliasing rules the debug layer checks depend on it.
+// A 2D texture placed at offset 0 of its own heap, the heap shaped like the one
+// RenderDoc showed for SceneVelocity on a UE 5.2 title: no restriction flags
+// (tier 2) and `CREATE_NOT_ZEROED`. The aliasing rules the debug layer checks
+// depend on the kind of heap.
 bool CreatePlacedTexture(ID3D12Device* device, DXGI_FORMAT format, UINT64 width, UINT height,
                          D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE& clear,
                          ComPtr<ID3D12Heap>& heap, ComPtr<ID3D12Resource>& resource) {
@@ -262,8 +260,8 @@ int main(int argc, char** argv) {
     bool normals = false;
     bool velocityRealloc = false;
     bool specular = false;
-    // Velocity's pass shape: "oxi" (strict 2-cycle) or "skyrunner" (see
-    // Behaviour::VelocityComputeAssisted). Both must be found.
+    // Velocity's pass shape: "oxi" (a strict 2-cycle) or "skyrunner"
+    // (`Behaviour::VelocityComputeAssisted`). Both must be found.
     std::string pipeline = "oxi";
     std::string wpoEncodeTestDir;
     for (int i = 1; i < argc; ++i) {
@@ -334,16 +332,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 1. Debug layer BEFORE device creation - it has no effect afterwards.
+    // 1. The debug layer must be enabled before the device is created.
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
         debug->EnableDebugLayer();
         printf("[testhost] debug layer enabled\n");
         ComPtr<ID3D12Debug1> debug1;
         if (gpuValidation && SUCCEEDED(debug.As(&debug1))) {
-            // GPU-based validation is what catches the errors that matter
-            // here: a resource used in a state it is not actually in, and
-            // descriptor lifetime problems. It is very slow, hence --no-gbv.
+            // GPU-based validation catches resources used in the wrong state
+            // and descriptor lifetime errors. It is slow; --no-gbv turns it off.
             debug1->SetEnableGPUBasedValidation(TRUE);
             printf("[testhost] GPU-based validation enabled (slow)\n");
         }
@@ -379,8 +376,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Break-on-error is deliberately NOT set: the point is to collect every
-    // complaint and report them all, not to stop at the first.
+    // No break-on-error: every message is collected and reported.
     ComPtr<ID3D12InfoQueue> infoQueue;
     device.As(&infoQueue);
 
@@ -407,16 +403,15 @@ int main(int argc, char** argv) {
     ComPtr<IDXGISwapChain3> swapChain;
     swapChain1.As(&swapChain);
 
-    // 2. The line-up: SceneVelocity and its plausible mistakes. Every entry is a
-    // PLACED resource, whose aliasing rules the debug layer checks separately.
+    // 2. The line-up: SceneVelocity and its look-alikes, all placed resources.
     std::vector<LookAlike> lineUp = {
         {"SceneVelocity", "the real thing: velocity format, RT|UAV", kVelocityFormat,
          kVelocityWidth, kVelocityHeight,
          pipeline == "skyrunner" ? Behaviour::VelocityComputeAssisted : Behaviour::Velocity, true},
 
-        // This project's most expensive bug: identical in every way but one
-        // digit of the format enum (FLOAT is 10, UNORM 11). GetFormat never
-        // returns FLOAT, so the structural filter must reject it.
+        // Identical in every way but one digit of the format enum (FLOAT is 10,
+        // UNORM 11): the error that cost this project the most. `GetFormat`
+        // never returns FLOAT, so the structural filter must reject it.
         {"HDR pool target", "rejected on structure: R16G16B16A16_FLOAT is not a format "
                             "FVelocityRendering::GetFormat can return",
          DXGI_FORMAT_R16G16B16A16_FLOAT, kVelocityWidth, kVelocityHeight, Behaviour::Velocity, false},
@@ -426,17 +421,16 @@ int main(int argc, char** argv) {
         {"compute-written RG16", "rejected on behaviour: goes through UNORDERED_ACCESS and takes a UAV barrier",
          DXGI_FORMAT_R16G16_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::ComputeWritten, false},
 
-        // Byte-identical descriptor to the real one. Nothing structural can
-        // separate these two; only "exactly 2 barrier events per frame" does.
+        // The same descriptor as the real one: only "exactly 2 barrier events
+        // per frame" separates them.
         {"twin, read twice", "rejected on behaviour: 4 RT<->SRV events per frame, not 2",
          kVelocityFormat, kVelocityWidth, kVelocityHeight, Behaviour::ExtraPass, false},
     };
 
     if (velocityRealloc) {
         // Without the "twin, read twice" decoy: it takes the velocity edge every
-        // frame, which keeps resetting rival adoption's consecutive-frame run (a
-        // known limit: it follows one rival at a time; no measured title has
-        // such a twin).
+        // frame, which resets rival adoption's consecutive-frame run (a known
+        // limit; no measured title has such a twin).
         lineUp.erase(std::remove_if(lineUp.begin(), lineUp.end(),
                                     [](const LookAlike& t) { return t.behaviour == Behaviour::ExtraPass; }),
                      lineUp.end());
@@ -457,9 +451,9 @@ int main(int argc, char** argv) {
     if (normals) {
         // UE5's GBufferA (R10G10B10A2, RT only), finished by the base pass, so
         // its edge comes before velocity's. SceneVelocity passes the normals
-        // gates too - only mutual exclusion keeps it out. The post-process
-        // output below tied GBufferA 10-10 on Skyrunner; only shares_call_with_
-        // edge (readable in the same call as depth) separates them.
+        // gates too; only mutual exclusion keeps it out. The post-process output
+        // below tied GBufferA 10-10 on Skyrunner; only `shares_call_with_edge`
+        // (readable in the same call as depth) separates them.
         LookAlike gbufferA{"GBufferA", "normals: R10G10B10A2, RT only, readable in the same call as depth",
                            DXGI_FORMAT_R10G10B10A2_UNORM, kVelocityWidth, kVelocityHeight, Behaviour::ReadWithDepth,
                            false};
@@ -470,16 +464,17 @@ int main(int argc, char** argv) {
                              false};
         postOutput.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         // GBufferA's second allocation, taking turns with the first: normals must
-        // adopt it as a rival, and must NOT adopt the decoy, which takes its
-        // edge every frame.
+        // adopt it, and must not adopt the decoy, which takes its edge every
+        // frame.
         LookAlike gbufferA2 = gbufferA;
         gbufferA2.name = "GBufferA (2nd alloc)";
         gbufferA2.why = "normals: the same texture reallocated; must be adopted as a rival, not selected";
         gbufferA2.shouldBeNormals = false;
         gbufferA.allocation = 1;
         gbufferA2.allocation = 2;
-        // Scene colour as measured: shares calls with depth too, but a different
-        // descriptor (R16G16B16A16_FLOAT, RT|UAV) - refused by same_descriptor.
+        // Scene colour as measured: it shares calls with depth too, but has a
+        // different descriptor (R16G16B16A16_FLOAT, RT|UAV), so `same_descriptor`
+        // refuses it.
         LookAlike sceneColor{"scene colour", "normals rival decoy: shares calls with depth, different descriptor",
                              DXGI_FORMAT_R16G16B16A16_FLOAT, kVelocityWidth, kVelocityHeight,
                              Behaviour::ReadWithDepth, false};
@@ -490,8 +485,8 @@ int main(int argc, char** argv) {
     }
 
     if (specular) {
-        // GBufferB and GBufferC as measured on Skyrunner: identical structurally;
-        // GBufferB is readable in the same call as depth, GBufferC never.
+        // GBufferB and GBufferC as measured on Skyrunner: structurally identical.
+        // GBufferB is readable in the same call as depth; GBufferC never is.
         LookAlike gbufferB{"GBufferB", "specular: B8G8R8A8_TYPELESS, RT only, readable in the same call as depth",
                            DXGI_FORMAT_B8G8R8A8_TYPELESS, kVelocityWidth, kVelocityHeight,
                            Behaviour::ReadWithDepth, false};
@@ -508,10 +503,10 @@ int main(int argc, char** argv) {
     }
 
     if (pipeline == "skyrunner") {
-        // Without the "twin, read twice" decoy: it exists to test the strict
-        // two-events signal, which fires for neither when velocity itself is
-        // not a 2-cycle - they then tie (11-11) and identification correctly
-        // refuses. --ambiguous already covers refusal.
+        // Without the "twin, read twice" decoy: it tests the strict two-events
+        // signal, which fires for neither when velocity itself is not a 2-cycle.
+        // They then tie (11-11) and identification refuses, which --ambiguous
+        // already covers.
         lineUp.erase(std::remove_if(lineUp.begin(), lineUp.end(),
                                     [](const LookAlike& t) {
                                         return t.behaviour == Behaviour::ExtraPass;
@@ -520,8 +515,8 @@ int main(int argc, char** argv) {
     }
 
     if (ambiguous) {
-        // A perfect twin of whichever SceneVelocity this pipeline uses: the
-        // only correct answer is to refuse and say so.
+        // A perfect twin of whichever SceneVelocity this pipeline uses:
+        // identification must refuse.
         lineUp.push_back({"perfect twin", "indistinguishable - identification must REFUSE, not guess",
                           kVelocityFormat, kVelocityWidth, kVelocityHeight, lineUp.front().behaviour, false});
     }
@@ -574,8 +569,8 @@ int main(int argc, char** argv) {
          DXGI_FORMAT_R32G8X24_TYPELESS, kVelocityWidth / 2, kVelocityHeight / 2, false, false, 1},
         {"occluder depth", "rejected on flags alone: right extent, but DENY_SHADER_RESOURCE",
          DXGI_FORMAT_R32G8X24_TYPELESS, kVelocityWidth, kVelocityHeight, true, false, 1},
-        // Structurally IDENTICAL to scene depth: only per-frame usage separates
-        // them (and on a real title identification once refused to pick).
+        // Structurally identical to scene depth: only per-frame usage separates
+        // them.
         {"CustomDepth", "structurally IDENTICAL to scene depth - separable only by per-frame usage",
          DXGI_FORMAT_R32G8X24_TYPELESS, kVelocityWidth, kVelocityHeight, false, false, 1},
     };
@@ -598,8 +593,8 @@ int main(int argc, char** argv) {
         DepthLookAlike& target = depthLineUp[i];
         D3D12_CLEAR_VALUE clearValue{};
         clearValue.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-        // Not 0.0: UE5's reversed-Z far plane, which the tools read as "no
-        // geometry". 0.5 can only have come through the copy intact.
+        // Not 0.0, UE5's reversed-Z far plane, which the tools read as "no
+        // geometry"; 0.5 can only have come through the copy intact.
         clearValue.DepthStencil.Depth = 0.5f;
         clearValue.DepthStencil.Stencil = 0;
         const D3D12_RESOURCE_FLAGS flags =
@@ -648,8 +643,8 @@ int main(int argc, char** argv) {
 
     int errorsBeforeHook = DrainInfoQueue(infoQueue.Get(), "setup");
 
-    // 3. Load the hook into ourselves: same DllMain and InstallD3D12Hooks as an
-    // injection; the injector is not what is under test.
+    // 3. Load the hook into this process: the same `DllMain` and
+    // `InstallD3D12Hooks` as an injection.
     HMODULE hookModule = nullptr;
     if (!hookPath.empty()) {
         hookModule = LoadLibraryW(hookPath.c_str());
@@ -676,9 +671,9 @@ int main(int argc, char** argv) {
         cmdList->ResourceBarrier(1, &b);
     };
 
-    // UE5 settles depth before velocity, which the capture path optimises
-    // for; a title ordered the other way must still get depth. Both orderings
-    // are modelled.
+    // UE5 makes depth readable before velocity, the order capture is built
+    // for; a title ordered the other way must still get depth. Both orders are
+    // modelled.
     const bool depthBeforeVelocity = pipeline != "skyrunner";
     printf("[testhost] depth edges are emitted %s the velocity edge\n",
            depthBeforeVelocity ? "BEFORE (the UE5 prepass ordering)"
@@ -686,8 +681,7 @@ int main(int argc, char** argv) {
 
     // The depth line-up, cleared through a DSV first (GPU-based validation
     // rejects reading uninitialised placed memory). Scene depth takes several
-    // DEPTH_WRITE -> readable edges a frame, as with a partial prepass, so the
-    // last-before-velocity rule is exercised.
+    // `DEPTH_WRITE` -> readable edges a frame, as with a partial prepass.
     auto emitDepthEdges = [&]() {
         for (DepthLookAlike& target : depthLineUp) {
             const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvAt(target.dsvIndex);
@@ -695,7 +689,7 @@ int main(int argc, char** argv) {
             cmdList->ClearDepthStencilView(
                 dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5f, 0, 0, nullptr);
             ID3D12Resource* resource = target.resource.Get();
-            // Both readable states the real title uses: DEPTH_READ and SRV.
+            // Both readable states the real title uses: `DEPTH_READ` and SRV.
             for (int edge = 0; edge < target.edgesPerFrame; ++edge) {
                 const D3D12_RESOURCE_STATES readable =
                     (edge % 2) == 0 ? D3D12_RESOURCE_STATE_DEPTH_READ
@@ -708,7 +702,7 @@ int main(int argc, char** argv) {
 
     int totalErrors = 0;
 
-    // One frame, as a lambda so the --phase8-tests can keep rendering past the
+    // One frame, as a lambda so --phase8-tests can keep rendering after the
     // initial window.
     // --normals: GBufferA allocation 1 alone until identification has settled,
     // then the two alternate in 30-frame stretches.
@@ -719,8 +713,8 @@ int main(int argc, char** argv) {
     };
 
     // --velocity-realloc: allocation 1, then 2 (adopted), 3 (adopted), then 2
-    // again for 500 frames - longer than the 300-frame silence threshold, on
-    // an allocation no longer the latest rival.
+    // again for 500 frames, longer than the 300-frame silence threshold, on an
+    // allocation that is no longer the latest rival.
     const int velocitySwitchStart = identifyFrames + 20;
     auto velocityAllocationActive = [&](int allocation, int frame) {
         int active = 1;
@@ -765,7 +759,7 @@ int main(int argc, char** argv) {
             switch (target.behaviour) {
                 case Behaviour::Velocity:
                     // The edge the hook triggers on; its copy is recorded
-                    // inside this pair, under the debug layer.
+                    // between these barriers, under the debug layer.
                     barrier(resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
                             D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
                     barrier(resource, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
@@ -804,8 +798,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case Behaviour::VelocityComputeAssisted:
-                    // Enters UNORDERED_ACCESS without ever taking a UAV
-                    // barrier - why those are two separate signals.
+                    // Enters `UNORDERED_ACCESS` without taking a UAV barrier:
+                    // why those are two separate signals.
                     barrier(resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     barrier(resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -832,8 +826,8 @@ int main(int argc, char** argv) {
             emitDepthEdges();
         }
 
-        // Something trivial on the back buffer, so Present has real content
-        // and the overlay (if enabled) has something to composite over.
+        // Draw something on the back buffer, for the colour capture and the
+        // overlay.
         barrier(backBuffers[index].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         const float t = static_cast<float>(frame) / static_cast<float>(frames);
         const float clear[4] = {0.1f + 0.4f * t, 0.15f, 0.5f - 0.3f * t, 1.0f};
@@ -846,8 +840,8 @@ int main(int argc, char** argv) {
 
         swapChain->Present(1, 0);
 
-        // Serialise every frame. Slower than the real thing, but it means a
-        // debug-layer message can be attributed to the frame that caused it.
+        // One frame at a time, so a debug-layer message can be traced to its
+        // frame.
         queue->Signal(fence.Get(), ++fenceValue);
         if (fence->GetCompletedValue() < fenceValue) {
             fence->SetEventOnCompletion(fenceValue, fenceEvent);
@@ -863,7 +857,7 @@ int main(int argc, char** argv) {
         renderFrame(frame);
     }
 
-    // ---- Did it identify the right one? --------------------------------
+    // ---- Velocity identification ---------------------------------------------
     bool identificationPassed = true;
     if (hookModule != nullptr) {
         if (identifiedFn == nullptr) {
@@ -887,7 +881,7 @@ int main(int argc, char** argv) {
             if (phase9Negative) {
                 // The narrowed profile is the one that ran (a load failure also
                 // selects nothing), nothing was selected (no fallback), and the
-                // hook said so.
+                // hook logged it.
                 const auto activeProfile = HookExport<const char* (*)()>(hookModule, "MvActiveProfile");
                 const std::string profile = activeProfile != nullptr ? activeProfile() : "<no MvActiveProfile export>";
                 const bool profileOk = profile == kNegativeProfile;
@@ -904,7 +898,8 @@ int main(int argc, char** argv) {
                              "fall back"
                            : "FAIL - Phase 9 negative test (see the three lines above)");
             } else if (ambiguous) {
-                // Two indistinguishable candidates: only refusal is correct.
+                // Two indistinguishable candidates: refusal is the only right
+                // answer.
                 identificationPassed = picked == nullptr;
                 printf("[testhost] %s\n",
                        identificationPassed
@@ -941,7 +936,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Did it identify the right depth buffer? ------------------------
+    // ---- Depth identification ------------------------------------------------
     bool depthIdentificationPassed = true;
     if (hookModule != nullptr) {
         if (identifiedFn == nullptr) {
@@ -980,7 +975,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Phase 10: did normals pick GBufferA, and was velocity kept out? ---
+    // ---- Normals: GBufferA selected, velocity's buffer kept out ----------------
     bool normalsIdentificationPassed = true;
     if (normals && hookModule != nullptr) {
         void* picked = identified("normals");
@@ -1001,8 +996,8 @@ int main(int argc, char** argv) {
                                           ? "PASS - no normals selected, because velocity was never identified"
                                           : "FAIL - normals selected with no velocity extent to key off");
         } else {
-            // The collision case must actually have been exercised: velocity's
-            // own buffer reached normals' ranking and was excluded as held.
+            // Velocity's own buffer must have reached normals' ranking and been
+            // excluded as held.
             const std::vector<std::string> log = ThisRunsLog(hookModule);
             const bool excludedVelocity = AnyLine(log, "already held by velocity");
             const bool pickedRight = expected != nullptr && picked == static_cast<void*>(expected->resource.Get());
@@ -1044,7 +1039,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Phase 10 follow-up: did specular pick GBufferB over GBufferC? ---
+    // ---- Specular: GBufferB selected over GBufferC -----------------------------
     bool specularIdentificationPassed = true;
     if (specular && hookModule != nullptr) {
         void* picked = identified("specular");
@@ -1076,11 +1071,11 @@ int main(int argc, char** argv) {
 
     // ---- --phase8-tests: resize, depth reallocation, mid-burst reopen ------
     //
-    // MV_AUTOCAPTURE arms exactly one burst, and both test 3 and a real resize
-    // end it (a resize via the colour layout check, before velocity's 30-frame
-    // resize poll). So test 3 runs FIRST, through MvForceReopenVelocity, while
-    // the burst is fresh; test 1 then checks reidentification only.
-    // Must run BEFORE MvFlushCapture, which stops the writer for good.
+    // `MV_AUTOCAPTURE` starts one burst, and both test 3 and a real resize end it
+    // (a resize through the colour layout check, before velocity's 30-frame
+    // resize poll). So test 3 runs first, through `MvForceReopenVelocity`, while
+    // the burst is running; test 1 then checks reidentification only. All of
+    // this must run before `MvFlushCapture`, which stops the writer for good.
     bool midBurstReopenEndedBurst = true;
     bool resizeTestPassed = true;
     bool depthReopenRecoveryPassed = true;
@@ -1125,8 +1120,8 @@ int main(int argc, char** argv) {
                 return true;
             };
 
-            // MV_AUTOCAPTURE arms 1s (wall clock) after the hook starts, which
-            // may not have passed yet: wait for evidence of capture.
+            // `MV_AUTOCAPTURE` starts its burst 1 s (wall clock) after the hook
+            // loads, which may not have passed yet: wait for a captured frame.
             if (!capturingHasStarted() && waitFor(120, capturingHasStarted) < 0) {
                 printf("[testhost]   FAIL - MV_AUTOCAPTURE never produced a captured frame within 120 extra frames - "
                        "is the burst actually arming?\n");
@@ -1134,8 +1129,7 @@ int main(int argc, char** argv) {
                 resizeTestPassed = false;
                 depthReopenRecoveryPassed = false;
             } else {
-                // ---- Test 3: a mid-burst reopen must END the burst rather
-                // than silently drop frames from later ones (finding 1.14).
+                // ---- Test 3: a mid-burst reopen must end the burst.
                 printf("[testhost] test 3: forcing velocity to reopen mid-burst (no swapchain change)...\n");
                 if (forceReopenVelocity == nullptr) {
                     printf("[testhost]   FAIL - mv_hook.dll does not export MvForceReopenVelocity\n");
@@ -1150,7 +1144,7 @@ int main(int argc, char** argv) {
                 }
 
                 // ---- Test 1: a swapchain resize must trigger
-                // reidentification, not keep the abandoned resource.
+                // reidentification.
                 printf("[testhost] test 1: forcing a swapchain resize mid-session...\n");
                 for (UINT i = 0; i < kBackBufferCount; ++i) {
                     backBuffers[i].Reset(); // DXGI requires no outstanding back-buffer refs before ResizeBuffers
@@ -1183,8 +1177,8 @@ int main(int argc, char** argv) {
                                "the resize\n");
                         resizeTestPassed = false;
                     } else {
-                        // Same resource, same descriptor - it settles again
-                        // after spec.settleFrames (90); generous margin.
+                        // Same resource, same descriptor: it settles again
+                        // after `settleFrames` (90). Generous margin.
                         const int reselectedFrame = waitFor(150, [&] { return identified("velocity") != nullptr; });
                         if (reselectedFrame < 0) {
                             printf("[testhost]   FAIL - velocity never reidentified after the resize (reopened at "
@@ -1200,8 +1194,8 @@ int main(int argc, char** argv) {
                 printf(
                     "[testhost] test 1 (resize triggers reidentification): %s\n", resizeTestPassed ? "PASS" : "FAIL");
 
-                // ---- Test 2: a depth reallocation must produce a depth
-                // answer again afterward, not get stuck AMBIGUOUS or empty.
+                // ---- Test 2: after a depth reallocation, depth must be
+                // selected again, not stuck AMBIGUOUS or empty.
                 printf("[testhost] test 2: forcing scene depth to move to a different resource...\n");
                 if (forceReopenDepth == nullptr) {
                     printf("[testhost]   FAIL - mv_hook.dll does not export MvForceReopenDepth\n");
@@ -1220,7 +1214,7 @@ int main(int argc, char** argv) {
                         depthReopenRecoveryPassed = false;
                     } else {
                         // Needs at least one empty-survivors retry (2x
-                        // settleFrames = 120) first; generous margin.
+                        // `settleFrames` = 120) first. Generous margin.
                         const int recoveredFrame = waitFor(300, [&] { return identified("depth") != nullptr; });
                         void* after = identified("depth");
                         if (recoveredFrame < 0) {
@@ -1247,8 +1241,8 @@ int main(int argc, char** argv) {
     }
 
     if (hookModule != nullptr) {
-        // Drain the writer before counting files: it writes on a background
-        // thread.
+        // Drain the writer, which writes on a background thread, before counting
+        // files.
         const auto flushCapture = HookExport<void (*)()>(hookModule, "MvFlushCapture");
         if (flushCapture != nullptr) {
             flushCapture();
@@ -1282,9 +1276,9 @@ int main(int argc, char** argv) {
     }
 
     // ---- Did the bytes reach disk? -----------------------------------------
-    // A separate claim from "identified the right resource": a change once left
-    // every identification PASS while writing no depth at all. Counted after
-    // the flush. MV_CAPTURE_DEPTH read as the hook reads it.
+    // Separate from identification: a change once passed every identification
+    // check while writing no depth at all. Counted after the flush.
+    // `MV_CAPTURE_DEPTH` is read as the hook reads it.
     bool depthCaptureEnabled = true;
     {
         char value[8]{};
@@ -1317,12 +1311,12 @@ int main(int argc, char** argv) {
             printf("[testhost]   velocity frames: %d\n", velocities);
             printf("[testhost]   depth frames:    %d\n", depths);
             printf("[testhost]   normals frames:  %d\n", normalsFrames);
-            // Kept apart from dumpContentsPassed, which the branches below
-            // assign outright; combined after them.
+            // Kept apart from `dumpContentsPassed`, which the branches below
+            // assign; combined after them.
             bool normalsDumpOk = true;
             constexpr int kMaxNormalsMissed = 15;
             if (!normals && normalsFrames != 0) {
-                // Off by default: one normals blob means the opt-in leaked.
+                // Off by default: any normals blob means the opt-in leaked.
                 printf("[testhost] FAIL - normals was captured without MV_SURFACES=normals\n");
                 normalsDumpOk = false;
             } else if (normals && !expectNothingSelected &&
@@ -1356,8 +1350,8 @@ int main(int argc, char** argv) {
                            ? "PASS - nothing was captured, which is correct when identification selected nothing"
                            : "FAIL - something was captured despite identification selecting nothing");
             } else if (GetEnvironmentVariableA("MV_CAPTURE_DEPTH", nullptr, 0) != 0 && !depthCaptureEnabled) {
-                // MV_CAPTURE_DEPTH=0 (the bandwidth control test): velocity but
-                // no depth is the pass.
+                // `MV_CAPTURE_DEPTH=0` (the bandwidth test): velocity without depth
+                // is the pass.
                 dumpContentsPassed = velocities > 0 && depths == 0;
                 printf("[testhost] %s\n",
                        dumpContentsPassed

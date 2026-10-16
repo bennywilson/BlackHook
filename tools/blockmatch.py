@@ -1,31 +1,23 @@
 """Block matching against the captured colour frames.
 
-This is the project's only source of *independent* ground truth. Everything
-else - the decode constants, the warp test, the scale fit - is derived from the
-velocity buffer itself, so it can only ever show internal consistency. Block
-matching measures displacement from the imagery, and knows nothing about the
-velocity buffer at all.
+The only ground truth independent of the velocity buffer: displacement measured
+from the images. The decode, warp test and scale fit all start from the buffer
+itself.
 
-Why not optical flow: the subjects here are large, smooth, low-texture objects
-(a weapon viewmodel, the flat side of a train). Farneback is unreliable on
-those - the aperture problem - and reports near-zero regardless of the truth,
-which is a failure mode that looks exactly like a correct "nothing moved"
-answer. An earlier version of derive_scale.py was built on Farneback and its
-numbers should not be trusted; see DEBUGGING.md. Block matching measures
-displacement of a *region* directly and has no such failure mode, at the cost
-of assuming the region is locally rigid.
+Block matching rather than optical flow: the subjects are large, smooth,
+low-texture objects (a weapon viewmodel, the side of a train), where Farneback
+reports near zero whatever the truth (the aperture problem). Block matching
+measures a region's displacement directly, assuming the region is locally
+rigid.
 
-Both matchers here work on the SAD (sum of absolute differences) volume:
-for every candidate integer shift, the mean absolute difference between the
-current frame and the shifted previous frame, box-filtered over a window. The
-integer minimum is then refined to sub-pixel by fitting a parabola through it
-and its two neighbours along each axis, independently. That refinement matters:
-much of the real motion in these captures is well under a pixel, and an
-integer-only matcher would report 0 for all of it and make a sub-pixel decode
-look like a phantom.
+Both matchers work on the SAD volume: for every integer shift, the mean
+absolute difference between the current frame and the shifted previous frame,
+box-filtered over a window. The integer minimum is refined to sub-pixel with a
+parabola through it and its neighbours on each axis; much of the real motion is
+under a pixel.
 
-Sign convention matches the decode: the returned displacement is the offset
-from a pixel in frame N back to where that surface was in frame N-1.
+The returned displacement is the offset from a pixel in frame N back to where
+that surface was in frame N-1, as in the decode.
 """
 import numpy as np
 
@@ -57,9 +49,8 @@ def _sad_map(cur, padded, search, dx, dy, window):
     """Box-filtered |cur - prev shifted by (dx, dy)|, at full resolution.
 
     Shift (dy, dx) samples prev at (y+dy, x+dx), so the minimising shift is the
-    current-to-previous displacement directly. `padded` is prev edge-replicated
-    by `search` on all sides, which makes each shift a plain slice - much
-    cheaper than a warp, and exact for integer offsets.
+    current-to-previous displacement. `padded` is prev edge-replicated by
+    `search` on all sides, so each shift is a slice.
     """
     h, w = cur.shape
     y0, x0 = search + dy, search + dx
@@ -68,36 +59,24 @@ def _sad_map(cur, padded, search, dx, dy, window):
 
 
 def coarse_shift(cur, prev, mask=None, max_shift=400):
-    """Integer global displacement, with no small search radius to be blind above.
+    """Integer global displacement, with no search radius limit.
 
-    THIS EXISTS BECAUSE THE TOOLING WAS THE WEAK LINK, TWICE.
+    The other matchers here refine within +-`search` pixels (14 by default). On
+    a title moving 60 px per frame their minimum sits on the edge of the box and
+    the result is a small, wrong number: against a capture moving 27 px,
+    check_decode.py once reported 1.68 px. Phase correlation fails differently:
+    it measures translation only, so a camera flying forward reads as ~0.2 px.
 
-    Everything else in this module refines a displacement within +-`search`
-    pixels, which is 14 by default. That is a sensible refinement window and a
-    hopeless search window: on a title moving 60px per frame, the minimum sits
-    on the edge of the search box on every pixel, and what comes back is not an
-    error but a plausible small number. Measured against a capture whose true
-    motion was 27px, check_decode.py reported "mean block-matched 1.68px" and
-    the decode looked wrong by 16x. It was not; the reference was.
-
-    Phase correlation is not the answer either - it measures translation only,
-    so a camera flying forward (radial expansion, no net translation) reads as
-    ~0.2px. Two references failing in two different ways looked like agreement.
-
-    So: normalised cross-correlation of a central crop over a wide window, which
-    has no radius assumption and reports its own match quality. Returns
-    (dx, dy, score); score below ~0.5 means do not trust the answer.
+    This uses normalised cross-correlation of a crop over a wide window, which
+    has no radius limit and reports its own match quality. Returns
+    (dx, dy, score); below ~0.5, do not trust the answer.
     """
     h, w = cur.shape
     if mask is not None and mask.any():
-        # Centre the template on the region being scored, not on the middle of
-        # the frame. They are not the same place and they do not move the same
-        # way: the written region of a velocity buffer is often foliage at the
-        # frame edges, whose world-position-offset animation rides on top of the
-        # camera's motion. Centring on the frame middle measures the background,
-        # leaves the residual larger than the refinement window, and the answer
-        # comes back clipped low - which is the same failure this function was
-        # written to fix, one level in.
+        # Centre the template on the scored region, not the frame: the written
+        # velocity region is often foliage at the frame edges, whose WPO motion
+        # rides on the camera's. Centred on the frame, it measures the
+        # background, and the residual exceeds the refinement window.
         ys_, xs_ = np.where(mask)
         cy, cx = int(ys_.mean()), int(xs_.mean())
         hy, hx = int(h * 0.22), int(w * 0.20)
@@ -118,33 +97,26 @@ def coarse_shift(cur, prev, mask=None, max_shift=400):
 
 
 def global_shift(cur, prev, mask, search=14, max_samples=20000, seed=0, coarse=True):
-    """Single rigid displacement of the masked region, to sub-pixel precision.
+    """One rigid displacement of the masked region, to sub-pixel precision.
 
-    Used both as ground truth for a region that really is one rigid object, and
-    as the "best global translation" control in warp_validate.py - if a single
-    shift explains the frame as well as the per-pixel field does, the per-pixel
-    field has not been shown to carry per-pixel information.
+    Ground truth for a region that is one rigid object, and the "best global
+    translation" control in warp_validate.py: if one shift explains the frame as
+    well as the per-pixel field, the field has shown nothing per-pixel.
 
-    Scores only the masked pixels, not their bounding box. The written region
-    of a velocity buffer is rarely box-shaped - a weapon viewmodel fills ~8% of
-    the frame but its bounding box is far larger - and averaging over the box
-    drowns the moving subject in static background, dragging the match toward
-    (0,0) and making any decode look like a phantom.
+    Scores the masked pixels only, not their bounding box: a weapon viewmodel
+    fills ~8% of the frame but its box far more, and the static background in
+    the box pulls the match toward (0, 0).
 
-    Those pixels are then subsampled to `max_samples`. Evaluating every masked
-    pixel at every one of (2*search+1)^2 candidate shifts is ~10^9 operations
-    per frame pair, which made a full validation run take longer than the
-    capture did; 20k samples is far more than enough to localise a mean
-    absolute difference and makes it ~100x cheaper. The sample is drawn from a
-    fixed seed so results are reproducible.
+    The masked pixels are subsampled to `max_samples` (fixed seed): every pixel
+    at every shift is ~10^9 operations per pair, and 20k samples localise the
+    minimum as well.
 
-    Returns (dx, dy) as floats, or None if the mask is too small or too close
-    to the border to search.
+    Returns (dx, dy), or None if the mask is too small or too near the border.
     """
     h, w = cur.shape
-    # Centre the refinement window on a coarse estimate, so `search` bounds the
-    # PRECISION of the answer rather than its MAGNITUDE. Without this the whole
-    # function silently returns ~0 whenever the true motion exceeds `search`.
+    # Centre the refinement window on a coarse estimate, so `search` limits the
+    # precision of the answer, not its size. Without it, anything faster than
+    # `search` would come back as ~0.
     cdx = cdy = 0
     if coarse:
         cdx, cdy, score = coarse_shift(cur, prev, mask)
@@ -172,9 +144,8 @@ def global_shift(cur, prev, mask, search=14, max_samples=20000, seed=0, coarse=T
 
     iy, ix = np.unravel_index(np.argmin(scores), scores.shape)
     dy, dx = iy - search, ix - search
-    # Refine, where the minimum is not on the edge of the search window. A
-    # minimum sitting on the edge means the true displacement is outside the
-    # search radius, and interpolating there would invent precision.
+    # Refine only where the minimum is inside the window. On the edge, the true
+    # displacement is outside it.
     if 0 < ix < n - 1:
         dx += _parabolic1(scores[iy, ix - 1], scores[iy, ix], scores[iy, ix + 1])
     if 0 < iy < n - 1:
@@ -185,30 +156,22 @@ def global_shift(cur, prev, mask, search=14, max_samples=20000, seed=0, coarse=T
 def _dense_residual(cur, prev, search, window):
     """Per-pixel displacement field, sub-pixel, from the SAD volume.
 
-    This is what the scale fit needs: a displacement measured *independently at
-    each pixel*, so the regression against the decoded field has real per-pixel
-    variation on both axes rather than one number per frame.
+    The scale fit needs displacement measured at each pixel, so the regression
+    against the decoded field varies per pixel on both axes.
 
-    `window` is the correlation window in pixels - large enough that a smooth
-    surface still has enough gradient inside it to localise, small enough that
-    two objects moving differently rarely share one. `search` bounds the
-    representable displacement; anything faster is clipped to the window edge
-    and flagged via the returned confidence.
+    `window` is the correlation window: large enough for a smooth surface to
+    localise, small enough that two objects moving differently rarely share
+    one. `search` bounds the displacement; anything faster is pinned to the
+    window edge and flagged.
 
     Returns (flow_xy, confidence, clipped):
       flow_xy    (h, w, 2) float32, pixels, current -> previous
-      confidence SAD margin between best and second-best distinct shift - low
-                 values mean an ambiguous match (flat or repeating region)
-      clipped    True where the RESIDUAL landed on the edge of the search
-                 window, i.e. the match was pinned rather than measured
-
-    `clipped` is returned rather than left to the caller to infer from the
-    magnitude of flow_xy. That inference used to be `abs(flow) < search`, which
-    was equivalent while `search` bounded the whole displacement - and became
-    wrong the moment a coarse pre-shift was added, because the total then
-    legitimately exceeds the window and only the residual can be pinned. The
-    old test silently discarded every pixel moving faster than the window,
-    which is precisely the population the scale fit needs.
+      confidence SAD margin between the best and second-best distinct shift;
+                 low means an ambiguous match (flat or repeating region)
+      clipped    True where the residual is on the edge of the search window:
+                 pinned, not measured. Returned because, with a coarse
+                 pre-shift, the total can exceed the window and only the
+                 residual can be pinned.
     """
     if cv2 is None:
         raise RuntimeError("blockmatch requires opencv-python")
@@ -217,9 +180,8 @@ def _dense_residual(cur, prev, search, window):
     h, w = cur.shape
     padded = cv2.copyMakeBorder(prev, search, search, search, search, cv2.BORDER_REPLICATE)
 
-    # Two streaming passes rather than one materialised SAD volume: at these
-    # resolutions a (2*search+1)^2 x h x w float32 stack is gigabytes, which is
-    # how the first version of this fell over.
+    # Two streaming passes instead of a full SAD volume, which at these
+    # resolutions would be gigabytes.
     #
     # Pass 1: running argmin over shifts.
     best = np.full((h, w), np.inf, dtype=np.float32)
@@ -233,10 +195,9 @@ def _dense_residual(cur, prev, search, window):
             best_dx[better] = dx
             best_dy[better] = dy
 
-    # Pass 2: the three SAD samples each pixel needs for its own sub-pixel fit,
-    # plus the best score outside a 3x3 neighbourhood of the winner (the
-    # ambiguity margin). Both depend on where the winner landed, which is only
-    # known after pass 1.
+    # Pass 2: the three SAD samples each pixel's sub-pixel fit needs, and the
+    # best score outside a 3x3 neighbourhood of the winner (the ambiguity
+    # margin). Both need pass 1's winner.
     s_xm = np.full((h, w), np.nan, dtype=np.float32)
     s_xp = np.full((h, w), np.nan, dtype=np.float32)
     s_ym = np.full((h, w), np.nan, dtype=np.float32)
@@ -253,8 +214,8 @@ def _dense_residual(cur, prev, search, window):
             far = (np.abs(best_dy - dy) > 1) | (np.abs(best_dx - dx) > 1)
             second = np.where(far & (sad < second), sad, second)
 
-    # A minimum on the edge of the search window is a clipped match, not a
-    # refinable one - its outer neighbour was never evaluated (NaN here).
+    # A minimum on the edge of the window is pinned, not refinable: its outer
+    # neighbour was never evaluated (NaN here).
     ddx = np.where(np.isnan(s_xm) | np.isnan(s_xp), 0.0,
                    _parabolic(np.nan_to_num(s_xm), best, np.nan_to_num(s_xp)))
     ddy = np.where(np.isnan(s_ym) | np.isnan(s_yp), 0.0,
@@ -270,32 +231,19 @@ def _dense_residual(cur, prev, search, window):
 def dense(cur, prev, search=8, window=17, levels=4):
     """Per-pixel displacement field, coarse-to-fine over an image pyramid.
 
-    WHY A PYRAMID, AND WHAT IT REPLACED
+    A single level searches +-`search` around zero, so `search` limits how far a
+    pixel can move. On a title moving 15-70 px per frame every fast pixel is
+    pinned and discarded, and the scale fit sees only the slowest 1% (slope
+    0.73 where a correct decode gives 1.000). A single global pre-shift does not
+    fix it: a pixel moving differently from the scene, which is what velocity
+    is written for, is still pinned. Warping by the upsampled flow at each level
+    gives every pixel its own coarse estimate.
 
-    The single-level version searched +-`search` pixels around zero, which made
-    `search` bound the representable displacement rather than the precision of
-    it. On the title this was developed against that was invisible: motion was
-    under a pixel. On a second title moving 15-70px per frame it was fatal, and
-    fatal quietly - every fast pixel pinned to the window edge, discarded by the
-    caller's clipping filter, and the scale regression left fitting the slowest
-    1% of the frame. The reported slope was 0.73 where a correct decode gives
-    1.000, which reads exactly like a decode error rather than a measurement
-    that never saw the data.
+    Reach is about search * (2^levels - 1): ~120 px at the defaults, with the
+    same sub-pixel precision at level 0.
 
-    A single GLOBAL pre-shift is not enough either. It centres every pixel's
-    search on the same displacement, so a pixel moving differently from the
-    scene as a whole - which is the entire point of a per-pixel field, and is
-    what velocity is written for - is still pinned. Only a per-pixel coarse
-    estimate fixes that, which is what warping by the upsampled flow at each
-    level provides.
-
-    Representable displacement is now roughly search * (2^levels - 1): ~120px
-    at the defaults, against 8px before, while level 0 still refines to the same
-    sub-pixel precision.
-
-    Returns (flow_xy, confidence, clipped) exactly as the single-level core does;
-    `clipped` refers to the residual at the finest level, which is the only
-    level where being pinned still means the answer is untrustworthy.
+    Returns (flow_xy, confidence, clipped) as the single-level matcher does;
+    `clipped` refers to the residual at the finest level.
     """
     if cv2 is None:
         raise RuntimeError("blockmatch requires opencv-python")

@@ -18,7 +18,7 @@ namespace
 {
 
 // Resolved once: the configured root if it exists or can be created, else
-// %TEMP%. Every later OutputDir() call is a single CreateDirectoryA.
+// %TEMP%.
 const std::string& OutputRoot()
 {
     static const std::string root = []
@@ -51,12 +51,10 @@ std::string Timestamp()
     return buf;
 }
 
-// Writes are flushed every kFlushEvery lines.
 constexpr int kFlushEvery = 500;
 
-// std::ofstream, not FILE_APPEND_DATA: single-injection is enforced at the
-// launcher (refuses >1 matching process, refuses an already-loaded target),
-// so only one process ever has a given log file open.
+// `std::ofstream` rather than shared-write access: the launcher refuses to
+// inject twice, so only one process opens a given log.
 struct NamedFile
 {
     std::ofstream stream;
@@ -69,7 +67,7 @@ std::unordered_map<std::string, NamedFile>& NamedLogFiles()
     return files;
 }
 
-// Caller must hold LogMutex().
+// Caller must hold `LogMutex()`.
 NamedFile* FileFor(const std::string& name)
 {
     auto& files = NamedLogFiles();
@@ -92,7 +90,6 @@ std::string OutputDir(const std::string& subdir)
     return dir;
 }
 
-// Low-volume log, flushed per-line
 void Log(const std::string& message)
 {
     std::lock_guard<std::mutex> lock(LogMutex());
@@ -105,7 +102,6 @@ void Log(const std::string& message)
     f->stream.flush();
 }
 
-// High-volume log, flushed every kFlushEvery lines
 void LogTo(const std::string& name, const std::string& message)
 {
     std::lock_guard<std::mutex> lock(LogMutex());

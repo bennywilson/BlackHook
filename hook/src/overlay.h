@@ -10,19 +10,18 @@
 namespace mv
 {
 
-// Draws extracted surfaces into the game's back buffer at Present. F7 cycles
-// through (MV_OVERLAY=<n> picks the starting mode):
+// Draws captured surfaces into the game's back buffer at Present. F7 cycles the
+// modes; `MV_OVERLAY=<n>` picks the starting one.
 //
-//   0  Normal            - chained straight through, zero GPU cost
-//   1  SceneVelocity     - the stored channels mapped straight to RGB, the
-//                          same picture the engine's own
-//                          "visualizetexture SceneVelocity" draws
-//   2  Over gameplay     - the same, composited over the live frame
-//   3  GBuffer grid      - 2x2: frame   | depth (log-scaled, last edge before velocity)
-//                               normals | specular (metallic/spec/rough)
-//                          Raw channels, no decode. A quadrant whose surface
-//                          was not refreshed this frame gets a red border;
-//                          normals/specular need MV_SURFACES to be identified.
+//   0  Off             Nothing drawn, no GPU cost.
+//   1  SceneVelocity   The channels straight to RGB, as the engine's
+//                      `visualizetexture SceneVelocity` shows them.
+//   2  Over gameplay   The same, composited over the frame.
+//   3  GBuffer grid    2x2: frame   | depth (log-scaled)
+//                           normals | specular
+//                      Raw channels. A quadrant whose surface was not
+//                      refreshed this frame gets a red border. Normals and
+//                      specular need `MV_SURFACES`.
 //
 enum class OverlayMode
 {
@@ -33,34 +32,27 @@ enum class OverlayMode
     Count = 4
 };
 
-// Called from the Present hooks before chaining through, while the back buffer
-// `frame` is the presented-frame counter. This function checsk that the velocity texture
-// being drawn actually belongs to this frame.
+// Called from the Present hooks before the real Present. `frame` is the
+// present count, used to check that each copy being drawn is this frame's.
 void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint64_t frame);
 
-// Records a copy of `surface` (capture.h index) into the overlay's own SRV-able
-// texture for it. Velocity feeds modes 1-2 and paces depth's copy; depth,
-// normals and specular are the grid's other quadrants.
-// Called at the surface's trigger edge, where the source is known to hold
-// valid contents (they are transient resources). The first edge of a frame
-// wins - except depth, which keeps re-copying until velocity has been copied
-// that frame (its first edge can be a partial pass). A no-op unless the
-// current mode needs that surface. `frame` stamps the copy so
-// OverlayOnPresent knows if it is this frame's.
+// Copies `surface` (a `capture.h` index) into the overlay's own texture for it,
+// at the surface's trigger edge, where the transient source is complete. The
+// first edge of a frame wins, except depth, which is copied again on each edge
+// until velocity has been (its first edge can be a partial pass). A no-op
+// unless the current mode draws that surface. `frame` stamps the copy.
 void OverlayCaptureSurface(
     int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Resource* source,
     D3D12_RESOURCE_STATES stateBefore, uint64_t frame);
 
-// The overlay records its own barriers and submissions; they must go through
-// the original function pointers, not our hooks, so they do not re-enter
-// identification/logging.
+// The overlay's barriers and submissions go through the original functions,
+// not the hooks.
 void OverlaySetOriginals(ResourceBarrierFn resourceBarrier, ExecuteCommandListsFn executeCommandLists);
 
 void StartOverlayHotkeyThread();
 
-// Stops the F7 hotkey poller. Always detaches, never joins: by the time
-// DLL_PROCESS_DETACH runs at process exit, Windows has already killed the
-// thread, and destroying a still-joinable std::thread calls std::terminate().
+// Stops the F7 thread. Detaches: at `DLL_PROCESS_DETACH` Windows has already
+// ended it, and destroying a joinable `std::thread` terminates.
 void StopOverlayHotkeyThread();
 
 } // namespace mv

@@ -1,25 +1,18 @@
-"""Render the captured motion field as a video alongside the gameplay.
+"""Render the captured motion field as a video beside the gameplay.
 
-Three panels: the game's own back buffer, the extracted SceneVelocity field on
-its own, and the field composited over the frame. Panel 2 is deliberately
-shown raw rather than only as an overlay. SceneVelocity holds velocity for
-*dynamic and world-position-offset geometry only* - 11-13% of pixels in the
-station capture (the train, background characters and signage, and the weapon
-viewmodel), 7-9% in the corridor capture where the viewmodel is the only thing
-moving, ~21% in the Skyrunner flight captures. Static-geometry motion is
-reconstructed from camera matrices inside the consuming TSR/motion-blur shader
-and is genuinely not in this buffer, so a mostly-black panel is the honest
-picture of its contents rather than a bug in the visualisation.
+Three panels: the game's back buffer, the SceneVelocity field alone, and the
+field over the frame. SceneVelocity holds velocity for dynamic and WPO geometry
+only (7-21% of pixels in the captures so far); the consuming TSR and
+motion-blur shaders reconstruct static geometry from the camera, so a mostly
+black middle panel is correct.
 
-The hue-for-direction colouring here is the optical-flow (Middlebury)
-convention, imported by us. Unreal draws nothing like it, so this view has no
-engine ground truth to be checked against - the in-game overlay deliberately
-shows the raw channel mapping instead. See DEBUGGING.md.
+Hue for direction is the optical-flow (Middlebury) convention; the engine has
+no such view to check it against, so the in-game overlay shows the raw
+channels instead.
 
 Usage:  python make_video.py <dump_dir> [out.mp4] [--preview] [--still N]
-        [--still N]             write one PNG of frame N (or the middle frame if
-                                N is omitted) instead of a video - this is what
-                                produces the README's lead figure
+        --still N   write one PNG of frame N (the middle frame if N is
+                    omitted) instead of a video; this makes the README figure
 """
 import os
 import sys
@@ -51,11 +44,8 @@ indices = mvtools.frame_indices(dump_dir)
 cw, ch = dump.surface("color").width, dump.surface("color").height
 vw, vh = dump.surface("velocity").width, dump.surface("velocity").height
 
-# Target a fixed panel width rather than a fixed downscale ratio, so panel
-# (and text) size stays legible regardless of capture resolution. 640 was
-# chosen to match this project's native ~1708px-wide captures, which used a
-# fixed 0.36 ratio (-> ~615px panels); a 960px capture at that same ratio
-# gives ~345px panels, small enough that label text visibly pixelates.
+# A fixed panel width rather than a fixed scale, so panels and text stay
+# legible at any capture resolution.
 target_panel_width = 640
 scale = min(1.0, target_panel_width / cw)
 pw, ph = max(1, int(cw * scale)), max(1, int(ch * scale))
@@ -78,10 +68,7 @@ def colour_wheel(size):
 
 
 def label(img, text, colour=(255, 255, 255)):
-    # Font size is derived from the panel's own width rather than fixed, so it
-    # still fits at a low capture resolution. 0.58 @ 2px was tuned against this
-    # project's native-resolution captures (~615px-wide panels); at 960x540
-    # panels are only ~345px wide and the fixed size ran text off the edge.
+    # Font size follows the panel width, so text fits at low resolutions.
     w = img.shape[1]
     font_scale = max(0.30, min(0.58, w / 615.0 * 0.58))
     thickness = 2 if font_scale >= 0.45 else 1
@@ -116,11 +103,8 @@ def fields_for(index):
     return uv, written
 
 
-# One magnitude scale for the whole clip, so brightness is comparable frame to
-# frame rather than silently renormalising per frame - but derived from this
-# capture instead of hardcoded, because captures can differ by more than an
-# order of magnitude in displacement and a constant tuned for one renders the
-# other as a flat white or a flat black.
+# One magnitude scale for the whole clip, so brightness compares across frames,
+# derived from this capture: captures differ by more than 10x in speed.
 probe = indices[::max(1, len(indices) // 6)][:6]
 mags = []
 for index in probe:
@@ -140,15 +124,12 @@ def render(index):
     bgr = (mvtools.to_display(color)[:, :, ::-1] * 255).astype(np.uint8)
 
     field_rgb = mvtools.flow_to_rgb(uv, meta, max_pixels=MAX_PIXELS)
-    # Force unwritten pixels to actual black rather than leaving them at
-    # flow_to_rgb's brightness floor. The floor exists so slow-moving written
-    # pixels do not vanish; applied to unwritten ones it paints "no data" in the
-    # same colour vocabulary as data, and which pixels the engine wrote is
-    # exactly what this panel is for.
+    # Unwritten pixels go to black, not to `flow_to_rgb`'s brightness floor:
+    # which pixels the engine wrote is what this panel shows.
     field_rgb[~written] = 0
 
-    # Velocity is at render resolution (DRS); the back buffer is at output
-    # resolution - resize up before compositing or laying out.
+    # Velocity is at render resolution (dynamic resolution), the back buffer
+    # at output resolution: resize up before compositing.
     field_full = cv2.resize(field_rgb, (cw, ch), interpolation=cv2.INTER_NEAREST)
     mask_full = cv2.resize(written.astype(np.uint8), (cw, ch), interpolation=cv2.INTER_NEAREST) > 0
     composited = bgr.copy()

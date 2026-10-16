@@ -1,36 +1,23 @@
 """Warp-and-difference validation of the extracted motion field.
 
-Takes frame N-1, warps it by the motion field captured at frame N, and
-compares the result against the real frame N. If the vectors are correct (and
-correctly decoded, signed and scaled) the warped image should match frame N
-noticeably better than the un-warped frame N-1 does.
+Warps frame N-1 by the motion field captured at frame N and compares it with
+the real frame N. If the vectors are correctly decoded, signed and scaled, the
+warped frame matches frame N better than frame N-1 does.
 
-Only pixels where the velocity buffer was actually written are scored - UE5
-writes SceneVelocity for dynamic objects only, leaving static geometry to be
-reconstructed from camera matrices by the consuming shader. Scoring the
-unwritten region would be measuring something this buffer never claimed to
-contain.
+Only pixels the velocity buffer wrote are scored: UE5 writes SceneVelocity for
+dynamic objects only, and the consuming shader reconstructs static geometry
+from the camera.
 
-WHAT THIS TEST IS WORTH, stated up front because it is easy to over-read.
+The decode constants come from Common.ush (see mvtools.py), not from this test,
+so the multiplier sweep in step 1 is an independent check: a peak at 1.0 is
+evidence the decode is right. Step 2 scores the real field against three
+controls: a sign flip, the best single global translation, and a mismatched
+frame's field. A single rigid shift also reduces error on a scene dominated by
+one moving object, so the field must beat all three to count as per-pixel
+correct.
 
-Two things changed since the version of this script that produced the numbers
-quoted in earlier drafts, and both change how much the result means:
-
-  * The decode constants are no longer fitted to this test. They are now read
-    out of Common.ush (see mvtools.py). The multiplier sweep in step 1 used to
-    be circular - it recovered the value it had itself produced - and is now an
-    independent check: nothing downstream tuned it, so a peak at 1.0 is real
-    evidence that the source-derived decode is right.
-
-  * There are now control conditions. "Warping by this field reduces error" is
-    a weak claim on its own: a single rigid shift would do that too on a scene
-    dominated by one large moving object. Step 2 scores the real field against
-    a sign flip, against the best possible single global translation, and
-    against a deliberately mismatched frame's field. The per-pixel field has
-    to beat all three before "per-pixel correct" is a fair description.
-
-It still scores only the ~8-13% of pixels the velocity buffer wrote, using a
-mask derived from that same buffer. It is not a full-screen result.
+The score covers only the ~8-13% of pixels the buffer wrote, masked by that
+same buffer. It is not a full-screen result.
 """
 import os
 import sys
@@ -48,9 +35,8 @@ cw, ch = dump.surface("color").width, dump.surface("color").height
 
 grid_x, grid_y = np.meshgrid(np.arange(cw, dtype=np.float32), np.arange(ch, dtype=np.float32))
 
-# How far ahead the mismatched-frame control reaches for a wrong field. Far
-# enough that it is genuinely a different moment, close enough that it is still
-# the same shot with a similar written region.
+# How far ahead the mismatched-frame control takes its field: a different
+# moment, but the same shot with a similar written region.
 MISMATCH_OFFSET = 5
 
 
@@ -82,10 +68,8 @@ def masked_mae(a, b, mask):
 def load_pair(prev_i, cur_i, flow_from=None):
     """(prev, cur, flow, mask) for a pair, or None if nothing was written.
 
-    flow_from lets the mismatched-frame control take its field from a different
-    frame than the one being scored, while keeping the scored mask the same -
-    otherwise the control would be scoring a different set of pixels too and
-    the comparison would not be like for like.
+    `flow_from` gives the mismatched-frame control its field from another frame
+    while the scored mask stays the same, so both score the same pixels.
     """
     prev = to_display(mvtools.load_color(os.path.join(dump_dir, f"color_{prev_i:05d}.bin"), meta))
     cur = to_display(mvtools.load_color(os.path.join(dump_dir, f"color_{cur_i:05d}.bin"), meta))
@@ -93,9 +77,8 @@ def load_pair(prev_i, cur_i, flow_from=None):
     written = mvtools.velocity_written_mask(vel_path, meta)
     flow = mvtools.decode_velocity(os.path.join(
         dump_dir, f"vel_{(flow_from if flow_from is not None else cur_i):05d}.bin"), meta)
-    # Unwritten pixels hold 0, which decodes to a large bogus displacement -
-    # zero them so "no data" warps as "no motion" rather than smearing static
-    # geometry across the frame.
+    # Unwritten pixels hold 0, which decodes to a large false displacement:
+    # zero them so they warp as "no motion".
     flow[~written] = 0.0
     mask = cv2.resize(written.astype(np.uint8), (cw, ch), interpolation=cv2.INTER_NEAREST) > 0
     if mask.sum() == 0:
@@ -108,10 +91,8 @@ if not all_pairs:
     sys.exit("no adjacent frame pairs in this dump")
 print(f"pairing: {adjacency_note}")
 
-# Probe and scored sets are DISJOINT. Previously the probe pairs were a subset
-# of the scored ones, so the multiplier was chosen on data it was then scored
-# on - a small leak, but the kind that quietly turns a validation back into a
-# fit. Every 7th pair probes; the rest are scored and never touched by step 1.
+# The probe and scored sets are disjoint, so the multiplier is not chosen on
+# the data it is scored on. Every 7th pair probes; the rest are scored.
 probe_pairs = all_pairs[::7][:15]
 probe_set = set(probe_pairs)
 scored_pairs = [p for p in all_pairs if p not in probe_set]
@@ -149,8 +130,8 @@ if best_score >= baseline:
     print("  peak. Read that as 'this capture has no motion to reconstruct', not as a")
     print("  measurement. Recapture with real motion in frame.")
 
-# The scored run below deliberately uses 1.0, not best_mult. Scoring at the
-# swept optimum would reintroduce exactly the circularity this split removes.
+# The scored run uses 1.0, not best_mult: scoring at the swept optimum would
+# make the test a fit.
 SCALE = 1.0
 print(f"Scoring below uses multiplier {SCALE} (the unmodified engine decode), "
       f"not the swept optimum.\n")
@@ -211,8 +192,7 @@ for i, name in enumerate(names):
     print(f"  {name:>20}   {col[ok].mean():9.5f}   {delta:+11.1f}%   "
           f"{wins:>10}/{int(ok.sum()):<9}")
 
-# Explicit verdicts, so the reader does not have to do the comparison. Each of
-# these is a claim the numbers above either support or do not.
+# Explicit verdicts for each claim the numbers above support or not.
 print("\nControl verdicts:")
 pp = arr[:, 1]
 
@@ -248,12 +228,8 @@ if ok.any():
         print("         That is a limitation of the footage, not a pass.")
 
 # --- Step 3: write visual evidence ----------------------------------------
-# "A number in a log is not evidence" - dump the actual images so the result
-# can be seen rather than trusted.
-#
-# This picks the pair with the LARGEST un-warped error, i.e. the most motion in
-# the capture. That is the most legible pair, not a typical one - do not
-# describe it as representative.
+# Uses the pair with the largest un-warped error (the most motion): the most
+# legible pair, not a typical one.
 best_pair = max(rows, key=lambda r: r[1])[0]
 loaded = load_pair(best_pair - 1, best_pair)
 prev, cur, flow, mask = loaded
@@ -261,7 +237,7 @@ warped = warp(prev, flow, SCALE)
 
 diff_before = np.abs(prev - cur).mean(axis=2)
 diff_after = np.abs(warped - cur).mean(axis=2)
-# Crop to the region that actually has velocity, so the comparison is legible
+# Crop to the region that has velocity, so the comparison is legible.
 ys, xs = np.where(mask)
 y0, y1 = max(ys.min() - 20, 0), min(ys.max() + 20, ch)
 x0, x1 = max(xs.min() - 20, 0), min(xs.max() + 20, cw)
@@ -281,9 +257,8 @@ for label, img in panels:
     imgs.append(img)
 montage = np.hstack(imgs)
 out_path = sys.argv[2] if len(sys.argv) > 2 else paths.out_path("warp_validation.png")
-# Clamp the figure width. At 1707x1067 a five-panel montage is 8535px wide and
-# 14MB, which is not a sensible thing to commit to a repository and is wider
-# than anything will ever display it. The panels stay legible at half that.
+# Cap the figure width: at 1707x1067 a five-panel montage is 8535 px wide and
+# 14 MB.
 MAX_FIGURE_WIDTH = 4200
 if montage.shape[1] > MAX_FIGURE_WIDTH:
     scale = MAX_FIGURE_WIDTH / montage.shape[1]

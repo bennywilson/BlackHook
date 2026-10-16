@@ -1,24 +1,13 @@
 """Run every offline check against a dump and write results/validation.txt.
 
-The point of this script is reproducibility. The validation numbers quoted in
-README.md and DEBUGGING.md were, for most of this project's life, produced by
-script revisions that were never committed - at one point the figure in
-results/ had panel labels that matched no code in the repo. A reader had no way
-to check any of it without a capture of their own, and neither did I after the
-capture that produced them was overwritten.
-
-So: one command, every tool, output captured verbatim into results/, including
-the failures. If a number appears in the write-up it should be findable here.
+One command runs every tool and writes its output, failures included, into
+results/, so every number in the README can be traced to a file.
 
 Usage:  python run_validation.py [dump_dir] [tag]
 
 `tag` names the title the dump came from and is appended to every output file
-(results/validation_<tag>.txt, warp_validation_<tag>.png, ...). It exists
-because this project now covers more than one game, and the first runs against
-a second title overwrote the first title's committed results - the same class
-of loss as the capture that was overwritten and could not be regenerated, and
-harder to notice, because the file still exists and still looks plausible.
-Omit it for the original results/validation.txt.
+(results/validation_<tag>.txt, warp_validation_<tag>.png, ...), so results for
+one game do not overwrite another's. Omit it for results/validation.txt.
 """
 import os
 import subprocess

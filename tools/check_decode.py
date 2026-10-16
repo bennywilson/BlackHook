@@ -1,30 +1,18 @@
-"""Check the decoded velocity against directly measured image motion.
+"""Check the decoded velocity against measured image motion.
 
-This is the test the decode actually needed, and the one that was missing for
-most of the project: it compares, per frame pair, what the decode *claims* the
-written region moved against what the imagery *shows* it moved. Ground truth is
-block matching (see blockmatch.py), which knows nothing about the velocity
-buffer.
+Per frame pair, compares the displacement the decode gives for the written
+region with what block matching (blockmatch.py) measures from the images. It
+also runs a linear decode with fitted constants beside the engine's:
 
-It also runs the decode this project used to use - a plain linear decode with
-fitted constants - alongside the engine's real one, because the difference
-between them is the project's main debugging result and this is where it is
-reproducible. The short version:
-
-  * SceneVelocity is SQUARE-ROOT encoded. VELOCITY_ENCODE_GAMMA is 1 for every
+  * SceneVelocity is square-root encoded. VELOCITY_ENCODE_GAMMA is 1 on every
     SM5+ platform (Common.ush:238), so `sqrt(abs(V))*sqrt(2)` is applied before
-    the UNORM quantisation and must be undone after it.
-  * Decoding it linearly overstates small motions badly - sqrt is steepest near
-    zero - which is what produced ~1.7px of confident, consistently-signed
-    "motion" on a viewmodel that block matching put at 0.00px. That was read as
-    a zero-point error for a while. It is not: the zero point is exactly where
-    Common.ush says it is.
-  * Channels 2 and 3 are not colour and not displacement. They are the float32
-    bit pattern of V.z (the DeviceZ delta) split into high and low halves, with
-    the bottom bit of channel 3 carrying bHasPixelAnimation. Reassembled they
-    are a clean, tightly-clustered float; viewed as channels they look like one
-    bimodal channel and one noise channel, which is what misled the earlier
-    reading of them.
+    UNORM quantisation and must be undone after it.
+  * A linear decode overstates small motions (sqrt is steepest near zero): it
+    gives ~1.7 px of steady motion on a viewmodel block matching puts at 0.00 px.
+    The zero point is where Common.ush says it is.
+  * Channels 2 and 3 are the float32 bit pattern of V.z (the DeviceZ delta),
+    high and low halves, with the bottom bit of channel 3 holding
+    bHasPixelAnimation. Reassembled they give a tightly clustered float.
 
 Usage:  python check_decode.py [dump_dir] [max_pairs]
 """
@@ -45,13 +33,12 @@ indices = mvtools.frame_indices(dump_dir)
 cw, ch = dump.surface("color").width, dump.surface("color").height
 vw, vh = dump.surface("velocity").width, dump.surface("velocity").height
 
-# Integer search radius, in output-resolution pixels. Wide enough for the
-# fastest thing seen in these captures (a train at ~11px/frame).
+# Integer search radius in output pixels: enough for the fastest motion in
+# these captures (a train at ~11 px/frame).
 SEARCH = 14
 UE5_ZERO_CODE = 32767
 
-# The constants this project used before the encoding was read properly. Kept
-# only so the failure they produced stays reproducible from the repo.
+# Linear-decode constants fitted to one capture, for comparison.
 LEGACY_UV_PER_UNIT_X = -0.1758
 LEGACY_UV_PER_UNIT_Y = +0.1991
 
@@ -62,7 +49,7 @@ def gray(i):
 
 
 def legacy_decode(raw):
-    """The old linear decode, for side-by-side comparison only."""
+    """A linear decode, for comparison only."""
     out = np.empty(raw.shape[:2] + (2,), dtype=np.float32)
     out[:, :, 0] = (raw[:, :, 0] - 0.5) * LEGACY_UV_PER_UNIT_X
     out[:, :, 1] = (raw[:, :, 1] - 0.5) * LEGACY_UV_PER_UNIT_Y
@@ -120,9 +107,8 @@ print(f"mean |engine - measured|:      "
       f"{np.abs(np.hypot(arr[:, 0] - arr[:, 2], arr[:, 1] - arr[:, 3])).mean():.3f} px")
 print(f"mean |legacy  - measured|:     {np.abs(arr[:, 6] - arr[:, 5]).mean():.3f} px")
 
-# Correlation is only meaningful if the ground truth actually varies. A capture
-# where every pair matches at the same shift has no dynamic range to correlate
-# against, and reporting r on it would be misleading.
+# Correlation needs the ground truth to vary: with every pair at the same
+# shift, r means nothing.
 for axis, (dcol, bcol) in enumerate([(0, 2), (1, 3)]):
     name = "X" if axis == 0 else "Y"
     if np.ptp(arr[:, bcol]) < 0.25:
@@ -135,10 +121,8 @@ print(f"\nzero point, vs UE5 documented {UE5_ZERO_CODE} (Common.ush:2069):")
 for c in (0, 1):
     modes = np.array([m for cc, m in zero_offsets if cc == c])
     off = modes.mean() - UE5_ZERO_CODE
-    # What that code offset means once the sqrt encoding is undone. This is the
-    # line that settles it: an offset of a few hundred codes is not a broken
-    # zero point, it is a fraction of a pixel of real motion, magnified by the
-    # encoding being steepest exactly there.
+    # What that code offset is once the sqrt encoding is undone: a few hundred
+    # codes near zero are a fraction of a pixel.
     res = vw if c == 0 else vh
     g = (off / 65535.0) / mvtools.ENCODE_SCALE
     px = abs(g * abs(g) * 0.5 * 0.5) * res
@@ -154,9 +138,8 @@ sample = pairs[len(pairs) // 2][1] if pairs else indices[0]
 vel_path = os.path.join(dump_dir, f"vel_{sample:05d}.bin")
 written = mvtools.velocity_written_mask(vel_path, meta)
 if mvtools.velocity_channels(meta)[0] < 4:
-    # Not a failure and not a gap in the analysis: NeedVelocityDepth() picks the
-    # format AND whether V.z is written, so a 2-channel capture provably has no
-    # depth channels to look at.
+    # `NeedVelocityDepth()` decides both the format and whether V.z is written,
+    # so a 2-channel capture has no depth channels.
     print("  this capture is 2-channel (PF_G16R16), so there are no channels 2/3 - "
           "NeedVelocityDepth() was false on this title, which is the same predicate "
           "that chose the format (VelocityRendering.cpp:758)")

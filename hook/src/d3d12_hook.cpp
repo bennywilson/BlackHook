@@ -28,11 +28,9 @@ namespace mv
 namespace
 {
 
-// Vtable slot indices, verified against the Windows SDK IDL (dxgi.idl,
-// dxgi1_2.idl, d3d12.idl - 10.0.26100.0), not guessed from memory: each
-// interface's vtable is [inherited IUnknown/base methods][this interface's
-// own methods in declaration order]. COM guarantees these indices are
-// stable across vendors and OS versions.
+// Vtable slot indices, from the Windows SDK IDL (dxgi.idl, dxgi1_2.idl,
+// d3d12.idl, 10.0.26100.0). A vtable is the inherited methods followed by the
+// interface's own in declaration order; COM keeps these indices stable.
 //
 // IDXGISwapChain:
 //      [00-02] IUnknown                (QueryInterface, AddRef, Release)
@@ -64,15 +62,13 @@ constexpr size_t kPresent1Index = 22;
 constexpr size_t kExecuteCommandListsIndex = 10;
 constexpr size_t kResourceBarrierIndex = 26;
 
-// Idiomatic way to hook COM interfaces in C++ using MinHook
 void* VTableEntry(void* instance, size_t index)
 {
     void** vtable = *reinterpret_cast<void***>(instance);
     return vtable[index];
 }
 
-// Hook Function Pointer Signatures.
-// Note: First parameter is always the implicit 'this' interface pointer.
+// The hooked functions' signatures; the first parameter is `this`.
 using Present_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
@@ -84,8 +80,8 @@ ExecuteCommandLists_t g_originalExecuteCommandLists = nullptr;
 ResourceBarrier_t g_originalResourceBarrier = nullptr;
 
 // The present count: the frame key pairing a frame's barrier-time copies with
-// its Present. Atomic since multiple threads record command lists in parallel;
-// the counters below are diagnostics only.
+// its Present. Atomic: games record command lists on several threads. The
+// counters below are diagnostics only.
 std::atomic<uint64_t> g_frameCounter{0};
 
 std::atomic<uint64_t> g_presentCount{0};
@@ -93,7 +89,7 @@ std::atomic<uint64_t> g_present1Count{0};
 std::atomic<uint64_t> g_executeCommandListsCount{0};
 std::atomic<uint64_t> g_resourceBarrierCount{0};
 
-// Periodic summary of high-frequency hooks
+// Periodic heartbeat with the hook call counts.
 void LogHeartbeatIfDue()
 {
     // Either Present path: UE5 presents via Present1 (flip model).
@@ -108,14 +104,13 @@ void LogHeartbeatIfDue()
     }
 }
 
-// These hooks fully replace the game's Present/ExecuteCommandLists/etc.
-// Every path through them MUST call the original.
+// These hooks replace the game's calls; every path must call the original.
 //
-// The capture hand-off happens before the frame counter advances and before
-// the real Present: the back buffer still holds the finished frame, and the
-// frame index matches the one the frame's barriers were tagged with.
+// Capture runs before the frame counter advances and before the real Present:
+// the back buffer still holds the finished frame, and the frame index matches
+// the one the frame's barriers were tagged with.
 //
-// Back-buffer size is read every frame until velocity is identified, then
+// The back-buffer size is read every frame until velocity is identified, then
 // polled: a resize abandons the identified scene textures.
 constexpr uint64_t kResizePollFrames = 30;
 
@@ -138,11 +133,11 @@ void NoteBackBufferSizeIfNeeded(IDXGISwapChain* const swapChain, const uint64_t 
     }
 }
 
-// Known-source exclusion, fed on EVERY Present: a surface whose formats include
-// the back buffer's (normals: R8G8B8A8_UNORM) would otherwise shortlist - and
-// hold references to - the swapchain's buffers, which hangs flip-model teardown
-// at exit and fails a game's ResizeBuffers. All buffers, not just the current
-// one: a buffer can take a barrier before it is first presented.
+// Known-source exclusion, fed on every Present. A surface whose formats include
+// the back buffer's (normals: R8G8B8A8_UNORM) would otherwise shortlist, and
+// hold references to, the swapchain's buffers: flip-model teardown then hangs
+// at exit and the game's `ResizeBuffers` fails. All buffers, because one can
+// take a barrier before it is first presented.
 void NoteKnownSources(IDXGISwapChain* const swapChain)
 {
     if (!swapChain)
@@ -202,20 +197,16 @@ HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12C
     // The game's direct queue: our back-buffer copy goes there, under the same
     // fence as the velocity copy.
     mv::NoteCommandQueue(queue);
-    // Checks the list carrying the velocity copy was submitted to that queue.
+    // Checks that the list carrying the velocity copy goes to that queue.
     mv::NoteSubmission(queue, numCommandLists, commandLists);
     g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
 }
 
-// Re-entrancy guard for the barrier hook.
-//
-// Under the D3D12 debug layer, every ResourceBarrier call reaches this hook
-// twice: the validation layer forwards to the core layer through the same
-// patched code, so one app call arrives as two nested calls. Left
-// unguarded, this doubles every count (the real velocity buffer scores 4
-// and gets rejected) and the continuity check sees RT->SRV twice and flags
-// a violation that never happened - both behavioural filters invert under
-// instrumentation.
+// Re-entrancy guard. Under the D3D12 debug layer each `ResourceBarrier` call
+// reaches this hook twice (the validation layer forwards through the same
+// patched code). Counted twice, every profile doubles: the real velocity buffer
+// scores 4 and is rejected, and the continuity check reports violations that
+// never happened.
 thread_local int g_barrierHookDepth = 0;
 
 void STDMETHODCALLTYPE
@@ -226,8 +217,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
     const int depth = --g_barrierHookDepth;
     if (depth > 0)
     {
-        // An inner, forwarded call. The outer one describes the same barriers
-        // and will do the work; doing it here as well double-counts everything.
+        // The inner, forwarded call: the outer one handles the same barriers.
         return;
     }
     g_resourceBarrierCount.fetch_add(1, std::memory_order_relaxed);
@@ -260,9 +250,9 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 }
 
                 // Profiles the transition, tracks liveness, and returns the
-                // surfaces whose selected (or rival-adopted) resource just took
-                // its trigger edge. A reopen it triggers reaches capture.cpp
-                // through the registry's ReopenObserver.
+                // surfaces whose selected or adopted resource just took its
+                // trigger edge. A reopen it causes reaches capture.cpp through
+                // the registry's `ReopenObserver`.
                 constexpr int kMaxTriggers = 4; // mutual exclusion: at most one in practice
                 mv::SurfaceTrigger triggers[kMaxTriggers];
                 const int triggerCount = registry.OnBarrierTransition(resource, frame, stateBefore, stateAfter, triggers, kMaxTriggers);
@@ -299,8 +289,8 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
         }
     }
 
-    // Which edges share one ResourceBarrier call: the shares_call_with_edge
-    // signal's input, plus MV_DIAG / MV_SNAPSHOT. One branch when none is in use.
+    // Which edges share one `ResourceBarrier` call: the input of
+    // `shares_call_with_edge`, `MV_DIAG` and `MV_SNAPSHOT`. One branch otherwise.
     if (registry.WantsBarrierBatches())
     {
         registry.OnBarrierBatch(cmdList, barriers, numBarriers);
@@ -322,7 +312,7 @@ bool CreateHook(void* target, void* detour, void** original, const char* name)
 
 bool InstallD3D12Hooks()
 {
-    // Register a message-only window to create a swapchain against
+    // A message-only window to create the dummy swapchain on.
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = DefWindowProcW;
@@ -349,8 +339,7 @@ bool InstallD3D12Hooks()
         return false;
     }
 
-    // Select the high-performance adapter, in case the user is on a
-    // hybrid-graphics laptop.
+    // The high-performance adapter, for hybrid-graphics laptops.
     ComPtr<IDXGIFactory6> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr))
@@ -367,7 +356,7 @@ bool InstallD3D12Hooks()
         Log("InstallD3D12Hooks: EnumAdapterByGpuPreference failed: 0x" +
             std::to_string(static_cast<unsigned long>(hr)) + ", falling back to default adapter");
 
-        // nullptr falls back to system default
+        // nullptr: the system default adapter.
         adapter.Reset();
     }
     else
@@ -417,7 +406,7 @@ bool InstallD3D12Hooks()
         return false;
     }
 
-    // 6. Dummy command list (to get ID3D12GraphicsCommandList's vtable).
+    // A dummy command list, for `ID3D12GraphicsCommandList`'s vtable.
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
     if (FAILED(hr))
@@ -438,10 +427,9 @@ bool InstallD3D12Hooks()
     }
     commandList->Close();
 
-    // Extract vtable pointers and install hooks. MinHook patches the
-    // underlying function code (shared by every instance of a given
-    // interface), not anything specific to our dummy instance - once
-    // patched, every caller, including the game, goes through our hook.
+    // MinHook patches the function code behind each vtable slot, which every
+    // instance of the interface shares: once patched, the game's calls go
+    // through the hooks too.
     Log("InstallD3D12Hooks: dummy device/swapchain/command-list created, installing hooks");
 
     if (MH_Initialize() != MH_OK)
@@ -474,15 +462,14 @@ bool InstallD3D12Hooks()
         "ResourceBarrier");
 
     // Wire the surface registry before any hook can fire. Velocity registers
-    // first: the others name it in spec.extentFrom. If the profile failed to
-    // load nothing is registered - the game runs, nothing is identified, and
-    // the log says why; there is no built-in spec to fall back to.
+    // first; the others name it in `spec.extentFrom`. If the profile failed to
+    // load, nothing is registered: the game runs, nothing is identified, and the
+    // log says why.
     if (const mv::SurfaceProfile* profile = mv::LoadSurfaceProfile())
     {
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->velocity));
         mv::GetSurfaceRegistry().Register(std::make_unique<mv::SurfaceIdentifier>(profile->depth));
-        // Optional surfaces, after velocity (their extent source), each only
-        // if its spec exists and MV_SURFACES enabled it.
+        // Optional surfaces whose spec exists and `MV_SURFACES` enabled.
         for (const mv::SurfaceProfile::OptionalSurface& optional : profile->optional)
         {
             if (optional.present && optional.spec.enabled)
@@ -508,7 +495,7 @@ bool InstallD3D12Hooks()
         }
     }
 
-    // Hand the capture module the *original* function pointers
+    // Capture and the overlay record through the original functions.
     if (ok)
     {
         mv::SetOriginalFunctions(g_originalResourceBarrier, g_originalExecuteCommandLists);
@@ -517,7 +504,6 @@ bool InstallD3D12Hooks()
         mv::StartOverlayHotkeyThread();
     }
 
-    // Tear down temp objects
     DestroyWindow(hwnd);
     UnregisterClassW(windowClass.lpszClassName, windowClass.hInstance);
 

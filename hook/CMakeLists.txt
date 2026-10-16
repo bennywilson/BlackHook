@@ -1,18 +1,14 @@
-# The manifest (docs/REFACTOR_PLAN.md sec 4.1) records which build produced a
-# dump, so a stale build cannot be quietly mistaken for the one under test.
-# Real by construction: git failing is a build error, never a placeholder
-# string that reads like a real commit.
+# The manifest records which build produced a dump. If git fails the build
+# fails, rather than stamping a placeholder that reads like a commit.
 find_package(Git QUIET)
 if(NOT Git_FOUND)
   message(FATAL_ERROR "git is required to build mv_hook (build_commit.h embeds the commit hash)")
 endif()
 
-# The commit is stamped at BUILD time, every build, not at configure time: a
-# configure-time stamp went stale after every commit on a branch (it only
-# re-ran when .git/HEAD itself changed, which a commit does not do), so dumps
-# named a commit the DLL was not built from. "-dirty" marks a build with
-# uncommitted or untracked changes. The script rewrites build_commit.h only
-# when the value changes, so an unchanged tree recompiles nothing.
+# The commit is stamped on every build, not at configure time (which re-runs
+# only when .git/HEAD changes, not on each commit). "-dirty" marks uncommitted
+# or untracked changes. build_commit.h is rewritten only when the value
+# changes, so an unchanged tree recompiles nothing.
 set(MV_BUILD_COMMIT_H ${CMAKE_CURRENT_BINARY_DIR}/generated/build_commit.h)
 add_custom_target(mv_build_commit
   COMMAND ${CMAKE_COMMAND}
@@ -26,16 +22,15 @@ add_custom_target(mv_build_commit
   VERBATIM)
 
 string(TIMESTAMP MV_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
-# Where the hook writes logs and default dumps: the repo's gitignored temp/,
-# so a run never scatters output across %TEMP%. Baked in because the hook
-# runs inside the game's process and has no other way to find the repo.
+# Where the hook writes logs and default dumps: the repo's gitignored temp/.
+# Baked in, since the hook runs in the game's process and cannot find the repo.
 set(MV_OUTPUT_ROOT "${CMAKE_SOURCE_DIR}/temp")
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h @ONLY)
 
-# Surface profiles, embedded byte-for-byte so the DLL's commit hash determines
-# them (MV_PROFILE_FILE can still add/replace at runtime - surface_profile.h).
-# A byte array rather than a string literal: no MSVC literal-length limit, no
-# escaping. Editing the JSON re-runs configure via CMAKE_CONFIGURE_DEPENDS.
+# Surface profiles, embedded as bytes so the DLL's commit pins them
+# (MV_PROFILE_FILE can still add or replace at runtime). A byte array avoids
+# MSVC's string-literal length limit and escaping. Editing the JSON re-runs
+# configure (CMAKE_CONFIGURE_DEPENDS).
 set(MV_PROFILES_JSON ${CMAKE_SOURCE_DIR}/profiles/ue5.json)
 file(READ ${MV_PROFILES_JSON} MV_PROFILES_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MV_PROFILES_BYTES "${MV_PROFILES_HEX}")
@@ -60,7 +55,5 @@ target_link_libraries(mv_hook PRIVATE minhook nlohmann_json::nlohmann_json d3d12
 target_compile_definitions(mv_hook PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(mv_hook PRIVATE /W4)
 
-# Static CRT (this DLL gets loaded into the game's process and must not
-# depend on a specific VC++ redistributable being present there) is set
-# globally in the top-level CMakeLists.txt, before MinHook is fetched, so
-# every target - including MinHook's - uses the same runtime library.
+# The static CRT (set in the top-level CMakeLists.txt) means the DLL does not
+# depend on a VC++ redistributable being installed alongside the game.

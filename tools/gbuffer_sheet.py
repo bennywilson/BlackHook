@@ -1,13 +1,13 @@
-"""Contact sheets of the 8-bit/10-bit surfaces, raw channels only - no decode.
+"""Contact sheets of the 8-bit and 10-bit surfaces, raw channels, no decode.
 
     python gbuffer_sheet.py <dump_dir> [--frames 6] [--out sheet.png]
         One row per frame: colour | normals | specular RGB | specular alpha
-        (whichever of normals/specular the dump has), frames spread evenly.
+        (whichever of normals and specular the dump has), frames spread evenly.
     python gbuffer_sheet.py --snapshots <snapshot_*.bin ...> [--scale 2] [--out snaps.png]
-        MV_SNAPSHOT candidates: one row each, RGB | alpha (stretched), plus
-        per-channel stats - how GBufferB was told from GBufferC and the rest.
+        MV_SNAPSHOT candidates: one row each, RGB | alpha (stretched), with
+        per-channel statistics. How GBufferB was told from GBufferC.
 
-numpy only (no OpenCV); writes PNG itself. Default output: temp/out/.
+numpy only (no OpenCV); writes the PNG itself. Default output: temp/out/.
 """
 import argparse
 import os

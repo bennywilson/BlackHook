@@ -13,19 +13,19 @@ namespace mv
 namespace
 {
 
-// When mv_barrier_profile.log is written: late enough that every resource has
+// When `mv_barrier_profile.log` is written: late enough that every resource has
 // had thousands of frames to show its pattern.
 constexpr uint64_t kProfileDumpFrame = 2000;
 
-// Distinct resources GetDesc() is called on (see ConsiderResource). Generous for
-// identification, which completes in the first ~90 frames.
+// Distinct resources `GetDesc()` is called on (see `ConsiderResource`).
+// Identification needs far fewer: it finishes in the first ~90 frames.
 constexpr int64_t kIdentifyBudget = 8000;
 
 } // namespace
 
 SurfaceRegistry::SurfaceRegistry() noexcept : identifyBudget_(kIdentifyBudget)
 {
-    entries_.reserve(8); // kMaxSurfaces, capture.cpp's own constant - avoid any reallocation after Configure()
+    entries_.reserve(8); // room for every surface: `Configure()` hands out pointers into it
 }
 
 void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
@@ -62,7 +62,7 @@ void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
 
 void SurfaceRegistry::ForgetAllResourcesSeen() noexcept
 {
-    // Refill first: a reopen with an empty budget would search forever and find nothing.
+    // Refill first: with an empty budget a reopened search would find nothing.
     identifyBudget_.store(kIdentifyBudget, std::memory_order_relaxed);
     budgetExhaustionReported_.store(false, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(seenMutex_);
@@ -129,8 +129,7 @@ void SurfaceRegistry::Configure() noexcept
         }
     }
     // Second pass, once every identifier has a stable address: resolve each
-    // spec.extentFrom to its identifier, and record the reverse edge for the
-    // reopen cascade.
+    // `spec.extentFrom` and record the reverse edge for the reopen cascade.
     for (Entry& e : entries_)
     {
         const char* extentFrom = e.identifier->Spec().extentFrom;
@@ -217,8 +216,8 @@ int SurfaceRegistry::OnBarrierTransition(
 
 void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
 {
-    // Registration order (velocity first) runs a source's OnFrame before its
-    // dependents'. Not load-bearing: OnFrame re-reads the live source.
+    // Registration order runs velocity's `OnFrame` before its dependents'.
+    // Order does not matter: `OnFrame` reads the source's live state.
     for (Entry& e : entries_)
     {
         e.identifier->OnFrame(frame);
@@ -242,10 +241,9 @@ void SurfaceRegistry::OnBarrierBatch(
         return;
     }
 
-    // SignalId::SharesCallWithEdge's input, for every profiled resource: which
-    // of its trigger edges shared this call with another resource's trigger
-    // edge, by type. The two trigger types are disjoint (their before-states
-    // differ), so a transition is at most one of them.
+    // Input of `SignalId::SharesCallWithEdge`: which trigger edges shared this
+    // call with another resource's trigger edge, by type. The two edge types
+    // have different before-states, so a transition is at most one of them.
     if (sharedCallSignals_)
     {
         constexpr TriggerEdge kEdges[kTriggerEdgeCount] = {TriggerEdge::RenderTargetToShaderResource,
@@ -297,16 +295,16 @@ void SurfaceRegistry::OnBarrierBatch(
     {
         return;
     }
-    // Only once both anchors are known: before that "not in the same call as
-    // velocity's edge" would just mean velocity was not selected yet.
+    // Only once velocity and depth are both selected; before that, "not in a
+    // call with velocity's edge" means nothing.
     if (velocity_->Selected() == nullptr || depth_->Selected() == nullptr)
     {
         return;
     }
 
-    // Which registered surfaces had one of THEIR tracked resources (selected
-    // or rival-adopted) take THEIR trigger edge in this call - and which
-    // resource it was, so a candidate is never counted as sharing with itself.
+    // For each surface, the tracked resource (selected or adopted) that took
+    // its trigger edge in this call, so a candidate never counts as sharing a
+    // call with itself.
     uint64_t rtToSrv = 0;
     ID3D12Resource* trackedIn[kMaxBatchSurfaces] = {};
     for (UINT i = 0; i < count; ++i)
@@ -382,7 +380,7 @@ void SurfaceRegistry::OnBarrierBatch(
 void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
 {
     std::lock_guard<std::mutex> lock(batchMutex_);
-    // The signal's own input, over the resource's whole life.
+    // The signal's input, over the resource's whole life.
     const auto anyDepth = [](const BarrierProfile& p, bool known) -> std::string
     {
         const int rt = static_cast<int>(TriggerEdge::RenderTargetToShaderResource);
@@ -446,9 +444,8 @@ void SurfaceRegistry::NoteBackBufferSize(uint64_t width, uint32_t height) noexce
     {
         if (e.extentSource != nullptr)
         {
-            // A dependent (depth) inherits reopening through the cascade
-            // when its source resizes; it does not track the back buffer
-            // itself.
+            // A dependent reopens through its source's cascade and does not
+            // track the back buffer itself.
             continue;
         }
         if (e.identifier->NoteBackBufferSize(width, height))
@@ -464,15 +461,15 @@ void SurfaceRegistry::NoteKnownSourceResource(ID3D12Resource* resource) noexcept
 {
     if (!knownSources_.Note(resource))
     {
-        return; // already known - the per-Present common case
+        return; // already known: the usual case, every Present
     }
-    // Newly known: purge it from any search that shortlisted it first.
+    // Newly known: purge it from any shortlist that got it first.
     for (Entry& e : entries_)
     {
         if (e.identifier->ForgetKnownSource(resource))
         {
-            // Selected a back buffer: wrong by definition. Unreachable while
-            // sources are noted every Present; if it happens, search again.
+            // A selected back buffer is wrong by definition. Should not happen
+            // while sources are noted every Present; if it does, search again.
             ReopenCascade(e.identifier->Spec().name, ReopenReason::DescriptorChanged,
                           "the selected resource is a swapchain back buffer (known by construction)");
         }
@@ -502,7 +499,7 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
     std::vector<Entry*> cascade;
     CollectCascade(root, &cascade);
 
-    // Once per cascade: without the refill a reopen after the budget ran out
+    // Once per cascade. Without the refill, a reopen after the budget ran out
     // could never find the replacement resource.
     ForgetAllResourcesSeen();
 
@@ -518,8 +515,8 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
                 std::string("the ") + root->identifier->Spec().name + " search was reopened";
             e->identifier->Reopen(ReopenReason::DependencyReopened, dependentDetail.c_str());
         }
-        // For every identifier in the cascade, root or dependent: whether a
-        // dependent's reopen matters (depth's, per burst) is the observer's call.
+        // For every identifier in the cascade, root or dependent; the observer
+        // decides whether a dependent's reopen matters (depth's, per burst).
         if (reopenObserver_ != nullptr)
         {
             reopenObserver_(e->identifier->Spec().name);
@@ -587,8 +584,8 @@ void SurfaceRegistry::DumpBarrierProfiles() noexcept
                     " " + std::to_string(p.reverseEdgeCountByEdge[rt]) + " " + std::to_string(p.uavBarriers));
         });
     Log("barrier survey: dumped " + std::to_string(profileStore_.Size()) + " resource profiles to mv_barrier_profile.log");
-    // LogTo batches; the survey is written once and never again, so without
-    // an explicit flush the tail of it sits in memory until the process exits.
+    // `LogTo` batches lines, and the survey is written once, so flush it now
+    // rather than at exit.
     FlushLogs();
 }
 

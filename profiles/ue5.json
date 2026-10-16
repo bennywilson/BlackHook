@@ -1,48 +1,41 @@
-// Surface identification profiles - docs/REFACTOR_PLAN.md sec 2.1/2.8, Phase 9.
+// Surface identification profiles: what the hook searches for, per surface.
 //
-// JSON with // comments (the hook parses with comments allowed). Embedded into
-// mv_hook.dll at CMake configure time, so a DLL's commit hash determines its
-// profiles; MV_PROFILE_FILE adds/replaces profiles from a file at runtime
-// (recorded in manifest.json as session.profile_source).
+// JSON with // comments, embedded into mv_hook.dll at configure time, so a DLL's
+// commit pins its profiles. MV_PROFILE_FILE adds or replaces profiles from a
+// file at runtime (recorded in manifest.json as session.profile_source).
 //
-// Which profile runs, first match wins - and a named profile that does not
-// exist is an error, never a fallback:
+// The profile used, first match wins (a named profile that does not exist is an
+// error, never a fallback):
 //   1. MV_PROFILE=<name>
 //   2. MV_ENGINE_VERSION=5.2 -> "ue5.2-generic"
 //   3. default_profile below
-// MV_IDENTIFY_FRAMES=<n> then overrides velocity's settle_frames for that run
-// (logged as "profile:   override:"); mv_testhost uses it to fit short runs.
+// MV_IDENTIFY_FRAMES=<n> then overrides velocity's settle_frames for that run.
 //
-// What a profile may do (sec 2.8): narrow or widen candidate sets, adjust
-// weights and thresholds. What it may NOT do: assert an identity. There is no
-// field for a resource, an exact descriptor, or skipping a gate - the
-// narrowest thing expressible is a one-entry format table, which still has to
-// pass the behaviour gate and win on score.
+// A profile can narrow or widen candidate sets and change weights and
+// thresholds. It cannot name a resource: there is no field for a resource, an
+// exact descriptor, or skipping a gate, so the narrowest possible profile is a
+// one-entry format table that still has to pass the behaviour gate and win.
 //
-// "extends" applies this profile as an RFC 7386 merge patch over the named
-// one: objects merge field by field, arrays (formats, flags, signals) are
-// replaced whole.
+// "extends" applies this profile as an RFC 7386 merge patch over the named one:
+// objects merge field by field, arrays (formats, flags, signals) are replaced.
 //
-// Every field below is required unless marked optional. Unknown fields are an
-// error, so a typo cannot silently leave a value at some default.
+// Every field is required unless marked optional. Unknown fields are an error.
 {
   "schema_version": 1,
   "default_profile": "ue5-generic",
 
   "profiles": {
     "ue5-generic": {
-      "description": "The values hardcoded in velocity_identify.cpp/depth_identify.cpp before Phase 9, unchanged. Used when the engine version is not known.",
+      "description": "Used when the engine version is not known.",
       "surfaces": {
         "velocity": {
           "log_prefix": "identify",
 
-          // FVelocityRendering::GetFormat() returns PF_A16B16G16R16 and
-          // PF_R16G16_UINT on Windows which map to D3D12's
-          // DXGI_FORMAT_R16G16_UNORM, and DXGI_FORMAT_R16G16B16A16_UNORM.
-          // Android GLES-only in the engine, so the UINT variants should never
-          // appear on a D3D12 title - kept as low-score fallbacks rather than
-          // excluded, so a near-miss still shows up in the log with its actual
-          // score instead of a flat rejection.
+          // FVelocityRendering::GetFormat() returns PF_A16B16G16R16 or
+          // PF_G16R16 on Windows, which are D3D12's R16G16B16A16_UNORM and
+          // R16G16_UNORM. The UINT variants are the Android GLES path and should
+          // never appear on D3D12; they are kept at a low score so a near-miss
+          // is logged with its score instead of rejected outright.
           "formats": [
             { "format": "R16G16B16A16_UNORM", "score": 4, "description": "R16G16B16A16_UNORM (PF_A16B16G16R16, NeedVelocityDepth)" },
             { "format": "R16G16_UNORM",       "score": 4, "description": "R16G16_UNORM (PF_G16R16, no velocity depth)" },
@@ -50,33 +43,27 @@
             { "format": "R16G16_UINT",        "score": 1, "description": "R16G16_UINT (PF_R16G16_UINT, Android GLES path)" }
           ],
 
-          // FVelocityRendering::GetCreateFlags: TexCreate_RenderTargetable |
-          // UAV | ShaderResource maps to ALLOW_RENDER_TARGET (0x01) |
-          // ALLOW_UNORDERED_ACCESS (0x04). The filter only requires those two
-          // bits set; an exact Flags == 5 match scores higher than a superset
-          // with other flags (see the exact_required_flags signal below).
+          // FVelocityRendering::GetCreateFlags: RenderTargetable | UAV |
+          // ShaderResource, i.e. ALLOW_RENDER_TARGET (0x01) and
+          // ALLOW_UNORDERED_ACCESS (0x04). Both are required; exactly those
+          // flags scores higher (exact_required_flags).
           "required_flags": ["ALLOW_RENDER_TARGET", "ALLOW_UNORDERED_ACCESS"],
           "forbidden_flags": [],
 
-          // Anything smaller than this is a downsampled/tile target.
-          // Deliberately generous - excludes 1/16-res things like
-          // MotionBlur.VelocityFlatten, doesn't try to guess the render
-          // resolution.
+          // Smaller is a downsampled or tile target (MotionBlur.VelocityFlatten
+          // is 1/16 resolution). Low on purpose; the render resolution is not
+          // guessed.
           "min_width": 320,
           "min_height": 180,
           "max_back_buffer_multiple": 2,
-          // extent_from (optional) omitted: velocity is the extent source,
-          // not a dependent.
+          // extent_from (optional) omitted: velocity is the extent source.
 
           "trigger": "render_target_to_shader_resource",
-          // Behaviour: how long to watch before deciding. The barrier
-          // signature is a per-frame invariant, not an average - 90 frames to
-          // be sure it's genuine.
+          // Frames watched before deciding.
           "min_frames_observed": 30,
           "settle_frames": 90,
-          // Format-tier bonus counts only at the desktop-tier score (4) - see
-          // SurfaceIdentifier::CollectSignals. GLES-fallback formats (score 1)
-          // pass the structural gate but earn nothing from this baseline.
+          // The format score counts only for desktop formats (score 4); the GLES
+          // formats pass the gate but add nothing.
           "format_score_gate": 4,
 
           "signals": [
@@ -89,33 +76,24 @@
             { "signal": "no_continuity_violations",      "weight": 1 }
           ],
 
-          // Top two survivors must differ by at least 2 points.
+          // The top two survivors must differ by at least 2 points.
           "ambiguity": { "rule": "score_margin", "margin": 2 },
 
-          // Optional (absent = never adopt): rival adoption, following the
-          // pass when the engine moves it to another allocation of the same
-          // texture (SurfaceIdentifier::OnUnmatchedEdge).
+          // Optional (absent: never adopt). Rival adoption follows the pass
+          // when the engine moves it to another allocation of the same texture.
           "rival": {
-            // How long to watch a stall before checking for a rival, and how
-            // many consecutive frames a rival must carry the edge before being
-            // adopted as a second target.
+            // Frames the selected resource must be idle before a rival counts,
+            // and consecutive frames a rival must take the edge to be adopted.
             "stall_frames": 3,
             "frames_before_adopt": 8,
-            // Sized for a single one-off reallocation, the only pattern seen
-            // before a slow-motion sequence reallocated SceneVelocity 6 times
-            // in ~8 seconds and exhausted this budget seconds before the pass
-            // was reported STOPPED - at which point a further reallocation
-            // would have looked like silence rather than being followed.
-            // Raised to give sustained churn real headroom instead of a limit
-            // sized for a rare one-time event.
+            // A slow-motion sequence on Skyrunner reallocated SceneVelocity 6
+            // times in ~8 s, so this allows for sustained churn.
             "max_adoptions": 64,
-            // Output cap for the rival-edge diagnostic - stalls recur every
-            // few seconds and would otherwise log forever; a few dozen lines
-            // is enough to tell whether a rival exists.
+            // Cap on RIVAL log lines per stall; stalls recur every few seconds.
             "max_reports": 40
           },
 
-          // Reopen re-scans everything.
+          // A reopen rescans everything.
           "reopen_clears_shortlist": true
         },
 
@@ -123,19 +101,15 @@
           "log_prefix": "depth",
 
           // GPixelFormats[PF_DepthStencil].PlatformFormat (D3D12RHI.cpp:117/127)
-          // is one of exactly two things, chosen by the r.D3D12.UseD24 cvar:
+          // depends on r.D3D12.UseD24:
           //
           //     UseD24 != 0 : DXGI_FORMAT_R24G8_TYPELESS      (44)
           //     UseD24 == 0 : DXGI_FORMAT_R32G8X24_TYPELESS   (19)
           //
-          // Both are TYPELESS (UE puts a typed view on top) and MULTI-PLANE
-          // (depth in plane 0, stencil in plane 1) - capture.cpp already
-          // derives plane/subresource counts from the desc rather than
-          // assuming one.
-          //
-          // Fully-typed and single-plane variants are listed below but unused
-          // in practice - UE5 never creates scene depth that way - kept so a
-          // near-miss still scores instead of being flatly rejected.
+          // Both are TYPELESS (UE adds a typed view) and have two planes, depth
+          // and stencil; capture.cpp reads the plane count from the desc. UE5
+          // never creates scene depth in the typed or single-plane formats
+          // below; they are listed so a near-miss is logged with its score.
           "formats": [
             { "format": "R24G8_TYPELESS",       "score": 4, "description": "R24G8_TYPELESS (PF_DepthStencil, r.D3D12.UseD24=1)" },
             { "format": "R32G8X24_TYPELESS",    "score": 4, "description": "R32G8X24_TYPELESS (PF_DepthStencil, r.D3D12.UseD24=0)" },
@@ -145,61 +119,49 @@
             { "format": "D32_FLOAT",            "score": 1, "description": "D32_FLOAT (depth without stencil, typed)" }
           ],
 
-          // TexCreate_DepthStencilTargetable | TexCreate_ShaderResource maps
-          // to ALLOW_DEPTH_STENCIL with no DENY_SHADER_RESOURCE; requiring the
-          // deny bit absent separates scene depth from shadow-map atlases
+          // DepthStencilTargetable | ShaderResource: ALLOW_DEPTH_STENCIL without
+          // DENY_SHADER_RESOURCE. The deny bit marks shadow-map atlases
           // (TargetableOnly).
           "required_flags": ["ALLOW_DEPTH_STENCIL"],
           "forbidden_flags": ["DENY_SHADER_RESOURCE"],
 
-          // No size floor of its own, unbounded by the back buffer - bounded
-          // by the exact extent test against velocity instead.
+          // No size bounds of its own: depth must match velocity's extent.
           "min_width": 0,
           "min_height": 0,
           "max_back_buffer_multiple": 0,
           "extent_from": "velocity",
 
           "trigger": "depth_write_to_readable",
-          // Measured from when velocity produces an extent (depth
-          // identification can't start before that) - see
-          // SurfaceIdentifier::OnFrame's extent-dependency path. settle_frames
-          // is currently unused there (that path decides the frame the
-          // dependency resolves), kept as documentation of the
-          // pre-extraction constant.
+          // Depth decides as soon as velocity has an extent; settle_frames is
+          // not used on that path.
           "min_frames_observed": 30,
           "settle_frames": 60,
-          // depth's score IS the raw format score, always - gate of 0 means
-          // every structurally-accepted format counts in full, with no
-          // bonus/checkbox breakdown.
+          // Depth's score is its format score alone, always counted.
           "format_score_gate": 0,
           "signals": [],
 
-          // A clear margin: 1.5x as many produce-then-consume edges per frame
-          // is the difference between a depth buffer the frame is built
-          // around and one that's occasionally rendered (e.g. CustomDepth).
-          // margin is a percentage for this rule.
+          // 1.5x as many DEPTH_WRITE -> readable edges separates scene depth,
+          // which the frame is built around, from one rendered occasionally
+          // (CustomDepth). The margin is a percentage for this rule.
           "ambiguity": { "rule": "edge_count_ratio", "margin": 150 },
 
           // rival omitted: depth never adopts.
 
-          // Reopen keeps the shortlist and only resets counters.
+          // A reopen keeps the shortlist and resets the counters.
           "reopen_clears_shortlist": false
         },
 
-        // UE5's GBufferA (world-space normal, SV_Target0 of the base pass) -
-        // docs/REFACTOR_PLAN.md sec 3.2 and Phase 10. OFF by default: opt in
-        // with MV_SURFACES=normals. Not required, so frames without it are
-        // still complete. Its six open questions (sec 3.2) can only be closed
-        // on a live title: read the "normals:" and mutual-exclusion lines in
-        // mv_hook.log before trusting a single byte of it.
+        // UE5's GBufferA: world-space normal, SV_Target0 of the base pass. Off
+        // by default (MV_SURFACES=normals); not required, so frames without it
+        // are still complete. Measured on Skyrunner only: check the "normals:"
+        // and mutual-exclusion lines in mv_hook.log on any other title.
         "normals": {
           "log_prefix": "normals",
 
-          // Candidates to verify, not facts: GBufferA's format follows
-          // r.GBufferFormat, and these scores mean "most likely first". The
-          // R16G16B16A16_UNORM entry COLLIDES with velocity's top format; the
-          // registry's mutual exclusion keeps velocity's own buffer out of
-          // this search (it is excluded before ranking, not just at claim).
+          // GBufferA's format follows r.GBufferFormat; the scores order the
+          // candidates by likelihood. R16G16B16A16_UNORM is also velocity's
+          // format: mutual exclusion keeps velocity's own buffer out of this
+          // search before ranking.
           "formats": [
             { "format": "R10G10B10A2_UNORM",  "score": 4, "description": "R10G10B10A2_UNORM (PF_A2B10G10R10 - UE5 default GBufferA)" },
             { "format": "R16G16B16A16_FLOAT", "score": 3, "description": "R16G16B16A16_FLOAT (PF_FloatRGBA - high-precision GBuffer)" },
@@ -207,16 +169,15 @@
             { "format": "R8G8B8A8_UNORM",     "score": 1, "description": "R8G8B8A8_UNORM (low-precision GBuffer)" }
           ],
 
-          // A render target that shaders read. No UAV requirement either way:
-          // "GBufferA has no UAV" is the kind of cross-title claim this
-          // project has been burned by (Skyrunner's velocity DOES enter
-          // UNORDERED_ACCESS), so it is scored evidence below, not a gate.
+          // A render target that shaders read. UAV use is scored below, not
+          // gated: Skyrunner's velocity does enter UNORDERED_ACCESS, so "never
+          // UAV" is not safe to assume of any target.
           "required_flags": ["ALLOW_RENDER_TARGET"],
           "forbidden_flags": ["DENY_SHADER_RESOURCE"],
 
-          // Bound to the scene extent through velocity, like depth. This is
-          // also what keeps the back buffer out when DRS makes the two
-          // extents differ; known-source exclusion covers it when they don't.
+          // Sized from velocity, like depth. This also keeps the back buffer
+          // out when dynamic resolution makes the two extents differ;
+          // known-source exclusion covers it when they match.
           "min_width": 0,
           "min_height": 0,
           "max_back_buffer_multiple": 0,
@@ -225,25 +186,20 @@
           "trigger": "render_target_to_shader_resource",
           "min_frames_observed": 30,
           "settle_frames": 60,
-          // Every structurally-accepted format counts in full, like depth.
+          // Every format counts in full, as for depth.
           "format_score_gate": 0,
 
-          // What separates GBufferA from the other scene-extent render targets
-          // that also go RT -> SRV every frame:
-          //   - plain RT flags, never written by compute: separates it from
-          //     HDR scene colour (RT|UAV). Holds on Skyrunner.
-          //   - NOT enough on Skyrunner, which has a second R10G10B10A2,
-          //     RT-only target at scene extent (most likely a post-process
-          //     output): the two tied 10-10, AMBIGUOUS, on two separate runs.
-          //   - shares_call_with_edge (depth): measured on Skyrunner with
-          //     MV_SURFACES=normals' normals-diag log - GBufferA becomes
-          //     readable in the SAME ResourceBarrier call as scene depth once
-          //     a frame (one of its two RT -> SRV edges, i.e. 50%), because
-          //     the passes that read normals read depth too; the same-format
-          //     decoy never does (0%). Evidence from ONE title, so it is
-          //     scored, not a gate, and min_percent sits well below the 50%
-          //     seen - the ambiguity guard still covers a title where it
-          //     does not separate.
+          // What separates GBufferA from other scene-extent targets that go
+          // RT -> SRV every frame:
+          //   - exactly the RT flag and no compute writes: separates it from
+          //     HDR scene colour (RT|UAV).
+          //   - shares_call_with_edge (depth): on Skyrunner a second
+          //     R10G10B10A2, RT-only target at scene extent (likely a
+          //     post-process output) tied GBufferA 10-10 on everything else.
+          //     GBufferA becomes readable in the same ResourceBarrier call as
+          //     scene depth on 50% of its edges (the passes that read normals
+          //     read depth too); the other target on 0%. Measured on one title,
+          //     so it is scored, with min_percent well below 50.
           "signals": [
             { "signal": "exact_required_flags",          "weight": 3 },
             { "signal": "never_enters_unordered_access", "weight": 2 },
@@ -253,19 +209,13 @@
 
           "ambiguity": { "rule": "score_margin", "margin": 2 },
 
-          // Measured on Skyrunner: UE keeps several physical copies of
-          // GBufferA (as it does of SceneVelocity - velocity adopted 3 in the
-          // same session) and switches between them in stretches. Pinned to
-          // one pointer, normals was captured on only 215-641 of ~1000-2100
-          // burst frames, the rest having no GBufferA edge at all. Same
-          // thresholds as velocity. A rival must also carry the
-          // shares_call_with_edge evidence the selection was made on, or the
-          // same-format post-process target above - which takes its edge
-          // every frame - would be adopted the first time GBufferA moved.
-          // same_descriptor: evidence alone was NOT enough live - scene
-          // colour (R16G16B16A16_FLOAT, RT|UAV) also shares calls with depth
-          // (33%) and was adopted as "GBufferA", which then ended the burst
-          // on a layout change. A reallocation has the identical descriptor.
+          // UE keeps several copies of GBufferA (as of SceneVelocity) and
+          // switches between them; tied to one, normals was captured on 215-641
+          // of ~1000-2100 burst frames on Skyrunner. A rival must carry the
+          // shares_call_with_edge evidence too, or the post-process target above
+          // would be adopted. same_descriptor: scene colour (R16G16B16A16_FLOAT,
+          // RT|UAV) also shares calls with depth (33%) and was adopted without
+          // it; a reallocation has the identical descriptor.
           "rival": {
             "stall_frames": 3,
             "frames_before_adopt": 8,
@@ -274,33 +224,27 @@
             "same_descriptor": true
           },
 
-          // A dependent of velocity, like depth: reopen keeps the shortlist.
+          // Sized from velocity, like depth: a reopen keeps the shortlist.
           "reopen_clears_shortlist": false,
 
           "enabled": false
         },
 
-        // UE5's GBufferB: metallic, specular, roughness (RGB) and the shading
-        // model ID (A). OFF by default: opt in with MV_SURFACES=specular
-        // (or normals,specular). Not required. Channel packing is unverified
-        // against engine source, so the manifest says encoding "unknown".
+        // UE5's GBufferB: metallic, specular and roughness in RGB, the shading
+        // model ID in A. Off by default (MV_SURFACES=specular); not required.
+        // The channel packing is not verified against engine source, so the
+        // manifest says encoding "unknown".
         //
-        // How it was found (Skyrunner, UE 5.2): every 8-bit scene-extent
-        // render target is B8G8R8A8_TYPELESS (UE views its 8-bit GBuffers as
-        // sRGB or linear) - 7-9 of them take an RT -> SRV edge each frame and
-        // tie 10-10 on format, flags and extent. MV_SNAPSHOT=specular copied
-        // one frame of each to disk, and the pixels named GBufferB beyond
-        // doubt: R = metallic (non-zero only on the character's armour),
-        // G = specular (~constant), B = roughness, and A holding exactly 5
-        // values (0,33,34,37,38 - shading-model ID plus a flag bit), which
-        // only GBufferB stores. GBufferC (base colour + AO) and a mostly empty
-        // GBufferD/E were its neighbours.
-        //
-        // The barrier evidence that then separates it, in two sessions:
-        // GBufferB becomes readable in the SAME ResourceBarrier call as scene
-        // depth on 100% of its edges; every other candidate on 0% (GBufferC and
-        // D/E go in calls of three render targets, no depth). The same signal
-        // as normals, stronger: GBufferA shares with depth on 50%.
+        // On Skyrunner (UE 5.2) every 8-bit scene-extent render target is
+        // B8G8R8A8_TYPELESS, and 7-9 of them take an RT -> SRV edge each frame
+        // and tie 10-10 on format, flags and extent. MV_SNAPSHOT=specular
+        // copied one frame of each, and the pixels identified GBufferB: R
+        // metallic (non-zero on the armour only), G specular (near constant),
+        // B roughness, A exactly 5 values (shading model ID plus a flag bit).
+        // GBufferC (base colour and AO) and a mostly empty GBufferD/E were
+        // among the others. GBufferB becomes readable in the same
+        // ResourceBarrier call as scene depth on 100% of its edges, every
+        // other candidate on 0%.
         "specular": {
           "log_prefix": "specular",
 
@@ -327,14 +271,14 @@
             { "signal": "exact_required_flags",          "weight": 3 },
             { "signal": "never_enters_unordered_access", "weight": 2 },
             { "signal": "never_takes_uav_barrier",       "weight": 1 },
-            // Measured 100% vs 0% - see above. One title, so scored, not a gate.
+            // Measured 100% vs 0% (see above), on one title, so scored.
             { "signal": "shares_call_with_edge", "edge": "depth_write_to_readable", "min_percent": 50, "weight": 3 }
           ],
 
           "ambiguity": { "rule": "score_margin", "margin": 2 },
 
-          // As normals: UE reallocates its scene textures; a rival must be an
-          // exact-descriptor copy carrying the same depth-call evidence.
+          // As for normals: a rival must be an exact-descriptor copy with the
+          // same depth-call evidence.
           "rival": {
             "stall_frames": 3,
             "frames_before_adopt": 8,
@@ -350,12 +294,11 @@
       }
     },
 
-    // Per-engine-version profiles. Identical to ue5-generic today: no value
-    // the hook uses has yet been shown to differ between 5.2 and 5.7 (the
-    // 5.2/5.7 difference that IS known - velocity channel 2/3 packing - is
-    // decode-side, in tools/mvtools.py, not identification). They exist so a
-    // version-specific finding lands as an override here, not as a branch in
-    // C++, and so the manifest names the version the capture was tuned for.
+    // Per-engine-version profiles, the same as ue5-generic so far: nothing the
+    // identification uses is known to differ between 5.2 and 5.7 (the known
+    // difference, velocity channel 3, is in the decode, tools/mvtools.py). A
+    // version-specific finding goes here as an override, and the manifest
+    // names the version.
     "ue5.2-generic": {
       "extends": "ue5-generic",
       "description": "UE 5.2 (e.g. Skyrunner). No overrides yet."

@@ -5,17 +5,17 @@
 
 #include <string>
 
-// Surface profiles: the SurfaceSpecs identification runs on, from
-// profiles/ue5.json (embedded into the DLL at configure time) plus any
-// MV_PROFILE_FILE (same name replaces). Which profile runs: MV_PROFILE, else
-// "ue<major>.<minor>-generic" from MV_ENGINE_VERSION, else the file's
-// default_profile. MV_IDENTIFY_FRAMES and MV_SURFACES then apply, logged as
-// overrides.
+// Surface profiles: the `SurfaceSpec`s identification runs on, from
+// `profiles/ue5.json` (embedded into the DLL at configure time) plus any
+// `MV_PROFILE_FILE` (a profile with the same name replaces the embedded one).
+// The profile is `MV_PROFILE`, else `ue<major>.<minor>-generic` from
+// `MV_ENGINE_VERSION`, else the file's `default_profile`. `MV_IDENTIFY_FRAMES`
+// and `MV_SURFACES` then apply, logged as overrides.
 //
-// Any failure - malformed JSON, an unknown or missing field, an out-of-range
-// value, a missing profile - is logged and DISABLES identification for the
-// session. There is deliberately no built-in fallback: a capture against a
-// spec nobody chose is worse than none.
+// Any error (malformed JSON, an unknown or missing field, a value out of range,
+// a missing profile) is logged and disables identification for the session.
+// There is no built-in fallback: a capture against a spec nobody chose is worse
+// than none.
 
 namespace mv
 {
@@ -29,10 +29,10 @@ struct SurfaceProfile
     SurfaceSpec velocity{};
     SurfaceSpec depth{};
 
-    // Optional surfaces: slot i is kSurfaceNames[kFirstOptionalSurface + i].
-    // `present` when the profile has a spec for it; registered only when also
-    // spec.enabled - off by default, MV_SURFACES=<name>[,<name>] opts in. A
-    // fixed array: identifiers keep a reference to their spec.
+    // Optional surfaces: slot i is `kSurfaceNames[kFirstOptionalSurface + i]`.
+    // `present` when the profile has a spec for it; registered only if also
+    // `spec.enabled` (off by default; `MV_SURFACES` turns it on). A fixed array:
+    // identifiers keep a reference to their spec.
     static constexpr int kOptionalSurfaceCount = kSurfaceCount - kFirstOptionalSurface;
     struct OptionalSurface
     {
@@ -45,12 +45,11 @@ struct SurfaceProfile
     const SurfaceSpec* Optional(const char* surfaceName) const noexcept;
 };
 
-// Called once, from InstallD3D12Hooks, before any identifier is registered.
-// Returns nullptr on failure, having logged why.
+// Called once, from `InstallD3D12Hooks`, before any identifier is registered.
+// nullptr on failure, having logged why.
 const SurfaceProfile* LoadSurfaceProfile() noexcept;
 
-// The profile LoadSurfaceProfile() loaded, or nullptr before that / on
-// failure. For the manifest and the test harness.
+// The loaded profile, or nullptr before loading or after a failure.
 const SurfaceProfile* ActiveSurfaceProfile() noexcept;
 
 } // namespace mv

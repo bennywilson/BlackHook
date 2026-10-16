@@ -1,28 +1,16 @@
-"""Backfills a manifest.json for a dump captured before Phase 4 existed.
+"""Writes a manifest.json for a dump captured before the hook wrote one.
 
-mvtools.load_dump() refuses any dump directory without a manifest.json - see
-docs/REFACTOR_PLAN.md sec 4.3's version-gate table, which names this file as
-the documented escape hatch: "this is a pre-manifest dump; re-capture, or use
-tools/legacy_meta.py". This is that tool.
-
-WHAT THIS DOES NOT DO: pretend to be the hook. A live manifest.json (Phase
-4c-2's WriteManifestNow) records facts the hook observed AS it captured -
-which build produced it, wall-clock start/seal times, per-frame fence
-coverage, why the burst ended. None of that was recorded anywhere in a
-pre-manifest dump's meta.txt/meta_depth.txt/frames.csv, and this script does
-not invent it. Every field it cannot derive from what is actually on disk is
-either omitted or explicitly marked - see `reconstructed` at the top of the
-output - rather than filled with a plausible-looking guess. A reader (or a
-future version of this script) should be able to tell at a glance that this
-manifest was assembled after the fact, not written by the capture that
-produced the blobs it describes.
+`mvtools.load_dump()` refuses a dump without manifest.json; this reconstructs
+one from the dump's meta.txt, meta_depth.txt and frames.csv. It records only
+what those files hold. Fields the hook observes while capturing (the build,
+start and seal times, fence coverage, why the burst ended) are omitted or
+marked, and `reconstructed` at the top says the manifest was assembled after
+the fact.
 
 Usage:  python legacy_meta.py <dump_dir>
 
-Writes <dump_dir>/manifest.json (atomically: write .tmp, then rename).
-Refuses to run if manifest.json already exists - this is a one-time
-backfill, not a sync tool; delete the existing file first if you really want
-to regenerate it.
+Writes <dump_dir>/manifest.json (via a .tmp file and a rename). Refuses if a
+manifest.json already exists.
 """
 import json
 import os
@@ -33,9 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mvtools  # noqa: E402
 
 
-# Same per-surface facts capture.cpp's kStaticFacts table records - these are
-# facts about how the hook works structurally, unchanged by when a dump was
-# captured, so backfilling them is not a guess.
+# The per-surface facts from capture.cpp's `kCaptureFacts`: how the hook works,
+# the same for every dump.
 STATIC_FACTS = {
     "velocity": {"trigger": "render_target_to_shader_resource", "arbitration": "first_in_frame",
                  "file_pattern": "vel_%05d.bin"},
@@ -54,8 +41,8 @@ def _layout_surface(meta, prefix, plane_prefix=None):
     bytes_ = meta[f"{prefix}_bytes"]
     subresources = meta[f"{prefix}_subresources"]
     if plane_prefix is None:
-        # Single-plane surface (velocity, colour): meta.txt has flat
-        # width/height/row_pitch, no plane index.
+        # Single-plane surface (velocity, colour): flat width/height/row_pitch
+        # keys, no plane index.
         planes = [{
             "index": 0, "offset": 0,
             "width": meta[f"{prefix}_width"], "height": meta[f"{prefix}_height"],
@@ -113,11 +100,7 @@ def build_manifest(dump_dir):
                               "mechanism": "IDXGISwapChain3::GetBuffer(GetCurrentBackBufferIndex())"}
         else:
             obj["source"] = {"kind": "identified"}
-        # No pre-manifest dump recorded per-frame fence coverage - the field
-        # this hook build tracks lives entirely in the live capture path
-        # (capture.cpp's Coverage enum), not in meta.txt/meta_depth.txt.
-        # Reporting fabricated numbers here would be worse than reporting
-        # nothing - see this file's module docstring.
+        # Old dumps recorded no fence coverage; none is reported.
         obj["coverage_note"] = "not recorded - this dump predates per-surface fence coverage tallies"
         surfaces[name] = obj
 
@@ -168,10 +151,8 @@ def build_manifest(dump_dir):
             "note": "2-column legacy format",
         },
         "integrity": {
-            # The capture that produced these blobs did finish (this is an
-            # archived, reproducible result, not a partial run) - "sealed"
-            # here means that, not "this reconstruction observed a live
-            # drain-completion event", which it structurally cannot.
+            # The capture that produced these blobs finished; "sealed" means
+            # that here.
             "sealed": True,
             "required_surfaces": ["velocity", "color"] + (["depth"] if has_depth else []),
             "dropped_frames_backpressure": None,

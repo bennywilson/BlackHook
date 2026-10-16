@@ -1,19 +1,12 @@
 """Decoding helpers for the raw buffers dumped by the hook.
 
-The hook writes untouched GPU bytes plus a manifest.json describing them
-(docs/REFACTOR_PLAN.md sec 4.1), so all format knowledge lives here rather
-than in the injected DLL - keeping the in-process code as small and as
-low-risk as possible.
+The hook writes untouched GPU bytes plus a manifest.json describing them, so
+all format knowledge lives here, out of the injected DLL.
 
-load_dump() is the only supported door into a dump (sec 4.3): it gates on
-schema_version, refuses an unsealed dump unless told not to, and returns a
-Dump whose surfaces are typed by how their identity was established -
-IdentifiedSurface (found by search, has a coverage tally) or KnownSurface
-(given by an API contract, e.g. colour - no score, no signals, because there
-was nothing to search for). Every decode function below still takes a plain
-dict (`meta`), not a Surface - Dump.meta reconstructs that dict from the
-manifest so this file's numerically-sensitive decode code did not need to
-change shape for this migration.
+`load_dump()` opens a dump: it checks `schema_version`, refuses an unsealed dump
+unless told otherwise, and returns a `Dump` whose surfaces are typed by how they
+were found: `IdentifiedSurface` (found by search) or `KnownSurface` (named by an
+API: colour). The decode functions take the flat dict `Dump.meta`.
 """
 import json
 import os
@@ -23,11 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-# DXGI formats we actually encounter, verified against dxgiformat.h in the
-# installed Windows SDK (10.0.26100.0), not recalled. The neighbours matter:
-# R16G16B16A16_FLOAT is 10 and R16G16B16A16_UNORM is 11, and confusing those two
-# is the error that cost this project the most (see DEBUGGING.md). R16G16_UNORM
-# sits at 35, between R16G16_FLOAT (34) and R16G16_UINT (36).
+# DXGI formats seen in captures, from dxgiformat.h (Windows SDK 10.0.26100.0).
+# R16G16B16A16_FLOAT is 10 and R16G16B16A16_UNORM is 11; mistaking one for the
+# other cost this project more than any other error (DEBUGGING.md).
 DXGI_R16G16B16A16_UNORM = 11
 DXGI_R16G16B16A16_UINT = 12
 DXGI_R10G10B10A2_UNORM = 24
@@ -36,16 +27,16 @@ DXGI_R16G16_UNORM = 35
 DXGI_R16G16_UINT = 36
 DXGI_B8G8R8A8_UNORM = 87
 
-# The four formats FVelocityRendering::GetFormat can return (VelocityRendering.cpp:758),
-# crossed with the D3D12 RHI's PF_* -> DXGI table (D3D12RHI.cpp:139,144):
+# The four formats `FVelocityRendering::GetFormat` can return
+# (VelocityRendering.cpp:758), through the D3D12 RHI's PF_* -> DXGI table
+# (D3D12RHI.cpp:139,144):
 #
 #     bNeedVelocityDepth ? PF_A16B16G16R16 : PF_G16R16              (desktop)
 #     bNeedVelocityDepth ? PF_R16G16B16A16_UINT : PF_R16G16_UINT    (OpenGL/GLES)
 #
-# -> (channels, bytes per pixel). The UINT variants store the same 0..65535
-# integers the UNORM ones do - the GLES path just writes them explicitly
-# (`return uint4(EncodedV * 65535.0 + 0.5f)`, Common.ush:2081) - so normalising
-# by 65535 recovers the identical [0,1] value and the decode below is unchanged.
+# -> (channels, bytes per pixel). The UINT variants hold the same 0..65535
+# values (`return uint4(EncodedV * 65535.0 + 0.5f)`, Common.ush:2081), so dividing
+# by 65535 gives the same [0,1] value and the same decode.
 VELOCITY_FORMATS = {
     DXGI_R16G16B16A16_UNORM: (4, 8),
     DXGI_R16G16B16A16_UINT: (4, 8),
@@ -55,24 +46,18 @@ VELOCITY_FORMATS = {
 
 
 # ---------------------------------------------------------------------------
-# The manifest-backed loader. See this file's module docstring and
-# docs/REFACTOR_PLAN.md sec 4.3 - this is the only supported door into a
-# dump; every other function in this file takes bytes or a dict this loader
-# produces, never a raw manifest.
+# The manifest loader. Every other function here takes what it produces.
 
 SUPPORTED_SCHEMA = 1
-# Schema versions this build can still read, each mapped to a function that
-# upgrades that version's manifest dict to the current shape. Empty today -
-# schema_version 1 is the only version that has ever existed - but the seam
-# is here so a real migration is a function added to this dict, not a
-# reason to touch load_dump() itself.
+# Older schema versions this build can read, each mapped to a function that
+# upgrades its manifest dict. None yet: version 1 is the only one.
 _MIGRATIONS = {}
 
 
 @dataclass(frozen=True)
 class Plane:
-    """One D3D12 subresource plane's footprint. Depth has two (depth,
-    stencil); velocity and colour have one."""
+    """One D3D12 subresource plane's footprint. Depth has two (depth and
+    stencil); the other surfaces have one."""
     index: int
     offset: int
     width: int
@@ -91,12 +76,11 @@ def _parse_planes(layout_obj):
 
 @dataclass(frozen=True)
 class IdentifiedSurface:
-    """A surface whose identity came from the structural+behavioural search
-    (velocity, depth, and the optional normals/specular).
+    """A surface found by the structural and behavioural search: velocity,
+    depth, and the optional normals and specular.
 
-    Deliberately has no .score/.margin/.signals attributes: the hook logs its
-    identification evidence (mv_hook.log) but does not write it to the
-    manifest, and placeholder fields would invite a plausible-but-wrong read.
+    No score or signal fields: the hook logs its identification evidence in
+    mv_hook.log but does not write it to the manifest.
     """
     name: str
     present: bool
@@ -114,10 +98,7 @@ class IdentifiedSurface:
     detail: Optional[str] = None          # normals: why not present, in words
     encoding: Optional[dict] = None       # normals: {"kind": "unknown"} until verified
 
-    # Subresource 0 / plane 0 is the top mip / first plane, which is what
-    # every offline tool actually reads (matches WriteMetadata's own comment
-    # in capture.cpp) - exposed directly rather than making every caller
-    # write `.planes[0].width`.
+    # Plane 0 (the top mip, first plane) is what every tool reads.
     @property
     def width(self):
         return self.planes[0].width
@@ -133,14 +114,11 @@ class IdentifiedSurface:
 
 @dataclass(frozen=True)
 class KnownSurface:
-    """A surface whose identity is given by a documented API contract, not
-    found by search - colour, today, via IDXGISwapChain::GetBuffer.
+    """A surface named by an API rather than found: colour, from
+    `IDXGISwapChain::GetBuffer`.
 
-    Deliberately has NO .score, .margin, .signals or .coverage_note
-    attribute: docs/REFACTOR_PLAN.md sec 3.1/4.3 wants a consumer that tries
-    to read identification evidence off a known-source surface to fail
-    loudly (AttributeError) rather than silently get None back - the whole
-    point of two dataclasses instead of one optional-field class.
+    It has no identification fields at all, so code that reads them off colour
+    raises AttributeError instead of getting None.
     """
     name: str
     present: bool
@@ -237,12 +215,8 @@ class Dump:
 
     @property
     def meta(self):
-        """Flat dict, field-for-field compatible with the pre-manifest
-        load_meta() output, so every existing decode function in this file
-        (all of which take this dict shape) works unchanged against a
-        manifest-backed Dump. Built fresh each access rather than cached -
-        this is a read of already-parsed data, not a file read.
-        """
+        """The flat dict every decode function in this file takes, built from
+        the manifest on each access."""
         m = {}
         if self.has("velocity"):
             v = self.surface("velocity")
@@ -278,9 +252,9 @@ class Dump:
 
 
 def load_dump(dump_dir, *, allow_unsealed=False):
-    """The only supported way to open a dump. See docs/REFACTOR_PLAN.md
-    sec 4.3 for the full version-gate table this implements.
-    """
+    """Opens a dump directory through its manifest.json. Refuses a dump
+    without one, an unknown schema version, or an unsealed manifest (unless
+    `allow_unsealed`)."""
     manifest_path = os.path.join(dump_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         legacy = os.path.join(dump_dir, "meta.txt")
@@ -342,19 +316,13 @@ def load_dump(dump_dir, *, allow_unsealed=False):
 
 
 def decode_normals(dump, capture_index):
-    """World-space normals for one captured frame - REFUSES, by design.
+    """World-space normals for one captured frame. Always refuses.
 
-    The hook captures GBufferA's bytes (MV_SURFACES=normals), but how UE packs
-    the normal into them (octahedral vs direct, and whether that changed
-    between 5.2 and 5.7) has not been verified against engine source or a
-    live capture - docs/REFACTOR_PLAN.md sec 3.2 #6. The manifest says so
-    ("encoding": {"kind": "unknown"}), and decoding anyway would produce a
-    plausible normal field from a guess: the failure mode this project has
-    paid for twice (README: the format-enum bug, the missing sqrt).
-
-    When the encoding is established, the hook should write it into the
-    manifest and this function should decode exactly that kind and refuse
-    every other.
+    How UE packs the normal into GBufferA (octahedral or direct, and whether
+    that differs between 5.2 and 5.7) is not verified, and the manifest says so
+    (`"encoding": {"kind": "unknown"}`). Decoding on a guess would give
+    believable but wrong normals. Once the encoding is known, the hook should
+    write it into the manifest and this should decode that kind only.
     """
     surface = dump.surface("normals")  # raises if not captured, with the manifest's reason
     kind = (surface.encoding or {}).get("kind", "unknown")
@@ -365,11 +333,10 @@ def decode_normals(dump, capture_index):
 
 
 def _rows(path, width, height, row_pitch, bytes_per_pixel):
-    """Un-pad a GPU row-pitched buffer into a tight (height, width*bpp) array.
+    """Un-pads a GPU row-pitched buffer into a tight (height, width*bpp) array.
 
-    D3D12 pads each row up to a 256-byte multiple, and GetCopyableFootprints
-    reports a total size where the *last* row is not padded - so the file is
-    row_pitch*(height-1) + width*bpp bytes, not row_pitch*height.
+    D3D12 pads each row to a multiple of 256 bytes, and the last row is not
+    padded: the file is row_pitch*(height-1) + width*bpp bytes.
     """
     raw = np.fromfile(path, dtype=np.uint8)
     useful = width * bytes_per_pixel
@@ -381,11 +348,11 @@ def _rows(path, width, height, row_pitch, bytes_per_pixel):
 
 
 def velocity_channels(meta):
-    """(channels, bytes per pixel) for the captured velocity format.
+    """(channels, bytes per pixel) of the captured velocity format.
 
-    Read from the capture, not assumed: a title without Lumen, distance fields
-    or ray tracing gets PF_G16R16 (2 channels, 4 bytes) from the same engine
-    code that gives others R16G16B16A16_UNORM.
+    Read from the capture: a title without Lumen, distance fields or ray
+    tracing gets PF_G16R16 (2 channels, 4 bytes) where others get
+    R16G16B16A16_UNORM.
     """
     fmt = meta["velocity_format"]
     if fmt not in VELOCITY_FORMATS:
@@ -398,11 +365,11 @@ def velocity_channels(meta):
 
 
 def load_velocity_raw(path, meta):
-    """Returns raw velocity as float (h, w, channels) in [0,1].
+    """Raw velocity as float (h, w, channels) in [0,1].
 
-    Channel count depends on the format: 4 for PF_A16B16G16R16 (the
-    NeedVelocityDepth case), 2 for PF_G16R16. Callers that need channels 2/3
-    must check - decode_velocity_depth() does.
+    4 channels for PF_A16B16G16R16 (when velocity depth is needed), 2 for
+    PF_G16R16. Callers that need channels 2 and 3 must check, as
+    `decode_velocity_depth()` does.
     """
     channels, bpp = velocity_channels(meta)
     w, h = meta["velocity_width"], meta["velocity_height"]
@@ -412,66 +379,47 @@ def load_velocity_raw(path, meta):
 
 
 # ---------------------------------------------------------------------------
-# The SceneVelocity encoding.
+# The SceneVelocity encoding, from the encode/decode pair in
+# Engine/Shaders/Private/Common.ush (UE 5.7.1).
 #
-# These are no longer fitted. They are transcribed from the encode/decode pair
-# in Engine/Shaders/Private/Common.ush of the engine this title is built on
-# (UE 5.7.1, on disk), and every constant below can be pointed at a line there.
-# The previous fitted constants (-0.1758 / +0.1991 UV per UNORM unit) are gone;
-# what they actually were is explained at the bottom of this comment, because
-# the reason they looked plausible is the interesting part.
-#
-# EncodeVelocityToTexture(), Common.ush:2060 --
+# EncodeVelocityToTexture(), Common.ush:2060:
 #
 #     #if VELOCITY_ENCODE_GAMMA                          // 1 whenever SM5+
 #         V.xy = sign(V.xy) * sqrt(abs(V.xy)) * (2.0 / sqrt(2.0));
 #     #endif
 #     EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f;
 #
-# So the stored value is a SQUARE-ROOT encoding of the clip-space delta, not a
-# linear one. VELOCITY_ENCODE_GAMMA is `#define`d to 1 for every feature level
-# at or above SM5 (Common.ush:238), i.e. unconditionally for a D3D12 PC title -
-# there is no cvar and no per-project setting to check.
+# So the stored value is a square-root encoding of the clip-space delta.
+# VELOCITY_ENCODE_GAMMA is 1 at every feature level from SM5 up (Common.ush:238),
+# so always on for a D3D12 PC title; there is no cvar for it.
 #
-# The inverse, DecodeVelocityFromTexture() at Common.ush:2107:
+# The inverse, DecodeVelocityFromTexture(), Common.ush:2107:
 #
 #     V.xy = EncodedV.xy * InvDiv - 32767.0f/65535.0f * InvDiv;   // InvDiv = 1/(0.499*0.5)
 #     #if VELOCITY_ENCODE_GAMMA
 #         V.xy = (V.xy * abs(V.xy)) * 0.5;
 #     #endif
 #
-# V is then a CLIP-space delta, current minus previous, with x right and y up.
-# Two more engine facts fix the rest of the convention:
+# V is a clip-space delta, current minus previous, x right and y up. Two more
+# engine facts fix the convention:
 #
 #   * `PrevScreenPos = ScreenPos - DecodeVelocityFromTexture(...).xy`
-#     (PostProcessAmbientOcclusion.usf:1203, VisualizeMotionVectors.usf:78, and
-#     every other consumer) - so V points forward, and stepping *back* to the
-#     previous frame subtracts it.
+#     (PostProcessAmbientOcclusion.usf:1203, VisualizeMotionVectors.usf:78): V
+#     points forward, and stepping back to the previous frame subtracts it.
 #   * `ScreenPosToViewportUV(S) = float2(0.5 + 0.5*S.x, 0.5 - 0.5*S.y)`
-#     (Common.ush:1658) - clip to UV flips Y.
+#     (Common.ush:1658): clip to UV flips Y.
 #
-# Composing those two gives the backward (current -> previous) UV displacement
-# this module returns:
+# Together they give the backward (current -> previous) UV displacement this
+# module returns:
 #
 #     du = -0.5 * V.x        dv = +0.5 * V.y
 #
-# which is where the X-negative / Y-positive sign pattern comes from. It was
-# guessed correctly before; it is now derived.
+# The vector is already de-jittered: Calculate3DVelocityBase()
+# (VelocityCommon.ush:9) subtracts View.TemporalAAJitter from both positions
+# before differencing, so the TAA/TSR offset must not be removed again.
 #
-# Jitter: the encoded vector is already de-jittered. Calculate3DVelocityBase()
-# (VelocityCommon.ush:9) subtracts View.TemporalAAJitter.xy from the current
-# screen position and .zw from the previous one before differencing, so the
-# TAA/TSR sub-pixel offset is not in the buffer and must not be removed again.
-#
-# Why the old fitted constants looked right: linearising the sqrt encoding
-# around the dominant motion in the station capture (a train at ~11 px/frame
-# across a 1212-wide velocity buffer) gives an apparent slope of
-#     (11/1212) / (sqrt(2*11/1212) * sqrt(2) * 0.2495) = 0.191 UV per unit,
-# against the -0.1758 / +0.1991 that were fitted. The fit was not wrong about
-# its own data - it measured the local tangent of a curve and reported it as
-# the curve. That is also the whole of the "~10x disagreement with Common.ush":
-# 2.004 is the coefficient of the sqrt term, 0.19 is a chord across it, and the
-# ratio between them is a function of how fast the scene happened to be moving.
+# A linear fit to captured data looks right on one clip and is wrong elsewhere:
+# it measures the local slope of the sqrt curve at that clip's typical speed.
 ENCODE_ZERO = 32767.0 / 65535.0     # Common.ush:2069
 ENCODE_SCALE = 0.499 * 0.5          # Common.ush:2069
 ENCODE_GAMMA = True                 # Common.ush:238, SM5+ => always on here
@@ -479,51 +427,24 @@ ENCODE_GAMMA = True                 # Common.ush:238, SM5+ => always on here
 # ---------------------------------------------------------------------------
 # Engine version.
 #
-# The x/y encoding above is stable across the versions checked: UE 5.2 and
-# UE 5.7.1 both guard VELOCITY_ENCODE_GAMMA on `FEATURE_LEVEL >= FEATURE_LEVEL_SM5`
-# and both apply the identical `V.xy = (V.xy * abs(V.xy)) * 0.5` on decode. So
-# the displacement decode ports between them unchanged.
-#
-# The DEPTH channels do NOT. 5.7.1 steals the bottom 1-2 bits of channel 3 to
-# carry bHasPixelAnimation / temporal responsiveness:
+# The x/y encoding is the same in UE 5.2 and 5.7.1 (both guard
+# VELOCITY_ENCODE_GAMMA on `FEATURE_LEVEL >= FEATURE_LEVEL_SM5` and decode with
+# `V.xy = (V.xy * abs(V.xy)) * 0.5`). The depth channels differ: 5.7.1 uses the
+# bottom 1-2 bits of channel 3 for bHasPixelAnimation and temporal
+# responsiveness.
 #
 #   5.7.1:  V.z = asfloat((z << 16) | (w & VELOCITY_Z_LOW_MASK))   // 0xFFFE or 0xFFFC
-#   5.2:    V.z = asfloat((z << 16) |  w)                          // no mask at all
+#   5.2:    V.z = asfloat((z << 16) |  w)                          // no mask
 #
-# On 5.2 those bits are ordinary float32 mantissa. Masking them off loses (a
-# negligible amount of) precision, but *reporting bit 0 as a flag* would be
-# presenting the low mantissa bit of a float as a semantic boolean - which is
-# the exact mistake this project already made once, when channel 2's bimodality
-# was written up as "a flag, not a velocity component" (it is the sign bit of
-# this same float). Same error, one bit lower down. So the flag is only decoded
-# where it is known to exist.
+# On 5.2 those bits are float32 mantissa, so the flag is decoded only where it
+# is known to exist. Only 5.2 and 5.7.1 are verified; for other versions
+# `depth_encoding()` warns and uses the nearer one.
 #
-# Verified endpoints only. 5.2: no mask, no flag. 5.7.1: masked, flag present.
-# The introduction point in between has NOT been checked - anything else warns
-# rather than guessing, because a silently wrong boolean is worse than a noisy
-# one.
-#
-# One caveat on the 5.7 entry, found while porting and worth stating because it
-# is the same class of thing this table exists to prevent. VELOCITY_Z_LOW_MASK
-# is not a constant even within 5.7.1 (Common.ush:2049-2055):
-#
-#     #if VELOCITY_ENCODE_TEMPORAL_RESPONSIVENESS
-#         #define TEMPORAL_RESPONSIVENESS_MASK  0x3
-#         #define VELOCITY_Z_LOW_MASK           0xFFFC     <- two bits stolen
-#     #else
-#         #define TEMPORAL_RESPONSIVENESS_MASK  0x1
-#         #define VELOCITY_Z_LOW_MASK           0xFFFE     <- one bit stolen
-#     #endif
-#
-# and VELOCITY_ENCODE_TEMPORAL_RESPONSIVENESS depends on
-# VELOCITY_SUPPORT_TEMPORAL_RESPONSIVENESS, a per-shader-platform property we
-# cannot read from a dump. 0xFFFE below is therefore the *narrower* of the two
-# possibilities, chosen deliberately: if the title actually uses 0xFFFC, this
-# leaves bit 1 in the mantissa, which perturbs V.z by ~1e-7 relative - nothing.
-# Guessing the other way round would mask off a real mantissa bit AND report
-# bit 1 as part of a flag it is not. Both bits are low mantissa either way, so
-# V.z is safe; only bHasPixelAnimation (bit 0) is claimed, and bit 0 is stolen
-# under both branches.
+# VELOCITY_Z_LOW_MASK also varies within 5.7.1 (Common.ush:2049-2055): 0xFFFC
+# with VELOCITY_ENCODE_TEMPORAL_RESPONSIVENESS, else 0xFFFE. That depends on a
+# per-shader-platform property a dump does not record, so the table uses
+# 0xFFFE. If the title uses 0xFFFC, bit 1 stays in the mantissa (a ~1e-7
+# relative error in V.z); bit 0, the only flag reported, is taken in both.
 ENGINE_VERSION = (5, 7)
 
 _VERIFIED_ENCODINGS = {
@@ -534,25 +455,15 @@ _VERIFIED_ENCODINGS = {
 
 
 def engine_version(meta=None):
-    """The engine version to decode with: from the capture if it recorded one.
-
-    ENGINE_VERSION is a module global, which is fine for one title at a time and
-    silently wrong the moment two dumps from different engine versions are
-    analysed in the same session - the second one gets whatever the first one
-    set. The manifest records the engine version when MV_ENGINE_VERSION was
-    set for the capture, so the dump carries its own answer and the global is
-    only a fallback.
+    """The engine version to decode with: the capture's own if the manifest
+    recorded one (it does when MV_ENGINE_VERSION was set for the capture),
+    else MV_ENGINE_VERSION now, else `ENGINE_VERSION`.
     """
     if meta and "engine_version_major" in meta and "engine_version_minor" in meta:
         return (meta["engine_version_major"], meta["engine_version_minor"])
-    # Not in the capture. MV_ENGINE_VERSION lets the operator supply it after
-    # the fact, which is not as good as recording it but is far better than the
-    # alternative: falling back to a default that is wrong for the title, and
-    # then reporting bHasPixelAnimation for an engine version that has no such
-    # flag. That is exactly the error this whole mechanism exists to prevent -
-    # reading semantics into bits of a value whose type has not been
-    # established - and it happened here, silently, on the first third-party
-    # capture, because the game was launched without the variable set.
+    # Not recorded: take MV_ENGINE_VERSION from the environment, which beats a
+    # default that may be wrong for the title (and would then report
+    # bHasPixelAnimation for an engine that has no such flag).
     env = os.environ.get("MV_ENGINE_VERSION", "")
     if "." in env:
         try:
@@ -577,19 +488,17 @@ def depth_encoding(version=None):
         f"bHasPixelAnimation.")
     return _VERIFIED_ENCODINGS[nearest]
 
-# UE5 clamps the *encoded* channel to [0,1], so the representable clip-space
-# delta is bounded. Recorded here because it is the ceiling on anything this
-# module can report, not because anything divides by it.
+# UE5 clamps the encoded channel to [0,1], so this is the largest clip-space
+# delta a capture can hold.
 MAX_CLIP_DELTA = (ENCODE_ZERO / ENCODE_SCALE) ** 2 * 0.5 * 2.0
 
 
 def decode_velocity_clip(path, meta):
-    """Decode SceneVelocity into the engine's own clip-space delta.
+    """SceneVelocity as the engine's clip-space delta.
 
-    Returns (h, w, 2) of `V.xy` exactly as DecodeVelocityFromTexture() would
-    hand it to a shader: current-minus-previous, clip space, x right, y up.
-    Use this to compare against engine code; use decode_velocity() to compare
-    against images.
+    (h, w, 2) of `V.xy` as `DecodeVelocityFromTexture()` returns it: current
+    minus previous, clip space, x right, y up. Use it to compare against engine
+    code; use `decode_velocity()` to compare against images.
     """
     raw = load_velocity_raw(path, meta)
     v = (raw[:, :, :2] - ENCODE_ZERO) / ENCODE_SCALE
@@ -599,11 +508,11 @@ def decode_velocity_clip(path, meta):
 
 
 def decode_velocity(path, meta):
-    """Decode the velocity buffer into screen-space UV displacement.
+    """SceneVelocity as screen-space UV displacement.
 
-    Returned value is the displacement from this frame's pixel back to where
-    that surface was in the previous frame, in UV units (fraction of screen).
-    Only meaningful where velocity_written_mask() is true.
+    The displacement from this frame's pixel back to where that surface was in
+    the previous frame, in UV units. Meaningful only where
+    `velocity_written_mask()` is true.
     """
     v = decode_velocity_clip(path, meta)
     out = np.empty(v.shape, dtype=np.float32)
@@ -613,23 +522,20 @@ def decode_velocity(path, meta):
 
 
 def decode_velocity_depth(path, meta, version=None):
-    """Decode channels 2 and 3, which are not a colour and not a displacement.
+    """Channels 2 and 3: the DeviceZ delta, not a colour or a displacement.
 
-    Under VELOCITY_ENCODE_DEPTH (Common.ush:2071) the encoder splits the
-    float32 bit pattern of `V.z` - the DeviceZ delta, current minus previous -
-    across the two spare 16-bit channels:
+    Under VELOCITY_ENCODE_DEPTH (Common.ush:2071) the float32 bit pattern of
+    `V.z`, the DeviceZ delta (current minus previous), is split across the two
+    spare 16-bit channels:
 
         EncodedV.z = (asuint(V.z) >> 16) & 0xFFFF
         EncodedV.w = (asuint(V.z)        & VELOCITY_Z_LOW_MASK) | ResponsivenessMask
 
-    with the bottom 1-2 bits of w stolen for the temporal-responsiveness /
-    bHasPixelAnimation flags. Reassembling the halves is the only way to read
-    them: on their own, channel 2 looks bimodal and channel 3 looks like noise,
-    which is exactly what the top and bottom halves of a clustered float32 do
-    look like when you plot them as if they were colours.
+    with the bottom 1-2 bits of w used for flags. Viewed separately, channel 2
+    looks bimodal (it holds the sign bit) and channel 3 like noise.
 
     Returns (device_z_delta, has_pixel_animation). has_pixel_animation is None
-    on engine versions that do not encode it - see depth_encoding().
+    on engine versions that do not encode it (see `depth_encoding()`).
     """
     channels, _ = velocity_channels(meta)
     if channels != 4:
@@ -648,19 +554,13 @@ def decode_velocity_depth(path, meta, version=None):
 
 
 def velocity_written_mask(path, meta):
-    """True where the velocity buffer actually holds written data.
+    """True where the velocity buffer holds written data.
 
-    UE5 only writes SceneVelocity for pixels it considers to have non-trivial
-    motion; everywhere else the buffer holds its cleared value (0), which
-    decodes to a large bogus displacement rather than zero. Those pixels must
-    be excluded, not trusted.
-
-    The test is `EncodedV.x > 0`, which is the engine's own - see
-    `bIsRenderedVelocity` in VisualizeMotionVectors.usf:73 and
-    PostProcessAmbientOcclusion.usf:1200. Zero motion encodes to 32767, so 0 in
-    channel 0 is unambiguously "never written"; the engine falls back to
-    reconstructing camera motion from depth for those pixels, which is why they
-    are absent rather than zero.
+    UE5 writes SceneVelocity only for pixels with motion beyond the camera's;
+    elsewhere it holds its cleared value 0, which decodes to a large false
+    displacement. The test is the engine's own, `EncodedV.x > 0`
+    (`bIsRenderedVelocity`, VisualizeMotionVectors.usf:73): zero motion encodes
+    to 32767, so 0 means never written.
     """
     raw = load_velocity_raw(path, meta)
     return raw[:, :, 0] > 0.0
@@ -669,16 +569,13 @@ def velocity_written_mask(path, meta):
 # ---------------------------------------------------------------------------
 # Scene depth.
 #
-# UE5 creates scene depth as PF_DepthStencil, which the D3D12 RHI maps to a
-# TYPELESS format (D3D12RHI.cpp:117/127) - R24G8_TYPELESS or R32G8X24_TYPELESS
-# depending on the r.D3D12.UseD24 cvar. Both are MULTI-PLANE: depth is plane 0,
-# stencil is plane 1, with different formats and different row pitches. The hook
-# writes every plane's footprint into meta_depth.txt rather than describing only
-# the first, so this does not have to assume which case it is looking at.
+# UE5 creates scene depth as PF_DepthStencil, which the D3D12 RHI maps to
+# R24G8_TYPELESS or R32G8X24_TYPELESS depending on r.D3D12.UseD24
+# (D3D12RHI.cpp:117/127). Both have two planes, depth then stencil, with
+# different formats and row pitches; the manifest gives both.
 #
-# The values are DeviceZ exactly as the shader would read them: UE5 uses a
-# reversed-Z buffer, so 1.0 is the near plane and 0.0 is the far plane / sky.
-# Nothing is linearised here.
+# Values are DeviceZ as a shader reads them, reversed-Z: 1.0 is the near plane,
+# 0.0 the far plane or sky. Nothing is linearised here.
 DEPTH_PLANE0_DECODERS = {
     39: "float32",   # R32_TYPELESS       - plane 0 of R32G8X24_TYPELESS
     40: "float32",   # D32_FLOAT
@@ -723,8 +620,7 @@ def load_depth(path, meta):
     if kind == "float32":
         return out.view(np.float32).reshape(h, w)
     if kind == "unorm24":
-        # Depth is in the low 24 bits; the top 8 are the X8 padding, NOT the
-        # stencil (stencil lives in plane 1, in its own footprint).
+        # Depth is the low 24 bits; the top 8 are padding (stencil is plane 1).
         packed = out.view(np.uint32).reshape(h, w)
         return (packed & 0x00FFFFFF).astype(np.float32) / 16777215.0
     return out.view(np.uint16).reshape(h, w).astype(np.float32) / 65535.0
@@ -751,30 +647,21 @@ def load_color(path, meta):
 
 
 def to_display(color):
-    """Back buffer -> displayable RGB.
-
-    The presented back buffer is already display-encoded (the swapchain is what
-    goes to the monitor), so no gamma is applied here. An earlier version
-    applied **(1/2.2) on the assumption the data was linear, which double
-    gamma-corrected it and visibly washed out an otherwise dark scene - the
-    give-away was captures looking much brighter than the game does.
-    """
+    """Back buffer to displayable RGB. The back buffer is already
+    display-encoded, so no gamma is applied."""
     return np.clip(color, 0, 1).astype(np.float32)
 
 
 def flow_to_rgb(flow_uv, meta, max_pixels=None, gamma=0.5, floor=0.18):
-    """HSV colour-wheel visualisation: hue = direction, value = magnitude.
+    """HSV colour wheel: hue is direction, brightness is magnitude.
 
-    A real scene spans a wide range of speeds at once - here a train crossing
-    at ~11px/frame alongside a weapon viewmodel drifting at ~1px/frame. Mapping
-    magnitude to brightness linearly crushes everything slow to black, so the
-    ramp is gamma-corrected (sqrt by default) and written pixels get a small
-    brightness floor. Direction (hue) stays untouched; only the brightness ramp
-    is perceptual, so colours remain comparable between frames.
+    One frame can hold ~11 px/frame motion next to ~1 px/frame, so brightness
+    follows magnitude**gamma (sqrt by default) with a floor for written pixels;
+    hue is left linear, so colours compare across frames.
     """
     import cv2
     h, w = flow_uv.shape[:2]
-    # Convert UV displacement to pixels so the scale is physically meaningful.
+    # UV to pixels, so the scale is in pixels.
     fx = flow_uv[:, :, 0] * w
     fy = flow_uv[:, :, 1] * h
     mag = np.sqrt(fx * fx + fy * fy)
@@ -798,11 +685,7 @@ def frame_indices(dump_dir):
 
 
 def load_frame_map(dump_dir):
-    """capture index -> the game frame the capture came from, or None.
-
-    The hook appends one `captureIndex,frameIndex` line per drained frame to
-    frames.csv. Dumps taken before that existed have no such file.
-    """
+    """capture index -> the game frame it came from, from frames.csv."""
     path = os.path.join(dump_dir, "frames.csv")
     if not os.path.exists(path):
         return None
@@ -818,29 +701,21 @@ def load_frame_map(dump_dir):
 
 
 def consecutive_pairs(dump_dir, indices=None):
-    """(prev, cur) capture pairs that really are adjacent game frames.
+    """(prev, cur) capture pairs that are adjacent game frames.
 
-    The whole warp test assumes frame N-1 and frame N are one frame apart. That
-    was previously assumed rather than checked: capture indices are a counter
-    of what we managed to drain, so a dropped frame, a slot that was busy, or a
-    second F8 burst all produce numerically adjacent captures that are not
-    temporally adjacent. With frames.csv present this is now verified against
-    the game's own frame counter and non-adjacent pairs are dropped.
+    Capture indices count what was drained, so a dropped frame, a busy slot or
+    a second burst makes numerically adjacent captures that are not adjacent
+    frames. Pairs are checked against frames.csv.
 
-    Returns (pairs, note) where note describes which rule was applied, so
-    callers can print it rather than silently implying the strong one.
+    Returns (pairs, note), the note saying how many were kept and rejected.
     """
     if indices is None:
         indices = frame_indices(dump_dir)
     index_set = set(indices)
     frames = load_frame_map(dump_dir)
     if frames is None:
-        # A dump old enough to lack frames.csv also lacks manifest.json, so
-        # load_dump() already refuses it before any caller reaches here -
-        # this function is only ever called (via Dump.pairs()) on a dump
-        # that passed the loader gate. No fallback rule is needed any more
-        # (finding 1.17: the BURST constant this used to fall back to had
-        # drifted from kCaptureFrames for most of the project's life).
+        # Unreachable through `load_dump()`: a dump without frames.csv has no
+        # manifest either.
         raise ValueError(
             f"{dump_dir} has no frames.csv, so pairing cannot be verified. This should be unreachable "
             f"through load_dump(), which refuses any dump this old before it gets here.")

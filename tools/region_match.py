@@ -1,35 +1,25 @@
-"""Decode vs measured motion, compared over a REGION rather than per pixel.
+"""Decode vs measured motion, compared over a region instead of per pixel.
 
-WHY THIS EXISTS, AND WHY IT IS NOT JUST check_decode.py AGAIN
+`derive_scale.py` regresses decoded against measured displacement per pixel.
+On Skyrunner that reference fails, though the decode is right:
 
-`derive_scale.py` regresses decoded against measured displacement at every
-confidently-matched pixel. That is the strongest form of the test when it works,
-and on the second title in this project it does not work - not because the
-decode is wrong but because the *reference* is unusable there:
+  * the written region is wind-animated foliage, thin structure with
+    background showing through, so a 17 px window spans two surfaces moving
+    differently;
+  * heavy motion blur makes consecutive frames look alike at smaller offsets,
+    biasing any matcher low;
+  * per-pixel matching gives slope ~0.7, and filtering harder makes it worse
+    (0.73 keeping the top 50% of matches, 0.39 keeping the top 3%).
 
-  * the written region is wind-animated foliage, thin high-frequency structure
-    with background visible through it, so a 17px correlation window routinely
-    spans two surfaces moving differently and returns a compromise;
-  * the title applies heavy motion blur, which makes consecutive frames look
-    more similar at smaller offsets and biases any matcher low;
-  * per-pixel matching reports slope ~0.7 against a correct decode, and filtering
-    harder makes it worse, not better (slope peaks at 0.73 keeping the top 50%
-    of matches by confidence and falls to 0.39 keeping the top 3%). A reference
-    that degrades as you demand more of it is not measuring what you think.
+This asks a weaker question the footage can answer: over one region, does the
+decode predict the displacement the region underwent? It matches a large crop
+by normalised cross-correlation (no search radius limit, and it reports its
+match quality) and compares it with the median decoded displacement over the
+same pixels.
 
-This tool asks a weaker question that the same footage can actually answer: over
-one region, does the decode predict the displacement that region visibly
-underwent? It matches a large crop by normalised cross-correlation, which has no
-small search radius to be blind above and reports its own match quality, and
-compares that against the median decoded displacement over the same pixels.
-
-It cannot show the field is correct *per pixel* - only per region, per frame.
-That is a real limitation and it is the reason this file does not replace
-derive_scale.py. What it does show, on footage where the per-pixel route is
-compromised, is whether the decode has the right scale and sign at all - and
-because it works across a wide magnitude range, it also discriminates the
-square-root encoding from a linear one, which is the question a single frame
-cannot answer.
+It shows scale and sign per region, not correctness per pixel. Across a wide
+range of magnitudes it also tells the square-root encoding from a linear one,
+which one frame cannot.
 
 Usage:  python region_match.py [dump_dir]
 """
@@ -47,17 +37,13 @@ try:
 except ImportError:  # pragma: no cover
     cv2 = None
 
-# The fitted constants this project used before the encoding was read out of
-# Common.ush - kept only as a control. They are linear, so if the stored
-# encoding really is square-root these should track badly at large
-# displacements and acceptably at small ones. See DEBUGGING.md.
+# A linear decode with fitted constants, as a control: if the encoding is
+# square-root, it tracks badly at large displacements and acceptably at small
+# ones (DEBUGGING.md).
 LEGACY_UV_PER_UNIT_X = -0.1758
 LEGACY_UV_PER_UNIT_Y = +0.1991
 
-# Below this normalised-cross-correlation score the match is not trustworthy and
-# the pair is skipped rather than contributing a number. Stated rather than
-# silently tolerated: the whole point of this file is that a reference which
-# fails quietly is worse than no reference.
+# Pairs whose normalised cross-correlation is below this are skipped.
 MIN_SCORE = 0.70
 
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
@@ -80,12 +66,7 @@ def legacy_uv(path):
 
 
 def crop_box(mask, h, w):
-    """A crop centred on the written region, big enough to match reliably.
-
-    Centred on the mask rather than on the frame because that is where the
-    pixels under test are, and left large so the normalised cross-correlation
-    has plenty of structure to lock onto.
-    """
+    """A crop centred on the written region, large enough to match reliably."""
     ys, xs = np.where(mask)
     if ys.size < 1000:
         return None
@@ -101,9 +82,8 @@ def crop_box(mask, h, w):
 def match_crop(cur, prev, box, max_shift=400):
     """Where did this crop of `cur` come from in `prev`? Returns (dx, dy, ncc).
 
-    Plain template matching over a wide window: no small search radius to be
-    blind above, and it reports its own match quality so a bad match can be
-    discarded instead of quietly contributing a number.
+    Template matching over a wide window, with its own match quality so a bad
+    match can be dropped.
     """
     h, w = cur.shape
     y0, y1, x0, x1 = box
@@ -135,14 +115,11 @@ def main():
         if mask.mean() < 0.02:
             continue
 
-        # The crop is chosen here, not inside blockmatch, because BOTH sides of
-        # the comparison have to be computed over the same pixels. Measuring a
-        # centre crop and then averaging the decode over the whole frame is not
-        # a scale measurement - under camera rotation, foliage at the frame edge
-        # moves several times as far as the middle, so the two numbers describe
-        # different parts of the image and their ratio is meaningless. The first
-        # version of this file did exactly that and reported slope 0.73 where a
-        # like-for-like comparison of the same footage gives 1.04.
+        # The crop is chosen here so both sides are computed over the same
+        # pixels. Under camera rotation, foliage at the frame edge moves several
+        # times as far as the middle, so a centre-crop match against a
+        # whole-frame decode average compares different regions (slope 0.73,
+        # where the same footage compared like for like gives 1.04).
         box = crop_box(mask, ch, cw)
         if box is None:
             continue
@@ -190,11 +167,9 @@ def main():
         ry = np.corrcoef(a[:, yi], a[:, 1])[0, 1]
         print(f"  {label:<28} X: slope {sx:6.3f}  r {rx:+.3f}    Y: slope {sy:6.3f}  r {ry:+.3f}")
 
-    # The magnitude sweep is what separates the two encodings. A linear decode
-    # of square-root-encoded data does not fail by a constant factor - it fails
-    # progressively worse as displacement grows, because that is where the two
-    # curves diverge. So a decode whose ratio is FLAT across the range is the
-    # right one, and this is the check a single frame cannot do.
+    # The magnitude sweep separates the encodings: a linear decode of
+    # square-root data is off by more as displacement grows, so the right
+    # decode is the one whose ratio stays flat across the range.
     print("\nratio measured/decoded by displacement band (flat = correct encoding):")
     mag = np.abs(a[:, 0])
     edges = np.percentile(mag, [0, 33, 66, 100])

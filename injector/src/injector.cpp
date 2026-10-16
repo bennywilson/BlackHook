@@ -1,7 +1,6 @@
-// Classic CreateRemoteThread + LoadLibraryW injection.
+// CreateRemoteThread + LoadLibraryW injection.
 //
-// Important: Does not attempt to thwart anti-cheat.  Recommend use is on
-// shipping builds of single player Unreal Demos
+// Does nothing to avoid anti-cheat: for single-player games and demos.
 //
 // Usage:
 //   mv_injector.exe <process_name.exe> <path_to_hook_dll>
@@ -15,7 +14,7 @@
 namespace {
 
 DWORD FindProcessId(const std::wstring& processName) {
-    // Take a snapshot of every running process on the system.
+    // Snapshot of every running process.
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return 0;
@@ -24,7 +23,7 @@ DWORD FindProcessId(const std::wstring& processName) {
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
 
-    // Walk the snapshot looking for our process
+    // Find the target by name.
     DWORD pid = 0;
     if (Process32FirstW(snapshot, &entry)) {
         do {
@@ -39,17 +38,14 @@ DWORD FindProcessId(const std::wstring& processName) {
     return pid;
 }
 
-// Returns the module name from a DLL path. The module name is what
-// TH32CS_SNAPMODULE reports (szModule, name w/o path).
-//
-// Note: This function doesn't distinguish between two same-named modules loaded
-// from different paths.
+// The module name of a DLL path, as TH32CS_SNAPMODULE reports it (`szModule`,
+// no directory). Two same-named modules from different paths look the same.
 std::wstring ModuleNameFromPath(const std::wstring& dllPath) {
     const size_t lastSlash = dllPath.find_last_of(L"/\\");
     return (lastSlash == std::wstring::npos) ? dllPath : dllPath.substr(lastSlash + 1);
 }
 
-// Finds a module's base address inside a target process by name, via TH32CS_SNAPMODULE
+// A module's base address in a target process, by name (TH32CS_SNAPMODULE).
 HMODULE FindRemoteModuleBase(DWORD pid, const std::wstring& moduleName, std::wstring* const outFullPath) {
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -87,15 +83,12 @@ bool PathsEqual(const std::wstring& a, const std::wstring& b) {
                                 TRUE) == CSTR_EQUAL;
 }
 
-// Runs LoadLibraryW export as a remote thread on the target process and waits.
-//
-// Note: we're calling a void(void) export through a start routine typed
-// DWORD WINAPI(LPVOID). That's fine as the export never reads the unused
-// argument register.
+// Runs `LoadLibraryW` in the target as a remote thread and waits for it. It
+// matches a thread start routine: one pointer argument (the DLL path) and a
+// return value the thread exit code carries.
 bool RunRemoteThread(HANDLE process, LPVOID arg, DWORD& exitCode) {
-    // kernel32.dll loads at the same base address in every process within
-    // a boot session. So we can resolve LoadLibraryW's address in *this* process and
-    // using it as the remote thread's start routine in the target process.
+    // kernel32.dll loads at the same base address in every process in a boot
+    // session, so `LoadLibraryW`'s address here is its address in the target.
     const auto loadLibraryAddr =
         reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
 
@@ -120,7 +113,7 @@ int DoInject(const std::wstring& processName, const std::wstring& dllPath) {
     std::wcout << L"found " << processName << L", pid=" << pid << L"\n";
 
 
-    // Check if the dll was already injected.
+    // Refuse if the DLL is already loaded.
     {
         const std::wstring moduleName = ModuleNameFromPath(dllPath);
         std::wstring existingPath;
@@ -144,7 +137,7 @@ int DoInject(const std::wstring& processName, const std::wstring& dllPath) {
         return 1;
     }
 
-    // Allocate memory inside the target process to store dll path
+    // Write the DLL path into the target's memory.
     const size_t pathBytes = (dllPath.size() + 1) * sizeof(wchar_t);
     const LPVOID remoteMem = VirtualAllocEx(process, nullptr, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (remoteMem == nullptr) {
@@ -160,7 +153,6 @@ int DoInject(const std::wstring& processName, const std::wstring& dllPath) {
         return 1;
     }
 
-    // Perform the injection
     DWORD exitCodeLow = 0;
     if (!RunRemoteThread(process, remoteMem, exitCodeLow)) {
         VirtualFreeEx(process, remoteMem, 0, MEM_RELEASE);
@@ -168,14 +160,10 @@ int DoInject(const std::wstring& processName, const std::wstring& dllPath) {
         return 1;
     }
 
-    // LoadLibraryW returns an HMODULE (64 bits on x64), but the remote thread's
-    // exit code is only a DWORD, so we only get the low 32 bits. We treat an
-    // all-zero result as failure.
-    //
-    // Note: Windows pages are 4KB-aligned, so the low 12 bits of a real module
-    // base are always 0; ASLR randomizes bits 12-31. If those also land all
-    // zero (roughly one-in-a-million), a successful load would misreport as
-    // failure here.
+    // `LoadLibraryW` returns a 64-bit HMODULE, but a thread exit code is a
+    // DWORD, so only the low 32 bits arrive; zero is treated as failure. Module
+    // bases are 64 KB aligned with ASLR in bits 16-31, so a successful load
+    // with those bits all zero (about 1 in 65536) would read as a failure.
     if (exitCodeLow == 0) {
         std::wcerr << L"injection likely failed (LoadLibraryW returned NULL in the target process)\n";
     } else {

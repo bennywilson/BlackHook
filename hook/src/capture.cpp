@@ -25,26 +25,23 @@ namespace mv
 namespace
 {
 
-// Frames per F8 burst: ~20s of gameplay at the ~120fps measured on Skyrunner
-// at 960x540.
+// Frames per F8 burst: about 20 s at the ~120 fps measured on Skyrunner at
+// 960x540.
 constexpr int kCaptureFrames = 2400;
 
-// Slots in flight. GPU trails CPU by a few frames, so copies aren't
-// immediately readable; round-robin and map only once the fence passes.
+// Slots in flight. The GPU trails the CPU by a few frames, so a slot is mapped
+// only once its fence has passed.
 constexpr int kSlots = 4;
 
-// A Recording slot waits for the Present sharing its frame index. If that
-// Present never comes (abandoned frame, resolution change, skipped Present),
-// reclaim it rather than stall capture forever.
+// A Recording slot waits for the Present with its frame index. If that Present
+// never comes (abandoned frame, resolution change), the slot is reclaimed.
 constexpr unsigned long long kSlotStaleAfterFrames = 8;
 
-// Cap on depth copies per frame ("last one wins"). UE5 normally transitions
-// depth out of DEPTH_WRITE 1-2x/frame; the cap bounds bandwidth if a title's
-// frame graph does something unexpected.
+// Cap on depth copies per frame. UE5 normally takes depth out of `DEPTH_WRITE`
+// once or twice a frame; the cap bounds bandwidth on a title that does more.
 constexpr int kMaxDepthCopiesPerFrame = 4;
 
-// Recording from the first copy (velocity or depth, whichever comes first)
-// until the Present that pairs it with the back buffer and submits.
+// Recording: from the frame's first copy until its Present submits it.
 enum class SlotState
 {
     Free,
@@ -52,8 +49,8 @@ enum class SlotState
     Submitted
 };
 
-// What capture needs per surface (kSurfaceNames order). trigger/arbitration/
-// file pattern are reported in manifest.json as-is.
+// Per surface, in `kSurfaceNames` order. `trigger`, `arbitration` and the file
+// pattern go into `manifest.json` as written.
 struct CaptureFacts
 {
     const char* filePrefix; // vel_00001.bin
@@ -72,15 +69,13 @@ constexpr CaptureFacts kCaptureFacts[kSurfaceCount] = {
 };
 
 // How well the fence covers a surface's copy.
-//   Strong         - the exact recorded command list was seen submitted to the
-//                    fenced queue.
-//   Weak           - list identity wasn't observable (e.g. under the debug
-//                    layer's wrapper), but the queue did submit after
-//                    recording. Consistent, not proven.
-//   None           - nothing submitted in between; readback is unsafe.
-//   ByConstruction - our own list, submitted by us right before the Signal
-//                    (colour): nothing to check, which is not the same claim
-//                    as Strong.
+//   Strong         The recorded command list was seen submitted to the fenced
+//                  queue.
+//   Weak           List identity was not observable (the debug layer wraps
+//                  lists), but the queue submitted after the copy was recorded.
+//   None           Nothing was submitted in between: the readback is unsafe.
+//   ByConstruction Our own list, submitted right before the Signal (colour).
+//                  Nothing to check, which is a different claim from Strong.
 enum class Coverage : uint8_t
 {
     None,
@@ -89,24 +84,22 @@ enum class Coverage : uint8_t
     ByConstruction
 };
 
-// One surface's per-slot capture state.
 struct SurfaceCapture
 {
     ComPtr<ID3D12Resource> readback;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
-    // Desc the footprints were derived from; compared every frame since
-    // footprints are only valid for the exact layout they came from.
+    // The desc the footprints were derived from; footprints are valid for that
+    // exact layout only.
     D3D12_RESOURCE_DESC desc{};
     UINT64 bytes = 0;
     UINT subresources = 0;
     int copies = 0;
     bool present = false;
-    // Identity of the command list this copy was recorded onto, used only as a
-    // key to check submission (never dereferenced; no ref held). Only
-    // velocity's is graded today (see NoteSubmission).
+    // The command list this copy was recorded on, as a key for `NoteSubmission`.
+    // Never dereferenced. Only velocity's is graded.
     IUnknown* recordedList = nullptr;
-    // Submission count on our queue at the moment the copy was recorded, for
-    // the ordering-based fallback when list identity is not observable.
+    // Submissions on our queue when the copy was recorded: the fallback check
+    // when list identity is not observable.
     uint64_t queueSubmissionsAtRecord = 0;
     Coverage coverage = Coverage::None;
 };
@@ -122,11 +115,9 @@ struct Slot
     SlotState state = SlotState::Free;
 };
 
-// Canonical COM identity: QueryInterface(IID_IUnknown) is the only pointer
-// guaranteed equal for the same object. Matters here because under the D3D12
-// debug layer, ResourceBarrier's command-list pointer and the one passed to
-// ExecuteCommandLists are different wrapper objects - raw pointer comparison
-// fails. Safe to call: the object is alive at both call sites.
+// `QueryInterface(IID_IUnknown)` is the only pointer COM guarantees equal for
+// one object. Under the debug layer, the command list seen by `ResourceBarrier`
+// and the one passed to `ExecuteCommandLists` are different wrappers.
 IUnknown* ComIdentity(IUnknown* object)
 {
     if (object == nullptr)
@@ -142,7 +133,6 @@ IUnknown* ComIdentity(IUnknown* object)
     return identity;
 }
 
-// Whether a cached footprint set still matches this resource's layout.
 bool SameLayout(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b)
 {
     return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
@@ -167,41 +157,38 @@ ComPtr<ID3D12CommandQueue> g_queue;
 ComPtr<ID3D12Fence> g_fence;
 UINT64 g_nextFenceValue = 1;
 
-// Fence-coverage tallies (see Coverage), summarised once per burst.
+// Fence coverage (see `Coverage`), summarised once per burst.
 std::atomic<uint64_t> g_coverageStrong{0};
 std::atomic<uint64_t> g_coverageWeak{0};
 std::atomic<uint64_t> g_coverageNone{0};
-// Colour's: no fence check was needed at all, so not counted as strong.
+// Colour needs no fence check, so it has its own count.
 std::atomic<uint64_t> g_coverageByConstruction{0};
 std::atomic<uint64_t> g_queueSubmissions{0};
 
 std::atomic<int> g_framesRemaining{0};
 
-// Hard cap on Presents a burst may span. g_framesRemaining alone counts
-// frames submitted, so a burst that never lands the requested count would
-// otherwise run forever with F8 dead for the rest of the session.
+// Most Presents a burst may span. Without it, a burst that never reaches its
+// frame count would run forever and keep F8 from arming another.
 constexpr int kBurstPresentBudget = kCaptureFrames * 8;
 std::atomic<int> g_burstPresentsLeft{0};
 
-// Armed by the hotkey; begins at the next Present, so the first captured
-// frame is one whose recording was watched from the start.
+// Set by F8; the burst starts at the next Present, so its first frame is
+// recorded from the start.
 std::atomic<bool> g_burstArmed{false};
 
-// Whether depth is required for THIS burst: frozen when it is armed, not
-// re-read every frame. Read live, a mid-burst depth reopen would stop requiring
-// depth the moment identification went null - a dump mixing frames with and
-// without depth that still passes its own completeness check. Frozen, the
-// burst ends instead (NotifySurfaceReopened).
+// Whether depth is required for this burst, frozen when it starts. Read live,
+// a depth reopen mid-burst would stop requiring depth and the dump would mix
+// frames with and without it. Frozen, the burst ends instead
+// (`NotifySurfaceReopened`).
 std::atomic<bool> g_depthRequiredForBurst{false};
 
-// Arms the burst for the next Present.
 void ArmBurst()
 {
     g_burstArmed.store(true, std::memory_order_relaxed);
 }
 
-// Why a burst's g_framesRemaining reached zero. Set by compare_exchange
-// against NotEnded, so whichever condition fires first is what's recorded.
+// Why `g_framesRemaining` reached zero. Set by compare_exchange against
+// `NotEnded`, so the first condition to fire is the one recorded.
 enum class BurstEndReason : uint8_t
 {
     NotEnded,
@@ -209,8 +196,8 @@ enum class BurstEndReason : uint8_t
     LayoutChanged,             // a surface's layout changed mid-dump
     VelocityPassSilent,        // the velocity pass stopped rendering
     PresentBudgetExhausted,    // kBurstPresentBudget Presents spent
-    // A surface required for this burst reopened mid-burst: ending beats
-    // writing frames captured against a different resource (or none).
+    // A surface this burst requires reopened. Later frames would come from a
+    // different resource, or none.
     SurfaceReopened,
 };
 std::atomic<BurstEndReason> g_burstEndReason{BurstEndReason::NotEnded};
@@ -224,9 +211,9 @@ int EndBurst(BurstEndReason reason)
     return g_framesRemaining.exchange(0, std::memory_order_relaxed);
 }
 
-// True once nothing from the current (or last) burst is in flight: no frames
-// left to record AND no slot waiting on a fence - the signal that the dump
-// directory is safe to seal. Caller must hold g_mutex.
+// True when nothing from the current or last burst is in flight: no frames
+// left to record and no slot waiting on a fence. Then the dump can be sealed.
+// Caller must hold `g_mutex`.
 bool DumpFullyDrained()
 {
     if (g_framesRemaining.load(std::memory_order_relaxed) > 0)
@@ -243,20 +230,20 @@ bool DumpFullyDrained()
     return true;
 }
 
-// Set when a burst is armed, cleared once the manifest for it is enqueued. Two
-// bursts into one MV_DUMP_DIR share it: the manifest describes the directory.
+// Set when a burst starts, cleared once its manifest is enqueued. Bursts into
+// one `MV_DUMP_DIR` share one manifest, which describes the whole directory.
 std::atomic<bool> g_manifestDirty{false};
 
-// Frames skipped because every ring slot was in flight. Diagnostic only -
-// distinguishes "ring busy as designed" from "ring wedged".
+// Frames skipped because every ring slot was in flight. Tells a busy ring
+// from a wedged one.
 std::atomic<uint64_t> g_noFreeSlot{0};
 std::atomic<unsigned long long> g_frameIndex{0};
 std::atomic<int> g_captureCounter{0};
 std::atomic<bool> g_metadataWritten{false};
 
-// F8 hotkey thread, joinable with a stop flag: a detached thread looping
-// forever crashes when FreeLibrary unmaps the module under it (never in a
-// game, which never unloads; testhost tears down on every run).
+// The F8 thread is joinable, with a stop flag. A detached thread crashes when
+// `FreeLibrary` unmaps the module under it: a game never unloads the hook, but
+// the testhost does on every run.
 std::atomic<bool> g_hotkeyStop{false};
 std::thread g_hotkeyThread;
 
@@ -269,16 +256,14 @@ std::atomic<uint64_t> g_incompleteFrames{0};
 // ---------------------------------------------------------------------------
 // One dump, one layout.
 //
-// manifest.json describes one layout per surface (layouts[0]), so a
-// resolution change mid-dump has nowhere to be recorded. Continuing would
-// write frames every offline tool un-pads at the wrong row pitch - a
-// plausible image, not an error (the same class of bug as decoding velocity
-// as linear). So a layout change ends the burst instead.
+// `manifest.json` has one layout per surface (`layouts[0]`). After a resolution
+// change, offline tools would un-pad later frames at the old row pitch and get
+// a wrong image without an error, so a layout change ends the burst.
 struct DumpLayout
 {
     D3D12_RESOURCE_DESC desc{};
     bool known = false;
-    // Snapshotted the first time this surface is established for the dump.
+    // Recorded the first time the surface is set up for this dump.
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
     UINT64 bytes = 0;
     UINT subresources = 0;
@@ -300,9 +285,9 @@ void SnapshotDumpLayout(int surface, const SurfaceCapture& capture)
     tracked.subresources = capture.subresources;
 }
 
-// Caller must hold g_mutex. Records the layout the first time a surface is
-// seen; afterwards returns false - having already ended the burst - if it has
-// changed. Not reset per burst: bursts into one directory share a manifest.
+// Caller must hold `g_mutex`. Records the layout the first time a surface is
+// seen; afterwards returns false, having ended the burst, if it changed. Not
+// reset per burst: bursts into one directory share a manifest.
 bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 {
     const char* name = kSurfaceNames[surface];
@@ -329,9 +314,9 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 }
 
 // ---------------------------------------------------------------------------
-// Background writer. Disk I/O never happens on the render thread - a
-// synchronous per-frame write there is a stall that can expose latent bugs in
-// the game (DEBUGGING.md). The render thread only copies out and hands off.
+// Background writer. Disk I/O stays off the render thread: a synchronous write
+// per frame is a stall, and stalls have exposed bugs in games (DEBUGGING.md).
+// The render thread only copies the bytes out and hands them over.
 // ---------------------------------------------------------------------------
 
 struct WriteJob
@@ -340,14 +325,12 @@ struct WriteJob
     std::vector<uint8_t> data;
     bool append = false;
     // Manifest only: `path` is a .tmp file, renamed over this after a full
-    // write (MoveFileExA: a reader sees the old file or the new one, never torn).
+    // write. `MoveFileExA` replaces atomically, so a reader never sees half.
     std::string renameTo;
 };
 
-// Backpressure cap. An unbounded queue never stalls the render thread but
-// risks an unbounded memory spike if disk can't keep up with capture rate.
-// Drop instead: a short capture is recoverable, OOM elsewhere isn't. Drops
-// are counted and logged so offline tools see why indices have gaps.
+// Backpressure cap. Past it, frames are dropped and counted: an unbounded queue
+// risks running the game out of memory when the disk falls behind.
 constexpr size_t kMaxQueuedBytes = 512ull * 1024 * 1024;
 
 std::mutex g_writeMutex;
@@ -360,13 +343,12 @@ std::thread g_writerThread;
 std::atomic<uint64_t> g_droppedWrites{0};
 std::atomic<uint64_t> g_failedWrites{0}; // writer thread: open/write errors (disk full)
 std::atomic<uint64_t> g_droppedFrames{0};
-// Frames that reached the write queue (g_captureCounter counts slots
-// submitted to the GPU). The manifest's burst.drained_frames.
+// Frames that reached the write queue (`g_captureCounter` counts slots
+// submitted to the GPU). Reported as `burst.drained_frames`.
 std::atomic<uint64_t> g_drainedFrames{0};
 
-// Resolved and created once: it is called per blob, on the render thread.
-// MV_DUMP_DIR overrides it, so testhost's synthetic frames never overwrite a
-// real capture.
+// Resolved and created once; it is called per blob on the render thread.
+// `MV_DUMP_DIR` keeps testhost runs out of real captures.
 const std::string& DumpDir()
 {
     static const std::string dir = []
@@ -388,9 +370,9 @@ const std::string& DumpDir()
     return dir;
 }
 
-// MV_CAPTURE_DEPTH=0 disables the depth copy for a session - a bandwidth
-// isolation test, not a feature. Read once: it is consulted on the hot path,
-// and a mid-session change would make frames unlike each other.
+// `MV_CAPTURE_DEPTH=0` turns the depth copy off for the session, to measure
+// its bandwidth cost. Read once: it is checked on the hot path, and changing
+// it mid-session would make frames unlike each other.
 bool DepthCaptureEnabled()
 {
     static const bool enabled = []
@@ -413,8 +395,8 @@ bool DepthCaptureEnabled()
     return enabled;
 }
 
-// Writes one job; false (logged, counted) if the file could not be opened or
-// fully written. A manifest is only renamed into place after a full write.
+// Writes one job. False, logged and counted, if the file could not be opened or
+// fully written. A manifest is renamed into place only after a full write.
 bool WriteJobToDisk(const WriteJob& job)
 {
     HANDLE file = CreateFileA(
@@ -476,8 +458,8 @@ void WriterThread()
         }
         WriteJobToDisk(job);
 
-        // Confirms everything handed over so far is actually on disk - this,
-        // not "burst recorded", is the signal it's safe to quit.
+        // This line, not "burst recorded", is the signal that it is safe to
+        // quit.
         std::lock_guard<std::mutex> lock(g_writeMutex);
         if (g_writeQueue.empty())
         {
@@ -489,16 +471,16 @@ void WriterThread()
     }
 }
 
-// Is there room for `bytes` more of queued output? Checked first so a frame is
-// dropped whole, never as a dump missing one surface for some frames.
+// Room for `bytes` more? Checked before mapping, so a frame is dropped whole
+// instead of losing one surface.
 bool WriteQueueHasRoom(size_t bytes)
 {
     std::lock_guard<std::mutex> lock(g_writeMutex);
     return g_queuedBytes + bytes <= kMaxQueuedBytes;
 }
 
-// Returns false if the job was dropped for backpressure. A manifest write
-// (`renameTo` non-empty) always goes through.
+// False if the job was dropped for backpressure. A manifest write (`renameTo`
+// set) always goes through.
 bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = false, std::string renameTo = {})
 {
     {
@@ -512,8 +494,8 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
             g_writerStarted = true;
             g_writerThread = std::thread(WriterThread);
         }
-        // Small bookkeeping writes (frames.csv, manifest) always go through -
-        // without them the frames that did land cannot be interpreted.
+        // frames.csv and the manifest always go through: without them the
+        // frames on disk cannot be read.
         if (renameTo.empty() && data.size() > 4096 && g_queuedBytes + data.size() > kMaxQueuedBytes)
         {
             const uint64_t n = g_droppedWrites.fetch_add(1) + 1;
@@ -528,9 +510,9 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
     return true;
 }
 
-// Enqueues all of one frame's blobs, plus its frames.csv line, under one hold
-// of g_writeMutex: all of them or none. Returns false if the frame was dropped
-// for backpressure (DrainSlot checks room first, so this should not happen).
+// Enqueues one frame's blobs and its frames.csv line under one hold of
+// `g_writeMutex`: all or none. False if dropped for backpressure, which
+// `DrainSlot`'s room check should already have prevented.
 bool EnqueueFrame(std::vector<WriteJob> jobs)
 {
     size_t total = 0;
@@ -567,9 +549,6 @@ bool EnqueueFrame(std::vector<WriteJob> jobs)
     return true;
 }
 
-// ---------------------------------------------------------------------------
-
-// Creates a READBACK-heap resource of the given size.
 bool CreateReadbackBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resource>& out)
 {
     D3D12_HEAP_PROPERTIES heapProps{};
@@ -590,9 +569,8 @@ bool CreateReadbackBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resou
     return SUCCEEDED(hr);
 }
 
-// Plane count for a format (depth/stencil = 2, most others = 1). Subresource
-// count is mips * arraySize * planeCount - getting this wrong silently
-// truncates the copy.
+// Plane count of a format: 2 for depth/stencil, 1 for most. Subresources are
+// mips * array size * planes; a wrong count truncates the copy.
 UINT PlaneCountFor(ID3D12Device* device, DXGI_FORMAT format)
 {
     D3D12_FEATURE_DATA_FORMAT_INFO info{};
@@ -613,11 +591,10 @@ UINT SubresourceCountFor(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
     return mips * slices * PlaneCountFor(device, desc.Format);
 }
 
-// Makes sure a surface has a readback buffer matching `desc`, rebuilding its
-// footprints if the layout changed or this is the slot's first use. Compared
-// every frame: resolution can change mid-session (dynamic resolution), and
-// stale footprints would corrupt the copy into plausible-looking garbage.
-// Returns false if the buffer could not be created. Caller must hold g_mutex.
+// Makes sure a surface has a readback buffer matching `desc`, rebuilding the
+// footprints when the layout changed. Checked every frame because resolution
+// can change mid-session, and stale footprints corrupt the copy. False if the
+// buffer could not be created. Caller must hold `g_mutex`.
 bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_DESC& desc)
 {
     if (capture.readback != nullptr && SameLayout(capture.desc, desc))
@@ -649,14 +626,10 @@ bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_D
     return true;
 }
 
-// Copies every subresource of a texture into a READBACK buffer, bracketed by
-// barriers that restore the resource's original state afterward.
-//
-// Footprints are laid out back-to-back in subresource order (as
-// GetCopyableFootprints described them) so offline tools can address any
-// subresource from one file. Derived from the desc rather than assumed, so
-// mipped/arrayed/planar resources (e.g. depth/stencil) are handled correctly
-// rather than truncated to their first plane.
+// Copies every subresource of `source` into a READBACK buffer, between
+// barriers that restore its state. Subresources go back to back in the order
+// `GetCopyableFootprints` gives, so depth's stencil plane and any mips land in
+// the same file.
 void RecordCopyToReadback(
     ID3D12GraphicsCommandList* cmdList,
     ID3D12Resource* source,
@@ -670,8 +643,7 @@ void RecordCopyToReadback(
         return;
     }
 
-    // ALL_SUBRESOURCES transitions every subresource in one barrier - cheaper,
-    // and correct for multi-plane resources that would otherwise need one each.
+    // `ALL_SUBRESOURCES` covers every plane in one barrier.
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
@@ -696,16 +668,14 @@ void RecordCopyToReadback(
         cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
 
-    // Restore - leaving COPY_SOURCE would desync the game's own barrier
-    // bookkeeping and trip the debug layer / corrupt rendering.
+    // Restore the game's state, or its own barrier tracking goes out of step.
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.StateAfter = stateBefore;
     barrierFn(cmdList, 1, &barrier);
 }
 
-// MV_ENGINE_VERSION=<major>.<minor>, for the manifest's "engine" block. Unset
-// stays unset rather than guessed: 5.7 packs velocity channel 3 differently
-// from 5.2, so a wrong guess mis-decodes silently.
+// `MV_ENGINE_VERSION=<major>.<minor>`, for the manifest's "engine" block. Never
+// guessed: 5.7 packs velocity channel 3 differently from 5.2.
 bool ParseEngineVersion(int* major, int* minor)
 {
     char version[32]{};
@@ -727,8 +697,8 @@ bool ParseEngineVersion(int* major, int* minor)
     return true;
 }
 
-// Truncates frames.csv to its header, so a new session never appends onto a
-// previous one's capture indices.
+// Truncates frames.csv to its header, so a new session never appends to an
+// old one.
 void TruncateFramesCsv()
 {
     const std::string header = "# captureIndex,gameFrameIndex\n";
@@ -736,9 +706,9 @@ void TruncateFramesCsv()
 }
 
 // ---------------------------------------------------------------------------
-// manifest.json (schema in docs/REFACTOR_PLAN.md sec 4.1). Depth's layout lists
-// both planes: D24S8/D32S8 keep depth in plane 0 and stencil in plane 1, with
-// different formats and row pitches.
+// manifest.json (schema: docs/REFACTOR_PLAN.md sec 4.1). Depth's layout lists
+// both planes: D24S8 and D32S8 keep depth in plane 0 and stencil in plane 1,
+// with different formats and row pitches.
 
 std::string JsonEscape(const std::string& s)
 {
@@ -784,8 +754,7 @@ std::string JsonString(const std::string& s)
     return "\"" + JsonEscape(s) + "\"";
 }
 
-// One plane's footprint, as a manifest object literal. Depth is two planes
-// (depth + stencil); velocity and colour are one.
+// One plane's footprint as a manifest object.
 std::string PlaneJson(int index, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f, int indent)
 {
     const std::string pad(indent, ' ');
@@ -841,8 +810,7 @@ std::string UtcNowIso8601()
 // When the first burst into this dump directory started.
 std::string g_dumpStartedUtc;
 
-// Assembles manifest.json's full content. Caller must hold g_mutex (reads
-// g_dumpLayout, g_burstEndReason, and friends without their own locking).
+// Builds `manifest.json`. Caller must hold `g_mutex`.
 std::string BuildManifest()
 {
     std::string j;
@@ -857,8 +825,8 @@ std::string BuildManifest()
     j += "    \"process\": " + JsonString(process) + ",\n";
     j += "    \"started_utc\": " + JsonString(g_dumpStartedUtc) + ",\n";
     j += "    \"sealed_utc\": " + JsonString(sealedUtc) + ",\n";
-    // "embedded" means the DLL's own profiles/ue5.json, which producer.commit
-    // pins; anything else is an MV_PROFILE_FILE path, which it does not.
+    // "embedded" means the DLL's own `profiles/ue5.json`, pinned by
+    // `producer.commit`; anything else is an `MV_PROFILE_FILE` path.
     if (const SurfaceProfile* profile = ActiveSurfaceProfile())
     {
         j += "    \"profile\": " + JsonString(profile->name) + ",\n";
@@ -918,7 +886,7 @@ std::string BuildManifest()
         }
         if (!layout.known && i >= kFirstOptionalSurface)
         {
-            // So a consumer can tell "off" from "on but never found".
+            // Tells "off" from "on but never found".
             const std::string name = kSurfaceNames[i];
             const SurfaceProfile* profile = ActiveSurfaceProfile();
             const SurfaceSpec* spec = profile != nullptr ? profile->Optional(name.c_str()) : nullptr;
@@ -948,8 +916,8 @@ std::string BuildManifest()
         j += std::string("      \"file_pattern\": ") + JsonString(std::string(facts.filePrefix) + "_%05d.bin");
         if (i >= kFirstOptionalSurface)
         {
-            // No optional surface's encoding is verified against engine
-            // source; "unknown" is what makes mvtools.py refuse to decode it.
+            // No optional surface's encoding is verified; "unknown" makes
+            // `mvtools.py` refuse to decode it.
             j += ",\n      \"encoding\": { \"kind\": \"unknown\" }";
         }
         if (i == kSurfaceVelocity)
@@ -966,8 +934,8 @@ std::string BuildManifest()
         }
         else
         {
-            // Rides the game's list like velocity's, but its fence coverage is
-            // not graded - say so rather than report zeros.
+            // Rides the game's list like velocity's, but its coverage is
+            // not graded.
             j += ",\n      \"coverage_note\": \"not evaluated - see docs/REFACTOR_PLAN.md finding 1.2\"\n";
         }
         j += std::string("    }") + (i + 1 < kSurfaceCount ? ",\n" : "\n");
@@ -1028,8 +996,8 @@ std::string BuildManifest()
     return j;
 }
 
-// Enqueues the manifest as the LAST job after every blob it names: the writer
-// is FIFO, so every blob is on disk before the manifest appears.
+// Enqueues the manifest after every blob it names. The writer is FIFO, so the
+// blobs are on disk before the manifest appears.
 void WriteManifestNow()
 {
     const std::string json = BuildManifest();
@@ -1040,7 +1008,6 @@ void WriteManifestNow()
         /*renameTo=*/DumpDir() + "manifest.json");
 }
 
-// Maps one finished readback buffer out to a vector.
 bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
 {
     if (buffer == nullptr || bytes == 0)
@@ -1059,12 +1026,12 @@ bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
     return true;
 }
 
-// Maps a finished slot's readback buffers and hands their bytes to the writer,
-// all of the frame or none of it.
+// Maps a finished slot's readback buffers and hands the bytes to the writer:
+// the whole frame or none of it.
 bool DrainSlot(Slot& slot)
 {
-    // Room is checked BEFORE any Map(): the sizes are known from the
-    // footprints, so a dropped frame costs no copy out of GPU memory.
+    // Room is checked before any `Map()`, from the footprint sizes, so a
+    // dropped frame costs no copy out of GPU memory.
     size_t total = 0;
     for (int i = 0; i < kSurfaceCount; ++i)
     {
@@ -1084,8 +1051,8 @@ bool DrainSlot(Slot& slot)
         return false;
     }
 
-    // Velocity and the back buffer are what every downstream tool keys off, so
-    // a slot without both is not a capture.
+    // Every tool keys off velocity and the back buffer; a slot without both is
+    // not a capture.
     std::vector<uint8_t> data[kSurfaceCount];
     bool mapped[kSurfaceCount] = {};
     if (!MapOut(
@@ -1125,8 +1092,8 @@ bool DrainSlot(Slot& slot)
         haveColor = haveColor || i == kSurfaceColor;
     }
 
-    // Which GAME frame this capture is: capture indices only count what was
-    // drained, and warp validation needs N-1/N to be one frame apart.
+    // The game frame this capture came from. Capture indices only count what
+    // was drained; warp validation needs consecutive frames.
     if (haveVelocity && haveColor)
     {
         char line[64]{};
@@ -1157,8 +1124,8 @@ void NoteCommandQueue(ID3D12CommandQueue* queue)
     {
         return;
     }
-    // Only the DIRECT queue is useful: the back-buffer copy must land on the
-    // queue the game renders with, so one fence covers both it and velocity.
+    // Direct queue only: the back-buffer copy must go to the queue the game
+    // renders on, so one fence covers it and the velocity copy.
     const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
     if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
@@ -1192,7 +1159,7 @@ void StartCaptureHotkeyThread()
     g_hotkeyThread = std::thread(
         []
         {
-            // MV_AUTOCAPTURE: for mv_testhost, which has no one to press F8.
+            // `MV_AUTOCAPTURE`: for mv_testhost, which cannot press F8.
             if (GetEnvironmentVariableA("MV_AUTOCAPTURE", nullptr, 0) != 0)
             {
                 Sleep(1000);
@@ -1219,7 +1186,7 @@ void StartCaptureHotkeyThread()
 namespace
 {
 
-// Caller must hold g_mutex.
+// Caller must hold `g_mutex`.
 bool EnsureDevice(ID3D12GraphicsCommandList* cmdList)
 {
     if (g_device != nullptr)
@@ -1239,9 +1206,8 @@ bool EnsureDevice(ID3D12GraphicsCommandList* cmdList)
     return true;
 }
 
-// The slot this frame's copies go into: the one already recording this
-// frame, or a free one - whichever surface arrives first allocates. Caller must
-// hold g_mutex.
+// The slot this frame's copies go into: the one already recording this frame,
+// or a free one. Caller must hold `g_mutex`.
 Slot* AcquireSlotForFrame(unsigned long long frame)
 {
     for (Slot& candidate : g_slots)
@@ -1257,8 +1223,8 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
         {
             candidate.frameIndex = frame;
             candidate.state = SlotState::Recording;
-            // The readback buffers survive - reusing them is the point of the
-            // ring; EnsureReadback revalidates the layout before each copy.
+            // The readback buffers are kept for reuse; `EnsureReadback`
+            // revalidates the layout before each copy.
             for (SurfaceCapture& surface : candidate.surfaces)
             {
                 surface.present = false;
@@ -1273,8 +1239,8 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
     return nullptr;
 }
 
-// All slots in flight: the frame is skipped rather than stalled. Logged, since
-// it is otherwise indistinguishable from a wedged ring. Caller holds g_mutex.
+// Every slot is in flight: the frame is skipped, not waited for. Logged, or a
+// wedged ring would look the same. Caller must hold `g_mutex`.
 void LogNoFreeSlot()
 {
     const uint64_t misses = g_noFreeSlot.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1335,14 +1301,14 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
     }
     SurfaceCapture& capture = slot->surfaces[surface];
 
-    // Which of a frame's edges lands (kCaptureFacts arbitration).
+    // Which of a frame's edges lands (the `arbitration` in `kCaptureFacts`).
     if (surface == kSurfaceDepth)
     {
-        // last_before_surface: depth goes readable several times a frame and the
-        // first edge can be a partial pass (on Skyrunner, the weapon alone), so
-        // keep re-copying until velocity has been copied - the depth the frame's
-        // velocity was rendered against. A title whose depth goes readable only
-        // AFTER velocity still gets its first edge (copies == 0).
+        // last_before_surface: depth goes readable several times a frame, and
+        // the first edge can be a partial pass (on Skyrunner, the weapon only),
+        // so it is copied again on each edge until velocity has been copied. A
+        // title whose depth goes readable only after velocity still gets its
+        // first edge.
         const bool velocityDone = slot->surfaces[kSurfaceVelocity].present;
         if (capture.copies >= kMaxDepthCopiesPerFrame || (velocityDone && capture.copies > 0))
         {
@@ -1378,8 +1344,8 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
     RecordCopyToReadback(cmdList, resource, capture.readback.Get(), capture.footprints,
                          static_cast<D3D12_RESOURCE_STATES>(stateAfter), g_originalResourceBarrier);
 
-    // Recorded on the GAME's list: whether our fence covers it is checked in
-    // NoteSubmission, by COM identity (see ComIdentity), not assumed.
+    // Recorded on the game's list. `NoteSubmission` checks that the fence
+    // covers it.
     capture.recordedList = ComIdentity(cmdList);
     capture.coverage = Coverage::None;
     capture.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
@@ -1408,7 +1374,7 @@ int SurfaceIndex(const char* name)
 
 void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
 {
-    // Runs for every submission: nothing to check outside a burst.
+    // Runs for every submission; nothing to check outside a burst.
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || commandLists == nullptr)
     {
         return;
@@ -1424,8 +1390,8 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
         {
             continue;
         }
-        // Velocity only: depth's and the GBuffers' copies also ride the
-        // game's list and are not graded yet.
+        // Velocity only: the depth and GBuffer copies also ride the game's
+        // list but are not graded.
         SurfaceCapture& surface = slot.surfaces[kSurfaceVelocity];
         if (surface.recordedList == nullptr)
         {
@@ -1443,8 +1409,8 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
             }
             else
             {
-                // Correctness rests on one fence covering our copy and the
-                // velocity copy, so a second DIRECT queue would read stale.
+                // One fence must cover our copy and the velocity copy, so a
+                // second direct queue would give stale readbacks.
                 Log("capture: WARNING velocity command list submitted on a queue other than the "
                     "one we fence on - readback for frame " +
                     std::to_string(slot.frameIndex) + " is NOT covered by our fence");
@@ -1465,8 +1431,8 @@ void NotifySurfaceReopened(const char* surfaceName)
         return; // ended between the check above and taking the lock
     }
     const std::string name = surfaceName != nullptr ? surfaceName : "";
-    // Velocity is always required; depth's requirement is frozen per burst
-    // (g_depthRequiredForBurst).
+    // Velocity is always required; depth as frozen for this burst
+    // (`g_depthRequiredForBurst`).
     const bool required = name == "velocity" || (name == "depth" && g_depthRequiredForBurst.load(std::memory_order_relaxed));
     if (!required)
     {
@@ -1482,14 +1448,14 @@ void NotifySurfaceReopened(const char* surfaceName)
 }
 
 // ---------------------------------------------------------------------------
-// MV_SNAPSHOT=<surface>: copies ONE frame of each resource that surface has
+// `MV_SNAPSHOT=<surface>`: copies one frame of each resource that surface has
 // shortlisted at the scene extent, at its own RT -> SRV edge, to
-// snapshot_<surface>_<ptr>_<w>x<h>_fmt<f>_pitch<p>.bin in the dump directory -
-// for telling candidates apart by their pixels when every barrier signal ties
-// them (how GBufferB was found among seven B8G8R8A8_TYPELESS targets). Changes
-// no selection. The copy rides the game's list; the fence is signalled on the
-// game's queue at a LATER Present, after that list was submitted. Guarded by
-// g_mutex.
+// `snapshot_<surface>_<ptr>_<w>x<h>_fmt<f>_pitch<p>.bin` in the dump directory.
+// For telling candidates apart by their pixels when every barrier signal ties
+// them; this is how GBufferB was found among seven B8G8R8A8_TYPELESS targets.
+// Changes no selection. The copy rides the game's list, and the fence is
+// signalled at a later Present, after that list was submitted. Guarded by
+// `g_mutex`.
 // ---------------------------------------------------------------------------
 namespace
 {
@@ -1520,7 +1486,7 @@ const std::string& SnapshotSurface()
     return surface;
 }
 
-// Caller must hold g_mutex.
+// Caller must hold `g_mutex`.
 void ProcessSnapshots()
 {
     if (g_snapshots.empty() || g_queue == nullptr || g_fence == nullptr)
@@ -1613,8 +1579,8 @@ void OnPresent(IDXGISwapChain* swapChain)
 
     ProcessSnapshots(); // diagnostic; nothing to do unless MV_SNAPSHOT recorded copies
 
-    // An armed burst begins here, at a frame boundary, so the first captured
-    // frame is one whose recording was watched from the start.
+    // A burst starts at a frame boundary, so its first frame is recorded from
+    // the start.
     if (g_burstArmed.exchange(false, std::memory_order_relaxed))
     {
         g_framesRemaining.store(kCaptureFrames);
@@ -1630,9 +1596,8 @@ void OnPresent(IDXGISwapChain* swapChain)
         }
     }
 
-    // End the burst if the game has stopped rendering the velocity pass -
-    // otherwise a run that ends right after F8 spends its whole Present
-    // budget silently waiting for frames that will never come.
+    // End the burst if the game stopped rendering the velocity pass (a menu),
+    // instead of waiting out the whole Present budget.
     {
         const unsigned long long presented = g_frameIndex.load(std::memory_order_relaxed);
         uint64_t silentFor = 0;
@@ -1650,8 +1615,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         }
     }
 
-    // Spend one of the burst's Presents, whatever this frame turns out to
-    // produce, and end the burst if it has run out of them.
+    // Every Present counts against the burst's budget.
     if (g_framesRemaining.load(std::memory_order_relaxed) > 0 &&
         g_burstPresentsLeft.fetch_sub(1, std::memory_order_relaxed) <= 1)
     {
@@ -1677,8 +1641,8 @@ void OnPresent(IDXGISwapChain* swapChain)
         }
     }
 
-    // 1b. Seal the dump directory once nothing from this (or an earlier,
-    // still-draining) burst is in flight - which the drain above can make true.
+    // 1b. Seal the dump directory once nothing from this or an earlier burst
+    // is in flight, which the drain above can make true.
     if (g_manifestDirty.load(std::memory_order_relaxed) && DumpFullyDrained())
     {
         static const char* const kReasonNames[] = {
@@ -1692,9 +1656,9 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_manifestDirty.store(false, std::memory_order_relaxed);
     }
 
-    // 2. Reclaim slots whose Present never arrived (abandoned frame,
-    // resolution change, failed QueryInterface below). Four stranded slots
-    // and capture stops silently and permanently.
+    // 2. Reclaim slots whose Present never came (abandoned frame, resolution
+    // change, failed `QueryInterface` below). Four stranded slots would stop
+    // capture for good.
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     for (Slot& candidate : g_slots)
     {
@@ -1729,9 +1693,8 @@ void OnPresent(IDXGISwapChain* swapChain)
     }
     if (!slot->surfaces[kSurfaceVelocity].present)
     {
-        // Depth (or nothing) arrived but velocity did not. Every downstream
-        // tool keys off velocity, so a frame without it isn't a capture -
-        // release the slot rather than emit a half-frame.
+        // Depth arrived but velocity did not. Every tool keys off velocity, so
+        // nothing is written for this frame.
         const uint64_t n = g_framesWithoutVelocity.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 3 || n % 60 == 0)
         {
@@ -1742,9 +1705,9 @@ void OnPresent(IDXGISwapChain* swapChain)
         return;
     }
     // Every captured frame carries every surface this burst requires. Partial
-    // frames cluster at burst edges (F8 lands after depth's edges but before
-    // velocity's) and are dropped: inconsistent frames make every offline tool
-    // special-case them. A title that never identifies depth still captures.
+    // frames happen at burst edges (F8 lands after depth's edges but before
+    // velocity's) and are dropped. A title that never identifies depth still
+    // captures.
     const char* missing = nullptr;
     if (!slot->surfaces[kSurfaceDepth].present && g_depthRequiredForBurst.load(std::memory_order_relaxed))
     {
@@ -1770,23 +1733,19 @@ void OnPresent(IDXGISwapChain* swapChain)
     }
     ComPtr<ID3D12Resource> backBuffer;
     const UINT backBufferIndex = swapChain3->GetCurrentBackBufferIndex();
-    // GetBuffer AddRefs (unlike view-creation calls), so holding this pointer
-    // is safe.
+    // `GetBuffer` adds a reference, so holding the pointer is safe.
     if (FAILED(swapChain3->GetBuffer(backBufferIndex, IID_PPV_ARGS(&backBuffer))) || backBuffer == nullptr)
     {
         return;
     }
-    // (Known-source exclusion is fed every Present by d3d12_hook.cpp.)
 
-    // Same every-frame revalidation as velocity: a resize or fullscreen
-    // transition recreates swapchain buffers at a new size, and stale
-    // footprints would corrupt silently.
+    // Revalidated every frame like the others: a resize or fullscreen switch
+    // recreates the swapchain buffers.
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
     if (!DumpLayoutAccepts(kSurfaceColor, desc))
     {
-        // The slot stays Recording and is reclaimed by the stale-slot sweep
-        // above on a later Present. Nothing is written for this frame, which is
-        // the point - it would be the first frame at the new layout.
+        // The slot stays Recording and is reclaimed by the stale-slot sweep.
+        // This would have been the first frame at the new layout.
         return;
     }
     SurfaceCapture& color = slot->surfaces[kSurfaceColor];
@@ -1805,7 +1764,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     }
 
     // The fence below covers the velocity copy only if the game has already
-    // submitted the list it was recorded onto - checked, not assumed.
+    // submitted the list it is on (see `NoteSubmission`).
     if (slot->surfaces[kSurfaceVelocity].coverage == Coverage::Strong)
     {
         g_coverageStrong.fetch_add(1, std::memory_order_relaxed);
@@ -1844,8 +1803,8 @@ void OnPresent(IDXGISwapChain* swapChain)
         return;
     }
 
-    // The back buffer is in PRESENT state here (== COMMON), since the game has
-    // finished with it and is about to present.
+    // The game is done with the back buffer and about to present: it is in
+    // `PRESENT` (== `COMMON`).
     RecordCopyToReadback(
         slot->commandList.Get(),
         backBuffer.Get(),
@@ -1853,7 +1812,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         color.footprints,
         D3D12_RESOURCE_STATE_PRESENT,
         g_originalResourceBarrier);
-    // Our list, our submit, immediately before the Signal below: nothing to check.
+    // Our list, submitted right before the Signal below: nothing to check.
     color.coverage = Coverage::ByConstruction;
     g_coverageByConstruction.fetch_add(1, std::memory_order_relaxed);
     ++color.copies;
@@ -1879,13 +1838,12 @@ void OnPresent(IDXGISwapChain* swapChain)
     const int remaining = g_framesRemaining.fetch_sub(1) - 1;
     if (remaining <= 0)
     {
-        // No-op if an early-end site already recorded a reason.
+        // No-op if an early end already recorded a reason.
         BurstEndReason expectedReason = BurstEndReason::NotEnded;
         g_burstEndReason.compare_exchange_strong(
             expectedReason, BurstEndReason::Completed, std::memory_order_relaxed);
-        // "Recorded" is the honest word: last frames may still be in flight
-        // on the GPU, and drained frames are only queued for the writer, not
-        // necessarily on disk yet. Only ShutdownCapture guarantees that.
+        // "Recorded": the last frames may still be on the GPU or in the write
+        // queue.
         Log("capture: burst recorded, " + std::to_string(g_captureCounter.load()) + " frames; writes still draining (" +
             std::to_string(g_droppedWrites.load()) + " dropped)");
         Log("capture: fence coverage - " + std::to_string(g_coverageStrong.load()) +
@@ -1904,24 +1862,23 @@ void StopCaptureHotkeyThread(bool processExiting)
     }
     if (processExiting)
     {
-        // Detach: by DLL_PROCESS_DETACH Windows has already terminated every
-        // other thread, and destroying a joinable std::thread calls terminate().
+        // Detach: at `DLL_PROCESS_DETACH` Windows has already ended every
+        // other thread, and destroying a joinable `std::thread` terminates.
         g_hotkeyThread.detach();
     }
     else
     {
-        // The loop's longest wait is a 30ms Sleep, so this returns promptly,
-        // and neither GetAsyncKeyState nor Sleep needs the loader lock that may
-        // be held while this runs.
+        // Returns within one 30 ms `Sleep`, and nothing in the loop needs the
+        // loader lock that may be held here.
         g_hotkeyThread.join();
     }
 }
 
 void ShutdownCapture(bool processExiting)
 {
-    // A live flush (MvFlushCapture) drains the queue and joins. At process exit
-    // the writer is already gone. Either way, the writer's "write queue drained"
-    // line - not "burst recorded" - is what says it is safe to quit.
+    // A live flush (`MvFlushCapture`) drains the queue and joins. At process
+    // exit the writer is already gone. Either way, the writer's "write queue
+    // drained" line is the signal that it is safe to quit.
     StopCaptureHotkeyThread(processExiting);
 
     std::thread writer;

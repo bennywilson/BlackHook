@@ -1,52 +1,21 @@
-// Synthetic WPO-encode round-trip test (NEXT_PROMPT.md item 3).
+// Synthetic velocity-encode round trip, for `tools/wpo_synthetic_test.py`.
 //
-// WHY THIS EXISTS
+// The encode does not depend on where a pixel's motion came from:
+// `EncodeVelocityToTexture()` (Common.ush) packs a clip-space delta the same way
+// for camera motion, skinning or world-position offset (WPO, e.g. wind-animated
+// foliage). So the decode can be tested on WPO-like values without simulating
+// WPO geometry: known velocities go through the real encode and the GPU's
+// UNORM16 quantization, and `mvtools.py` decodes them unmodified.
 //
-// The analytical reprojection (tools/reproject.py) validates decode
-// correctness only on STATIC geometry, by construction: it selects pixels
-// whose depth-motion matches pure camera motion, which is exactly how it
-// excludes wind-animated foliage (world-position-offset geometry) from the
-// test. That leaves two failure modes conflated on WPO pixels - "the decode
-// is wrong there" vs. "the analytical reference simply cannot predict WPO
-// motion, which is expected" - with nothing in the repo separating them.
+// A full-screen triangle's pixel shader computes a known (Vx, Vy, Vz) per pixel,
+// swept to |V| = 2.0, just inside the encoding's 2.008 ceiling, so it spans the
+// nonlinear range without saturating. It is encoded with
+// `EncodeVelocityToTexture()` and `VELOCITY_ENCODE_DEPTH` as Common.ush has
+// them, rendered to an R16G16B16A16_UNORM target, and written as
+// `wpo_vel_00000.bin` with a `meta.txt` giving its layout.
 //
-// WHAT THIS DOES, AND WHY THAT IS ENOUGH
-//
-// The buffer's encode/decode format has no idea where a pixel's motion came
-// from. EncodeVelocityToTexture() (Common.ush:2060) takes a clip-space delta
-// and packs it; it does not care whether that delta was produced by camera
-// motion, a skinned mesh, or a WPO-animated tree. So decode correctness is
-// source-agnostic, and a full re-implementation of Calculate3DVelocityBase's
-// camera-projection math (which reproject.py already has, and already
-// validates independently on static geometry) is not needed to test it.
-// What IS needed is: known clip-space velocities, run through the REAL
-// encode - same macros, same GPU hardware UNORM16 quantization SceneVelocity
-// itself goes through - then decoded by the unmodified, already-shipping
-// mvtools.py and checked against the known input.
-//
-// This renders a full-screen triangle whose pixel shader computes a
-// deterministic (px, py) -> (Vx, Vy, Vz) grid - decorrelated from anything a
-// camera-only prediction would produce at that screen position, and swept to
-// |V| = 2.0, just inside the buffer's own documented 2.008 clip-unit ceiling
-// (DEBUGGING.md, "A moderate-speed capture, and the extreme-speed degradation
-// resolved") - so the sweep spans the encoding's nonlinear range without
-// reaching saturation, which this test does not cover -
-// encodes it via EncodeVelocityToTexture()/VELOCITY_ENCODE_DEPTH transcribed
-// exactly as Common.ush has them (mirroring mvtools.py's own transcription),
-// and writes the result to a real R16G16B16A16_UNORM render target. The
-// bytes are dumped in the same meta.txt/vel_NNNNN.bin shape a real capture
-// uses, so tools/wpo_synthetic_test.py can run mvtools.decode_velocity_clip()
-// and decode_velocity_depth() - unmodified - against it and compare the
-// decoded values to the independently-known true grid.
-//
-// SCOPE NOTE: this is a round-trip test of the encode/decode format on a
-// value population representative of WPO pixels, not a simulation of WPO
-// vertex geometry moving through a real velocity pass. Building the latter
-// (a vertex shader that displaces a mesh by a time-varying WPO function,
-// differences two frames' projected clip positions, and lets THAT drive the
-// encode) was judged out of scope for this phase - see NEXT_PROMPT.md and
-// DEBUGGING.md for why the narrower test already answers the question that
-// was actually open.
+// This tests the encode/decode format on WPO-like values. It does not render
+// WPO geometry through a real velocity pass.
 
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -62,26 +31,21 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// Grid size. Deliberately unrelated to the velocity buffer's own resolution -
-// this is a test pattern, not a rendered scene, and keeping it small keeps the
-// readback and the offline comparison fast. 256 columns give the X sweep a
-// reasonable number of distinct encoded values to cross without making the
-// dump large.
+// Grid size: a small test pattern, unrelated to any title's resolution. 256
+// columns give the X sweep enough distinct encoded values.
 constexpr UINT kWidth = 256;
 constexpr UINT kHeight = 64;
 constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R16G16B16A16_UNORM;
 
-// Must match tools/wpo_synthetic_test.py's VX_RANGE/VY_RANGE/VZ_RANGE exactly
-// - the offline tool regenerates this same grid independently to know what
-// SHOULD have been encoded, and the two sides have to agree on the formula
-// for the comparison to mean anything. Nothing enforces that agreement
-// automatically; changing a range here means changing it there too.
+// Must match `VX_RANGE`/`VY_RANGE`/`VZ_RANGE` in `tools/wpo_synthetic_test.py`,
+// which regenerates the grid to know what was encoded. Nothing checks that they
+// agree.
 const char* kShaderSource = R"HLSL(
 struct VSOut { float4 pos : SV_POSITION; };
 
 VSOut VSMain(uint id : SV_VertexID)
 {
-    // Fullscreen triangle - no vertex buffer needed.
+    // Fullscreen triangle; no vertex buffer.
     VSOut o;
     float2 uv = float2((id << 1) & 2, id & 2);
     o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
@@ -92,29 +56,23 @@ float4 PSMain(float4 pos : SV_POSITION) : SV_Target
 {
     float2 uv = (pos.xy - 0.5) / float2(WIDTH, HEIGHT);
 
-    // The known "true" clip-space velocity this pixel is asked to encode.
-    // Swept across [-2, 2] in both axes, which covers most of the encoding's
-    // usable range without reaching its edge: the buffer's ceiling is |V| =
-    // 2.008 (the V that encodes to exactly 1.0), and the largest magnitude
-    // here is 2.0. Encoded values therefore land in roughly [0.001, 0.997]
-    // and NOTHING in this grid saturates - the clamp behaviour at the ceiling
-    // is deliberately not what this test covers. What it does cover is the
-    // full nonlinear span of the sqrt encoding, where one UNORM16 step means
-    // very different things at the two ends.
+    // The clip-space velocity this pixel encodes, swept over [-2, 2] on both
+    // axes. The encoding's ceiling is |V| = 2.008 (encodes to 1.0), so nothing
+    // here saturates; the sweep covers the sqrt encoding's nonlinear span,
+    // where one UNORM16 step means very different things at the two ends.
     float2 V;
     V.x = lerp(-2.0, 2.0, uv.x);
     V.y = lerp(-2.0, 2.0, uv.y);
-    // DeviceZ deltas are ~1e-6 magnitude on a real capture (see mvtools.py) -
-    // swept over the same order of magnitude here.
+    // DeviceZ deltas are ~1e-6 on a real capture; swept over the same size.
     float Vz = lerp(-1e-5, 1e-5, uv.x * uv.y);
 
-    // EncodeVelocityToTexture(), Common.ush:2060 - transcribed exactly.
+    // `EncodeVelocityToTexture()`, Common.ush.
     float2 Vg = sign(V) * sqrt(abs(V)) * (2.0 / sqrt(2.0));
     float2 EncodedXY = Vg * (0.499f * 0.5f) + 32767.0f / 65535.0f;
 
-    // VELOCITY_ENCODE_DEPTH, Common.ush:2071. UE 5.7.1 steals channel 3's
-    // bottom bit for bHasPixelAnimation (VELOCITY_Z_LOW_MASK = 0xFFFE) - the
-    // same convention mvtools.py's depth_encoding() expects for (5, 7).
+    // `VELOCITY_ENCODE_DEPTH`, Common.ush. UE 5.7 uses channel 3's bottom bit
+    // for `bHasPixelAnimation` (`VELOCITY_Z_LOW_MASK` = 0xFFFE), as
+    // `mvtools.depth_encoding()` expects for 5.7.
     uint zbits = asuint(Vz);
     uint hi = (zbits >> 16) & 0xFFFFu;
     uint animBit = (uint(pos.x) ^ uint(pos.y)) & 1u;
@@ -143,8 +101,8 @@ bool WriteFileBytes(const std::string& path, const void* data, size_t bytes) {
 
 } // namespace
 
-// Self-contained: its own device, no window or swapchain (an offscreen
-// render target needs neither). Returns 0 on success.
+// Self-contained: its own device, no window or swapchain. Returns 0 on
+// success.
 int RunWpoEncodeTest(const std::string& outputDir) {
     printf("[wpo-encode-test] %ux%u synthetic velocity grid -> %s\n", kWidth, kHeight, outputDir.c_str());
 
@@ -153,8 +111,8 @@ int RunWpoEncodeTest(const std::string& outputDir) {
         debug->EnableDebugLayer();
     }
 
-    // No DXGI factory needed: D3D12CreateDevice(nullptr, ...) below takes the
-    // default adapter directly, and this test has no swapchain to create.
+    // `D3D12CreateDevice(nullptr, ...)` takes the default adapter; there is no
+    // swapchain, so no DXGI factory.
     ComPtr<ID3D12Device> device;
     if (!Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice")) {
         return 1;
@@ -180,8 +138,8 @@ int RunWpoEncodeTest(const std::string& outputDir) {
         return 1;
     }
 
-    // No resources bound - the shader is fully procedural, driven only by
-    // SV_VertexID and SV_Position.
+    // No resources bound: the shader uses only `SV_VertexID` and
+    // `SV_Position`.
     D3D12_ROOT_SIGNATURE_DESC rootDesc{};
     rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
     ComPtr<ID3DBlob> rootBlob, rootError;
@@ -245,7 +203,6 @@ int RunWpoEncodeTest(const std::string& outputDir) {
         return 1;
     }
 
-    // The render target itself.
     D3D12_HEAP_PROPERTIES rtHeapProps{};
     rtHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rtDesc{};
@@ -275,9 +232,8 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(renderTarget.Get(), nullptr, rtv);
 
-    // Readback buffer, sized from the real GetCopyableFootprints answer - the
-    // same row-pitch-padding the offline tools already know how to strip
-    // (mvtools.py's _rows()), rather than assuming a tight packing.
+    // Readback buffer sized by `GetCopyableFootprints`, with the row padding
+    // `mvtools._rows()` strips.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 totalBytes = 0;
     device->GetCopyableFootprints(&rtDesc, 0, 1, 0, &footprint, nullptr, nullptr, &totalBytes);
@@ -300,7 +256,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
         return 1;
     }
 
-    // Record: draw the full-screen triangle, barrier to COPY_SOURCE, copy out.
+    // Draw the triangle, transition to COPY_SOURCE, copy out.
     D3D12_VIEWPORT viewport{0, 0, static_cast<float>(kWidth), static_cast<float>(kHeight), 0.0f, 1.0f};
     D3D12_RECT scissor{0, 0, static_cast<LONG>(kWidth), static_cast<LONG>(kHeight)};
     cmdList->SetGraphicsRootSignature(rootSignature.Get());
@@ -347,10 +303,8 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     }
     CloseHandle(event);
 
-    // Debug-layer errors are exactly the thing an untested render path (no
-    // vertex buffer, no bound resources at all) would trip if the root
-    // signature or PSO were subtly wrong - the same discipline
-    // mv_testhost's main harness applies elsewhere in this project.
+    // A shader with no vertex buffer and no bound resources is the kind of path
+    // where a wrong root signature or PSO shows up as debug-layer errors.
     int errors = 0;
     if (infoQueue) {
         const UINT64 count = infoQueue->GetNumStoredMessages();

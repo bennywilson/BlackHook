@@ -1,26 +1,15 @@
-"""How distinctive is the velocity buffer's barrier pattern, really?
+"""How distinctive is the velocity buffer's barrier pattern?
 
-The project's identification argument has two halves, and only one of them was
-ever tested. The descriptor filter (1212x760, R16G16B16A16_UNORM) picks a
-resource; the barrier analysis then shows that resource behaves exactly as
-SceneVelocity should - two transitions per frame, strictly alternating
-RENDER_TARGET <-> ALL_SHADER_RESOURCE, no UAV barriers, no state-continuity
-violations. Clean, and circular: the barrier analysis only ever ran on
-resources that had already passed the descriptor filter, so it could confirm
-"the resource I picked behaves right" but never "nothing else does".
+The hook profiles every resource it meets in a barrier and writes the profiles
+to temp\\logs\\mv_barrier_profile.log at frame 2000
+(`SurfaceRegistry::DumpBarrierProfiles`). This reads that file and counts how
+many resources show the velocity buffer's barrier signature, ignoring size and
+format.
 
-The hook now profiles every resource the identify pass walks past (see
-DumpBarrierProfiles in hook/src/d3d12_hook.cpp) and writes them to
-temp\\logs\\mv_barrier_profile.log. This reads that file and asks the question the
-other way round: of all the resources in the frame, how many exhibit the
-velocity buffer's signature?
-
-If the answer is one, or a handful, then runtime behaviour alone comes close to
-identifying the velocity buffer - no RenderDoc capture needed to crib a
-descriptor from, and the technique transfers to a title you do not own. If the
-answer is dozens, the descriptor filter is doing the real work and the barrier
-pattern is corroboration rather than identification. Either result is worth
-having; only one of them was assumed before.
+If one or a handful do, behaviour alone nearly identifies the buffer, and the
+method transfers to a title without a RenderDoc capture to take a descriptor
+from. If dozens do, the structural gate does the real work and behaviour only
+corroborates.
 
 Usage:  python barrier_signature.py [path-to-mv_barrier_profile.log]
 """
@@ -59,11 +48,8 @@ if not rows:
 
 print(f"{len(rows)} resources profiled\n")
 
-# The signature, stated as testable predicates rather than prose.
-#
-# Deliberately NOT part of it: anything about size or format. The whole point
-# is to find out how far behaviour alone gets you, so bringing the descriptor
-# back in through the side door would just restate the circularity.
+# The signature as testable predicates. Size and format are left out on
+# purpose: the question is how far behaviour alone gets.
 def is_two_cycle(r):
     """Exactly two transitions per frame, every frame it appears."""
     return r.frames >= 10 and r.twoPerFrame == r.frames
@@ -115,9 +101,9 @@ else:
     print("  survivors share a descriptor - if they do, behaviour plus one descriptor")
     print("  predicate is still much weaker prior knowledge than the full signature.")
 
-# How much of the reduction came from behaviour vs. how much was already
-# implied by size? Worth knowing: if every 2-cycle resource is also the only
-# one at that resolution, the two filters are not independent evidence.
+# How much of the reduction did size already imply? If every 2-cycle resource
+# is also the only one at that resolution, the two are not independent
+# evidence.
 sizes = {}
 for r in survivors:
     sizes.setdefault((r.width, r.height, r.format), []).append(r)
