@@ -6,12 +6,12 @@ image-matching reference in this project resolves reliably either.
 Companion to mv_testhost.exe --wpo-encode-test <dir>, which renders a known
 (Vx, Vy, Vz) grid through the real EncodeVelocityToTexture()/
 VELOCITY_ENCODE_DEPTH path (transcribed exactly from Common.ush, in
-testhost/src/wpo_encode_test.cpp) and dumps the result in the same
-meta.txt/*.bin shape a real capture uses. This script regenerates the same
+testhost/src/wpo_encode_test.cpp) and dumps the raw texture plus a small
+meta.txt describing its layout. This script regenerates the same
 grid independently and runs the UNMODIFIED, already-shipping mvtools decode
 functions against the dump, then checks two things.
 
-The grid dimensions come from the dump's own meta.txt, so those cannot drift.
+The grid dimensions come from that meta.txt, so those cannot drift.
 The VALUE ranges below (VX_RANGE/VY_RANGE/VZ_RANGE) are a hand-kept duplicate
 of the lerp ranges in wpo_encode_test.cpp's PSMain, and nothing checks that
 the two still agree - the dump records the encoded result, not the formula
@@ -57,13 +57,16 @@ VX_RANGE = (-2.0, 2.0)
 VY_RANGE = (-2.0, 2.0)
 VZ_RANGE = (-1e-5, 1e-5)
 
-dump = mvtools.load_dump(dump_dir)
-meta = dump.meta
 vel_path = os.path.join(dump_dir, "wpo_vel_00000.bin")
-if not os.path.exists(vel_path):
-    sys.exit(f"no {vel_path} - run mv_testhost.exe --wpo-encode-test \"{dump_dir}\" first")
+meta_path = os.path.join(dump_dir, "meta.txt")
+if not (os.path.exists(vel_path) and os.path.exists(meta_path)):
+    sys.exit(f"no {vel_path} / meta.txt - run mv_testhost.exe --wpo-encode-test \"{dump_dir}\" first")
+# The fixture's own key=value layout file (not a capture dump - load_dump()
+# reads only those), in the dict shape the mvtools decode functions take.
+with open(meta_path) as f:
+    meta = {k: int(v) for k, v in (line.strip().split("=", 1) for line in f if "=" in line)}
 
-w, h = dump.surface("velocity").width, dump.surface("velocity").height
+w, h = meta["velocity_width"], meta["velocity_height"]
 print(f"dump: {w}x{h}, format {meta['velocity_format']}, "
       f"engine {meta.get('engine_version_major', '?')}.{meta.get('engine_version_minor', '?')}")
 
