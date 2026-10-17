@@ -22,6 +22,10 @@ __pycache__/
 *.pyc
 old/
 
+# Validation output. Only the per-engine-version reference runs are tracked.
+results/*/
+!results/ue5.*/
+
 # Local copies of third-party games used for capture (not redistributable)
 testgames/
 # Claude Code local settings

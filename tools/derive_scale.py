@@ -37,8 +37,6 @@ meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
 cw, ch = dump.surface("color").width, dump.surface("color").height
 
-RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
-
 # Block matching. SEARCH bounds the measurable displacement; WINDOW is the
 # correlation window. MIN_CONFIDENCE drops pixels whose SAD minimum is not
 # distinct (flat walls, sky, smooth surfaces), where optical flow would report
@@ -189,7 +187,6 @@ except ImportError:
     print("\n(matplotlib not installed - skipping the scatter plot)")
     sys.exit(0)
 
-os.makedirs(RESULTS, exist_ok=True)
 fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 n = min(len(dec_x), 40000)
 sub = np.random.default_rng(0).choice(len(dec_x), n, replace=False)
@@ -209,9 +206,8 @@ for ax, name, dec, leg, meas in (
         h.set_alpha(1.0)
 fig.suptitle("SceneVelocity decode vs measured image motion, per pixel")
 fig.tight_layout()
-# MV_RESULT_TAG names the title, so a run on another game does not overwrite
-# the first game's committed figures.
-_tag = os.environ.get("MV_RESULT_TAG", "")
-out = os.path.join(RESULTS, f"decode_scatter{'_' + _tag if _tag else ''}.png")
+# run_validation.py passes its tag in MV_RESULT_TAG, so the figure lands in the
+# same results/<tag>/ folder as the report.
+out = os.path.join(paths.results_dir(os.environ.get("MV_RESULT_TAG", "")), "decode_scatter.png")
 fig.savefig(out, dpi=110)
 print(f"\nwrote {os.path.normpath(out)}")

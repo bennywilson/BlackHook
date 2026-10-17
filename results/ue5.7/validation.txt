@@ -1,8 +1,8 @@
 SceneVelocity extraction - offline validation
 ========================================================================
 generated: 2026-08-26 19:59:49
-dump:      C:\Users\ben_a\AppData\Local\Temp\mv_dump_oxi_20260826_195534
-title:     oxi_live_20260826
+dump:      <dump_dir> (title and path in notes/)
+title:     ue5.7
 command:   python tools/run_validation.py <dump_dir> [tag]
 
 This file is generated verbatim from the committed tools. Nothing here
@@ -123,7 +123,7 @@ RMS error against measured displacement, per pixel:
    axis X: engine   0.248 px   legacy   1.390 px
    axis Y: engine   0.333 px   legacy   1.648 px
 
-wrote C:\projects\VelocityBufferHook\results\decode_scatter_oxi_live_20260826.png
+wrote results/ue5.7/decode_scatter.png
 
 
 ========================================================================
@@ -237,7 +237,7 @@ Control verdicts:
       -> the per-pixel field beats the best rigid translation, so it is
          carrying information a single global shift cannot express.
 
-  wrote C:\projects\VelocityBufferHook\results\warp_validation_oxi_live_20260826.png (pair 1850 -> 1851, MAE 0.21959 -> 0.04813)
+  wrote results/ue5.7/warp_validation.png (pair 1850 -> 1851, MAE 0.21959 -> 0.04813)
 
 
 ========================================================================

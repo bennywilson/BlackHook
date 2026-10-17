@@ -1,13 +1,13 @@
-"""Run every offline check against a dump and write results/validation.txt.
+"""Run every offline check against a dump and write results/<tag>/validation.txt.
 
 One command runs every tool and writes its output, failures included, into
-results/, so every number in the README can be traced to a file.
+results/<tag>/, so every number in the README can be traced to a file.
 
 Usage:  python run_validation.py [dump_dir] [tag]
 
-`tag` names the title the dump came from and is appended to every output file
-(results/validation_<tag>.txt, warp_validation_<tag>.png, ...), so results for
-one game do not overwrite another's. Omit it for results/validation.txt.
+`tag` names the folder under results/. Use the engine version (`ue5.7`) for a
+tracked reference run, and any other tag for a local run that git ignores.
+Without a tag, the output goes to results/untagged/.
 """
 import os
 import subprocess
@@ -17,14 +17,12 @@ import paths
 import time
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
-RESULTS = os.path.normpath(os.path.join(TOOLS, "..", "results"))
 
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else paths.DEFAULT_DUMP
 tag = sys.argv[2] if len(sys.argv) > 2 else ""
-suffix = f"_{tag}" if tag else ""
-os.makedirs(RESULTS, exist_ok=True)
-out_path = os.path.join(RESULTS, f"validation{suffix}.txt")
-figure_path = os.path.join(RESULTS, f"warp_validation{suffix}.png")
+results = paths.results_dir(tag)
+out_path = os.path.join(results, "validation.txt")
+figure_path = os.path.join(results, "warp_validation.png")
 # Tools that write their own figures read this rather than taking a path.
 os.environ["MV_RESULT_TAG"] = tag
 

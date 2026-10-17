@@ -456,6 +456,13 @@ json Resolve(const ProfileSet& set, const std::string& name, int depth)
     {
         Fail("profile '" + name + "'.extends: expected a profile name");
     }
+    // A same-named profile from MV_PROFILE_FILE has already replaced the
+    // embedded one, so it would find itself as its parent.
+    if (extends->get<std::string>() == name)
+    {
+        Fail("profile '" + name + "' extends itself - to patch the embedded '" + name +
+             "', give the patch a new name");
+    }
     json resolved = Resolve(set, extends->get<std::string>(), depth + 1);
     profile.erase("extends");
     resolved.merge_patch(profile);
