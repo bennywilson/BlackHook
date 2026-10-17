@@ -163,6 +163,25 @@ function Resolve-EngineVersion {
     return $null
 }
 
+# Set the game's SteamAppId and SteamGameId in the script's environment so the
+# game thinks Steam launched it. This stops the game from quitting and
+# relaunching through Steam (which would drop our MV_* environment variables).
+function Get-SteamAppId {
+    param([string]$GamePath)
+
+    if ($GamePath -notmatch '^(.*\\steamapps)\\common\\([^\\]+)\\') { return $null }
+    $steamapps = $Matches[1]
+    $folder    = $Matches[2]
+    foreach ($acf in Get-ChildItem -LiteralPath $steamapps -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue) {
+        $text = Get-Content -LiteralPath $acf.FullName -Raw
+        if ($text -match '"installdir"\s+"([^"]+)"' -and $Matches[1] -eq $folder -and
+            $text -match '"appid"\s+"(\d+)"') {
+            return $Matches[1]
+        }
+    }
+    return $null
+}
+
 # ------------------------------------------------------- process helpers ----
 
 function Get-MatchingProcesses {
@@ -288,6 +307,15 @@ if (-not $AttachOnly) {
     if ($Surfaces)       { $env:MV_SURFACES      = $Surfaces -join ',' } else { Remove-Item Env:\MV_SURFACES      -ErrorAction SilentlyContinue }
     if ($AutoCapture)   { $env:MV_AUTOCAPTURE   = '1' } else { Remove-Item Env:\MV_AUTOCAPTURE   -ErrorAction SilentlyContinue }
     if ($NoCaptureDepth) { $env:MV_CAPTURE_DEPTH = '0' } else { Remove-Item Env:\MV_CAPTURE_DEPTH -ErrorAction SilentlyContinue }
+
+    $steamAppId = Get-SteamAppId -GamePath $Game
+    if ($steamAppId) {
+        $env:SteamAppId  = $steamAppId
+        $env:SteamGameId = $steamAppId
+        Write-Note "SteamAppId=$steamAppId (so Steam does not restart the game without MV_*)"
+    } else {
+        Remove-Item Env:\SteamAppId, Env:\SteamGameId -ErrorAction SilentlyContinue
+    }
 
     $workingDir = Split-Path -Parent $Game
     Write-Note "working directory: $workingDir  (some titles exit immediately without this)"

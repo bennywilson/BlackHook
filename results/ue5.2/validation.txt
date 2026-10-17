@@ -1,8 +1,8 @@
 SceneVelocity extraction - offline validation
 ========================================================================
 generated: 2026-08-14 16:36:06
-dump:      D:/mv_captures/skyrunner_moderate
-title:     skyrunner
+dump:      <dump_dir> (title and path in notes/)
+title:     ue5.2
 command:   python tools/run_validation.py <dump_dir> [tag]
 
 This file is generated verbatim from the committed tools. Nothing here
@@ -111,7 +111,7 @@ RMS error against measured displacement, per pixel:
    axis X: engine   8.187 px   legacy   5.949 px
    axis Y: engine   3.782 px   legacy   3.394 px
 
-wrote D:\hook\ue5-motion-vectors\results\decode_scatter_skyrunner.png
+wrote results/ue5.2/decode_scatter.png
 
 --- stderr ---
 D:\hook\ue5-motion-vectors\tools\derive_scale.py:160: RankWarning: Polyfit may be poorly conditioned
@@ -224,7 +224,7 @@ Control verdicts:
       -> the per-pixel field beats the best rigid translation, so it is
          carrying information a single global shift cannot express.
 
-  wrote D:\hook\ue5-motion-vectors\results\warp_validation_skyrunner.png (pair 5 -> 6, MAE 0.12998 -> 0.03793)
+  wrote results/ue5.2/warp_validation.png (pair 5 -> 6, MAE 0.12998 -> 0.03793)
 
 
 ========================================================================

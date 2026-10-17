@@ -8,8 +8,9 @@ CMake configure time:
     temp/dumps/   mv_dump/ (the hook's default dump), <game>_<stamp>/ runs
     temp/out/     tool output (videos, previews, contact sheets)
 
-results/ is outside temp/: it holds committed validation output. No numpy, so
-tools that decode nothing can import it.
+results/<tag>/ is outside temp/ and holds validation output. Git tracks only
+the results/ue5.<minor>/ folders, one reference title per engine version, and
+ignores every other tag. No numpy, so tools that decode nothing can import it.
 """
 import os
 
@@ -19,6 +20,14 @@ LOGS = os.path.join(TEMP, "logs")
 DUMPS = os.path.join(TEMP, "dumps")
 DEFAULT_DUMP = os.path.join(DUMPS, "mv_dump")
 OUT = os.path.join(TEMP, "out")
+RESULTS = os.path.join(REPO, "results")
+
+
+def results_dir(tag):
+    """results/<tag>/, creating it if needed. An empty tag means "untagged"."""
+    path = os.path.join(RESULTS, tag or "untagged")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def out_path(name):
