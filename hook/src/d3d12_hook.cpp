@@ -167,7 +167,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     NoteBackBufferSizeIfNeeded(swapChain, frame);
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
-    mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
+    mv::OverlayOnPresent(swapChain, mv::GetPresentingQueue(), frame);
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     g_presentCount.fetch_add(1, std::memory_order_relaxed);
     LogHeartbeatIfDue();
@@ -183,7 +183,7 @@ HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DX
     NoteBackBufferSizeIfNeeded(swapChain, frame);
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
-    mv::OverlayOnPresent(swapChain, mv::GetGameQueue(), frame);
+    mv::OverlayOnPresent(swapChain, mv::GetPresentingQueue(), frame);
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     g_present1Count.fetch_add(1, std::memory_order_relaxed);
     LogHeartbeatIfDue();
@@ -194,9 +194,7 @@ void STDMETHODCALLTYPE
 HookExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
 {
     g_executeCommandListsCount.fetch_add(1, std::memory_order_relaxed);
-    // The game's direct queue: our back-buffer copy goes there, under the same
-    // fence as the velocity copy.
-    mv::NoteCommandQueue(queue);
+    mv::NoteCommandQueue(queue, numCommandLists, commandLists);
     // Checks that the list carrying the velocity copy goes to that queue.
     mv::NoteSubmission(queue, numCommandLists, commandLists);
     g_originalExecuteCommandLists(queue, numCommandLists, commandLists);
@@ -239,6 +237,10 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
                 const int stateBefore = static_cast<int>(barriers[i].Transition.StateBefore);
                 const int stateAfter = static_cast<int>(barriers[i].Transition.StateAfter);
                 registry.ConsiderResource(resource);
+                if (stateAfter == D3D12_RESOURCE_STATE_PRESENT && registry.IsKnownSource(resource))
+                {
+                    mv::NotePresentingList(cmdList);
+                }
 
                 if (mv::DiagEnabled() && registry.IsAnyCandidate(resource))
                 {

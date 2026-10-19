@@ -37,6 +37,11 @@ In game, **F8** captures a 2400-frame burst (about 20 seconds) into a fresh
 `temp\dumps\<game>_<stamp>\`. Wait for `capture: write queue drained` in
 `temp\logs\mv_hook.log` before quitting.
 
+Each surface is identified once, about 90 frames after injection. If a title
+allocates new scene targets when play starts, the search may already have
+measured its menu. **F6** restarts every search from an empty shortlist, so
+press it once the scene is rendering.
+
 A dump holds one file per surface per frame (`vel_00042.bin`, `depth_`,
 `color_`, `normals_`, `specular_`), `frames.csv` (capture index to game frame)
 and `manifest.json` (layouts, formats, why the burst ended, dropped-frame
@@ -69,7 +74,12 @@ chooses a profile and how a loaded profile overrides an embedded one.
 **F7** cycles through four modes: off, `SceneVelocity` as the engine's
 visualizer shows it, `SceneVelocity` over the frame, and a 2x2 grid of frame,
 depth, normals and specular. If a quadrant's surface was not refreshed that
-frame, the quadrant gets a red border.
+frame, the quadrant gets a red border. Without normals and specular, the grid
+is one row of frame and depth.
+
+A status panel at the top left, drawn in every mode, lists the hotkeys, the
+view, each surface's search state and the capture state. F8 copies the frame
+before the panel is drawn, so captures do not contain it.
 
 ## How identification works
 
@@ -177,11 +187,10 @@ report says so.
   edge every frame, it blocks adoption.
 - With all five surfaces enabled, write backpressure drops most of a burst.
 - Fence coverage is verified for the velocity copy only.
-- If a title uses NVIDIA's Streamline plugin, pass
-  `-GameArgs '-slnoswapchainprovider'`. Streamline wraps the DXGI swapchain.
-  On a tested title without `-slnoswapchainprovider`, pressing F7 removed the
-  D3D12 device whether frame generation was on or off. With
-  `-slnoswapchainprovider`, the overlay and an F8 burst both work.
-- `-slnoswapchainprovider` also disables frame generation, because frame
-  generation needs Streamline's swapchain wrapper. The engine renders no
-  `SceneVelocity` for a generated frame, so the capture loses nothing.
+- The overlay and the back-buffer copy go to the presenting queue, which
+  submits the back buffer's transition to `PRESENT`. With NVIDIA's Streamline
+  plugin loaded, the presenting queue can differ from the first direct queue
+  to submit. The overlay works through Streamline's swapchain wrapper on a
+  tested title. An F8 burst through the wrapper is untested.
+  `-GameArgs '-slnoswapchainprovider'` removes the wrapper, and frame
+  generation with it.

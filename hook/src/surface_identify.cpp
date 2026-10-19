@@ -1244,7 +1244,7 @@ void SurfaceIdentifier::ForgetAllCandidates() noexcept
     }
 }
 
-void SurfaceIdentifier::Reopen(ReopenReason /*reason*/, const char* detail) noexcept
+void SurfaceIdentifier::Reopen(ReopenReason reason, const char* detail) noexcept
 {
     Log(std::string(spec_.logPrefix) + ": REOPENING the search - " + detail + ".");
     identified_.store(nullptr, std::memory_order_release);
@@ -1253,7 +1253,9 @@ void SurfaceIdentifier::Reopen(ReopenReason /*reason*/, const char* detail) noex
     decisionMade_.store(false, std::memory_order_relaxed);
     decideAtFrame_.store(0, std::memory_order_relaxed);
 
-    if (spec_.reopenClearsShortlist)
+    // A kept shortlist can be full of a menu's targets, and a full one takes
+    // no new resources.
+    if (spec_.reopenClearsShortlist || reason == ReopenReason::Requested)
     {
         {
             std::lock_guard<std::mutex> lock(shortlistMutex_);

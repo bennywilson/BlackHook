@@ -3,6 +3,8 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#include <string>
+
 namespace mv
 {
 
@@ -30,16 +32,29 @@ using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT
 
 void SetOriginalFunctions(ResourceBarrierFn resourceBarrier, ExecuteCommandListsFn executeCommandLists);
 
-// Remembers the game's direct queue. The back-buffer copy is submitted there,
-// so one fence covers it and the velocity copy.
-void NoteCommandQueue(ID3D12CommandQueue* queue);
+// Called from the barrier hook when `cmdList` moves a swapchain back buffer to
+// `PRESENT`. The queue that submits that list is the one that presents.
+void NotePresentingList(ID3D12GraphicsCommandList* cmdList);
 
-// The game's direct queue, once seen. The overlay submits there, after the
-// frame it draws over.
-ID3D12CommandQueue* GetGameQueue();
+// Called from the `ExecuteCommandLists` hook. Remembers `queue` as the
+// presenting queue if its lists contain the one noted by
+// `NotePresentingList`.
+//
+// The back-buffer copy and the overlay are submitted to the presenting queue,
+// so they run after the frame they read. The first direct queue to submit is
+// not guaranteed to present (ex: when Nvidia Streamline is active). Submitting
+// overlays to an un-presented queue will trigger a
+// `DXGI_ERROR_DEVICE_REMOVED` crash.
+void NoteCommandQueue(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists);
+
+// Null until `NoteCommandQueue` finds the queue.
+ID3D12CommandQueue* GetPresentingQueue();
 
 // Starts the F8 hotkey thread.
 void StartCaptureHotkeyThread();
+
+// One line for the overlay's status panel: recording, writing, or idle.
+std::string CaptureStatusLine();
 
 // Called from the barrier hook on an identified surface's trigger edge
 // (`RENDER_TARGET` to shader-readable; depth: `DEPTH_WRITE` to readable), the

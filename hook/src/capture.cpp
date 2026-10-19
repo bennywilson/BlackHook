@@ -154,6 +154,8 @@ std::mutex g_mutex;
 Slot g_slots[kSlots];
 ComPtr<ID3D12Device> g_device;
 ComPtr<ID3D12CommandQueue> g_queue;
+// `ComIdentity` of the last list that moved a back buffer to `PRESENT`.
+std::atomic<IUnknown*> g_presentingList{nullptr};
 ComPtr<ID3D12Fence> g_fence;
 UINT64 g_nextFenceValue = 1;
 
@@ -1108,31 +1110,67 @@ void SetOriginalFunctions(ResourceBarrierFn resourceBarrier, ExecuteCommandLists
     g_originalExecuteCommandLists = executeCommandLists;
 }
 
-void NoteCommandQueue(ID3D12CommandQueue* queue)
+void NotePresentingList(ID3D12GraphicsCommandList* cmdList)
 {
-    if (queue == nullptr || g_queue != nullptr)
+    // D3D12 `PRESENT` and `COMMON` are the same state, so the barrier hook also
+    // calls this for a copy or compute list that returns a back buffer to
+    // `COMMON`. Only a direct list can present.
+    if (g_queue == nullptr && cmdList->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+    {
+        g_presentingList.store(ComIdentity(cmdList), std::memory_order_relaxed);
+    }
+}
+
+void NoteCommandQueue(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
+{
+    IUnknown* const presentingList = g_presentingList.load(std::memory_order_relaxed);
+    if (queue == nullptr || commandLists == nullptr || presentingList == nullptr || g_queue != nullptr)
     {
         return;
     }
-    // Direct queue only: the back-buffer copy must go to the queue the game
-    // renders on, so one fence covers it and the velocity copy.
-    const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
-    if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+
+    bool presents = false;
+    for (UINT i = 0; i < numCommandLists && !presents; ++i)
+    {
+        presents = ComIdentity(commandLists[i]) == presentingList;
+    }
+
+    if (!presents)
     {
         return;
     }
+
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_queue == nullptr)
     {
         g_queue = queue;
-        Log("capture: noted direct command queue");
+        Log("capture: noted the presenting direct command queue");
     }
 }
 
-ID3D12CommandQueue* GetGameQueue()
+ID3D12CommandQueue* GetPresentingQueue()
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_queue.Get();
+}
+
+std::string CaptureStatusLine()
+{
+    const int remaining = g_framesRemaining.load(std::memory_order_relaxed);
+    if (remaining > 0)
+    {
+        return "capture: recording, " + std::to_string(kCaptureFrames - remaining) + " of " +
+               std::to_string(kCaptureFrames) + " frames";
+    }
+
+    size_t queued = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_writeMutex);
+        queued = g_writeQueue.size();
+    }
+
+    return queued > 0 ? "capture: writing, " + std::to_string(queued) + " files queued. Wait before quitting."
+                      : "capture: idle";
 }
 
 void SetFrameIndex(unsigned long long frameIndex)
@@ -1157,6 +1195,7 @@ void StartCaptureHotkeyThread()
                 Log("capture: MV_AUTOCAPTURE set, starting a burst without a keypress");
             }
             bool wasDown = false;
+            bool restartWasDown = false;
             while (!g_hotkeyStop.load(std::memory_order_relaxed))
             {
                 const bool isDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
@@ -1167,10 +1206,18 @@ void StartCaptureHotkeyThread()
                         " frames from the next frame boundary");
                 }
                 wasDown = isDown;
+
+                const bool restartIsDown = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+                if (restartIsDown && !restartWasDown)
+                {
+                    GetSurfaceRegistry().RequestRestart();
+                }
+                restartWasDown = restartIsDown;
+
                 Sleep(30);
             }
         });
-    Log("capture: hotkey thread started (F8 = capture burst)");
+    Log("capture: hotkey thread started (F8 = capture burst, F6 = restart identification)");
 }
 
 namespace
@@ -1397,8 +1444,10 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
             }
             else
             {
-                // One fence must cover our copy and the velocity copy, so a
-                // second direct queue would give stale readbacks.
+                // Capture signals its fence on the presenting queue, so the
+                // fence covers only work submitted there. A velocity list on
+                // another queue can still be running when the fence passes,
+                // which makes the readback stale.
                 Log("capture: WARNING velocity command list submitted on another queue - frame " +
                     std::to_string(slot.frameIndex) + " is not covered by our fence");
             }

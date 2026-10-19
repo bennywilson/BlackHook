@@ -116,10 +116,20 @@ public:
 
     // A swapchain back buffer: never selectable, purged from any shortlist.
     void NoteKnownSourceResource(ID3D12Resource* resource) noexcept;
+    bool IsKnownSource(ID3D12Resource* resource) const noexcept
+    {
+        return knownSources_.Contains(resource);
+    }
 
     // Reopens `rootName` and every identifier sized from it, directly or not,
     // refilling the identify seen-set and budget once for the whole cascade.
     void ReopenCascade(const char* rootName, ReopenReason reason, const char* detail) noexcept;
+
+    // Restarts every search at the next `OnFrame`. Safe from any thread.
+    void RequestRestart() noexcept
+    {
+        restartRequested_.store(true, std::memory_order_relaxed);
+    }
 
     // MutualExclusionChecker
     bool TryClaim(ID3D12Resource* resource, const SurfaceIdentifier* claimant) noexcept override;
@@ -155,6 +165,7 @@ private:
     BarrierProfileStore profileStore_;
     KnownSourceSet knownSources_;
     std::atomic<bool> profileDumped_{false};
+    std::atomic<bool> restartRequested_{false};
     ReopenObserver reopenObserver_ = nullptr;
 
     // `OnBarrierBatch`'s `MV_DIAG` tallies.

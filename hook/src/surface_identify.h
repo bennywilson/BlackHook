@@ -36,6 +36,8 @@ enum class ReopenReason : uint8_t
     DescriptorChanged,
     BackBufferResized,
     DependencyReopened, // e.g. depth reopening because velocity's own search reopened
+    // F6 restarts every search from an empty shortlist (see `Reopen`).
+    Requested,
 };
 
 // The barrier edge that finishes a surface: the one moment the transient

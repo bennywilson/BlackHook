@@ -214,8 +214,17 @@ int SurfaceRegistry::OnBarrierTransition(
 
 void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
 {
-    // Registration order runs velocity's `OnFrame` before its dependents'.
-    // Order does not matter: `OnFrame` reads the source's live state.
+    // F6's restart runs here, on the Present thread, as a resize's reopen
+    // does. Every surface in the embedded profile is sized from velocity, so
+    // velocity's cascade restarts them all.
+    if (restartRequested_.exchange(false, std::memory_order_relaxed))
+    {
+        ReopenCascade("velocity", ReopenReason::Requested, "F6 pressed");
+    }
+
+    // Velocity registers first, so its `OnFrame` runs before its dependents'.
+    // A dependent then sees an extent velocity found this frame without
+    // waiting a frame. Nothing else depends on the order.
     for (Entry& e : entries_)
     {
         e.identifier->OnFrame(frame);
@@ -509,7 +518,9 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
         {
             const std::string dependentDetail =
                 std::string("the ") + root->identifier->Spec().name + " search was reopened";
-            e->identifier->Reopen(ReopenReason::DependencyReopened, dependentDetail.c_str());
+            e->identifier->Reopen(
+                reason == ReopenReason::Requested ? ReopenReason::Requested : ReopenReason::DependencyReopened,
+                dependentDetail.c_str());
         }
         // For every identifier in the cascade, root or dependent; the observer
         // decides whether a dependent's reopen matters (depth's, per burst).

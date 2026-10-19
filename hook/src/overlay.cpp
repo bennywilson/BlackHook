@@ -1,12 +1,16 @@
 #include "overlay.h"
 
 #include "logging.h"
+#include "surface_registry.h"
 
 #include <d3dcompiler.h>
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,13 +22,34 @@ namespace mv
 namespace
 {
 
-// Frames of command-list resources in flight. If none is free, the overlay
-// skips that frame instead of waiting.
+// Frames of command-list resources in flight. If the next one is still busy,
+// the overlay waits up to `kSlotWaitMs` for it, then skips the frame and
+// counts it in `g_skippedFrames`.
 constexpr UINT kFrames = 3;
+constexpr DWORD kSlotWaitMs = 100;
+uint64_t g_skippedFrames = 0;
 
 // SRV heap slot i is surface i (`capture.h`), matching t0..t4 in the shader. The
-// colour slot holds the snapshot of the finished frame taken at Present.
-constexpr UINT kSrvCount = kSurfaceCount;
+// colour slot holds the snapshot of the finished frame taken at Present. The
+// last slot is the status panel (t5).
+constexpr UINT kPanelSrv = kSurfaceCount;
+constexpr UINT kSrvCount = kSurfaceCount + 1;
+
+// The status panel: lines of Consolas drawn by GDI into a CPU bitmap, uploaded
+// to an R8 texture when the text changes, at most every `kPanelRefreshMs`. The
+// width is a multiple of `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT`, so the upload
+// rows need no padding. The shader places it 16 pixels from the top left.
+constexpr UINT kPanelWidth = 768;
+constexpr UINT kPanelLines = 7;
+constexpr UINT kPanelLineHeight = 20;
+constexpr UINT kPanelHeight = kPanelLines * kPanelLineHeight + 8;
+constexpr DWORD kPanelRefreshMs = 250;
+
+// Must match `OverlayMode` in overlay.h, including its count.
+static_assert(static_cast<int>(OverlayMode::Count) == 4, "kModeNames is out of sync with OverlayMode");
+const char* const kModeNames[] = {
+    "off", "SceneVelocity (raw channels, engine view)", "SceneVelocity over gameplay",
+    "GBuffer grid (frame | depth / normals | specular)"};
 
 // Opacity of the velocity colours when composited over the live frame.
 constexpr float kOverGameplayBlend = 0.75f;
@@ -35,14 +60,16 @@ Texture2D<float>  Depth      : register(t1); // plane 0 only (depth, not stencil
 Texture2D<float4> SceneColor : register(t2);
 Texture2D<float4> Normals    : register(t3);
 Texture2D<float4> Specular   : register(t4);
+Texture2D<float>  PanelText  : register(t5); // text coverage, drawn by GDI
 SamplerState Samp            : register(s0);
 
 cbuffer Params : register(b0)
 {
     float4 StaleBySurface;  // 1 = not refreshed this frame: x velocity, y depth, z normals, w specular
-    float  Mode;            // 1 = velocity only, 2 = over gameplay, 3 = GBuffer grid
+    float  Mode;            // 0 = panel only, 1 = velocity only, 2 = over gameplay, 3 = GBuffer grid
     float  Blend;           // opacity when composited over gameplay
     float2 VelocityRes;     // velocity texture dimensions, in pixels
+    float  GridRows;        // 2, or 1 without normals and specular
 };
 #define Stale StaleBySurface.x
 
@@ -69,6 +96,13 @@ float FetchDepth(float2 uv)
 // 2x2: frame | depth / normals | specular. Raw channels, no decode.
 float4 GBufferGrid(float2 uv)
 {
+    // One row: the top row's cells, at the same size so neither image is
+    // stretched, centred vertically.
+    if (GridRows < 1.5)
+    {
+        if (uv.y < 0.25 || uv.y >= 0.75) return float4(0.0.xxx, 1.0);
+        uv.y -= 0.25;
+    }
     float2 cell = floor(uv * 2.0);
     float2 local = frac(uv * 2.0);
     int index = (int)(cell.y * 2.0 + cell.x);
@@ -121,7 +155,19 @@ VSOut VSMain(uint id : SV_VertexID)
     return o;
 }
 
-float4 PSMain(VSOut i) : SV_Target
+// The status panel at the top left: text over a translucent dark box. Alpha 0
+// outside the box.
+float4 Panel(float2 pixel)
+{
+    uint w, h;
+    PanelText.GetDimensions(w, h);
+    int2 p = int2(pixel) - 16;
+    if (any(p < 0) || p.x >= (int)w || p.y >= (int)h) return 0.0.xxxx;
+    float text = PanelText.Load(int3(p, 0));
+    return float4(text * float3(1.0, 1.0, 0.85), lerp(0.7, 1.0, text));
+}
+
+float4 ModeColor(VSOut i)
 {
     if (Mode > 2.5)
     {
@@ -160,12 +206,24 @@ float4 PSMain(VSOut i) : SV_Target
     }
     return float4(written ? lerp(scene, raw, Blend) : scene, 1.0);
 }
+
+// The pipeline blends by source alpha. Off, only the panel is drawn over the
+// game's frame; in the other modes the output is opaque.
+float4 PSMain(VSOut i) : SV_Target
+{
+    float4 panel = Panel(i.pos.xy);
+    if (Mode < 0.5) return panel;
+    return float4(lerp(ModeColor(i).rgb, panel.rgb, panel.a), 1.0);
+}
 )HLSL";
 
 struct FrameResources
 {
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commandList;
+    // Per slot, so a panel upload is never overwritten while the GPU reads it.
+    ComPtr<ID3D12Resource> panelUpload;
+    uint8_t* panelMapped = nullptr;
     UINT64 fenceValue = 0;
 };
 
@@ -221,6 +279,14 @@ ComPtr<ID3D12Resource> g_sceneColorTex;
 
 // The desc the scene snapshot was created from; a window resize changes it.
 D3D12_RESOURCE_DESC g_sceneColorDesc{};
+
+ComPtr<ID3D12Resource> g_panelTex;
+// The GDI side lives for the process: nothing in it depends on the device.
+HDC g_panelDc = nullptr;
+uint32_t* g_panelBits = nullptr;
+// The text last uploaded, and when the panel was last checked for changes.
+std::string g_panelText;
+DWORD g_panelCheckedAt = 0;
 
 bool SameLayout(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b)
 {
@@ -344,7 +410,7 @@ bool CreateRootSignature()
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].Constants.ShaderRegister = 0;
-    params[1].Constants.Num32BitValues = 8;
+    params[1].Constants.Num32BitValues = 9;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -374,6 +440,87 @@ bool CreateRootSignature()
     return SUCCEEDED(hr);
 }
 
+// The panel texture, its SRV, one mapped upload buffer per frame slot, and once
+// per process the GDI bitmap and font the text is drawn with.
+bool CreatePanel()
+{
+    if (g_panelDc == nullptr)
+    {
+        HDC dc = CreateCompatibleDC(nullptr);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = kPanelWidth;
+        info.bmiHeader.biHeight = -static_cast<LONG>(kPanelHeight); // top-down
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+
+        // Grey antialiasing, not ClearType: the shader reads one channel.
+        HFONT font = CreateFontA(
+            -static_cast<int>(kPanelLineHeight - 4), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        if (bitmap == nullptr || font == nullptr)
+        {
+            Log("overlay: could not create the status panel's GDI bitmap or font");
+            return false;
+        }
+
+        SelectObject(dc, bitmap);
+        SelectObject(dc, font);
+        SetTextColor(dc, RGB(255, 255, 255));
+        SetBkMode(dc, TRANSPARENT);
+        g_panelDc = dc;
+        g_panelBits = static_cast<uint32_t*>(bits);
+    }
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = kPanelWidth;
+    desc.Height = kPanelHeight;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(g_device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&g_panelTex))))
+    {
+        return false;
+    }
+    CreateSrvFor(g_panelTex.Get(), DXGI_FORMAT_R8_UNORM, kPanelSrv);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = static_cast<UINT64>(kPanelWidth) * kPanelHeight;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    for (FrameResources& f : g_frames)
+    {
+        void* mapped = nullptr;
+        if (FAILED(g_device->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&f.panelUpload))) ||
+            FAILED(f.panelUpload->Map(0, nullptr, &mapped)))
+        {
+            return false;
+        }
+        f.panelMapped = static_cast<uint8_t*>(mapped);
+    }
+
+    g_panelText.clear(); // a new texture starts empty, so upload at once
+    g_panelCheckedAt = GetTickCount() - kPanelRefreshMs;
+    return true;
+}
+
 bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
 {
     g_device = device;
@@ -393,7 +540,17 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     pso.pRootSignature = g_rootSignature.Get();
     pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    // Blends by source alpha and keeps the back buffer's own alpha.
+    D3D12_RENDER_TARGET_BLEND_DESC& blend = pso.BlendState.RenderTarget[0];
+    blend.BlendEnable = TRUE;
+    blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    blend.BlendOp = D3D12_BLEND_OP_ADD;
+    blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    blend.DestBlendAlpha = D3D12_BLEND_ONE;
+    blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pso.SampleMask = UINT_MAX;
     pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -457,6 +614,11 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
         g_frames[i].commandList->Close();
     }
 
+    if (!CreatePanel())
+    {
+        return false;
+    }
+
     if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
     {
         return false;
@@ -466,36 +628,40 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     return true;
 }
 
+// Blocks until `g_fence` reaches `target`, for at most `timeoutMs`. True if it
+// has.
+bool WaitForOverlayFence(UINT64 target, DWORD timeoutMs)
+{
+    if (!g_fence || g_fence->GetCompletedValue() >= target)
+    {
+        return true;
+    }
+
+    HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (event == nullptr)
+    {
+        return false;
+    }
+
+    if (SUCCEEDED(g_fence->SetEventOnCompletion(target, event)))
+    {
+        WaitForSingleObject(event, timeoutMs);
+    }
+    CloseHandle(event);
+    return g_fence->GetCompletedValue() >= target;
+}
+
 // Blocks until every in-flight overlay submission has retired. Used only when
 // a texture an executing command list may reference is about to be released.
 void WaitForOverlayIdle()
 {
-    if (!g_fence)
-    {
-        return;
-    }
-
     UINT64 target = 0;
     for (const FrameResources& f : g_frames)
     {
         target = f.fenceValue > target ? f.fenceValue : target;
     }
 
-    if (target == 0 || g_fence->GetCompletedValue() >= target)
-    {
-        return;
-    }
-
-    HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-    if (event == nullptr)
-    {
-        return;
-    }
-    if (SUCCEEDED(g_fence->SetEventOnCompletion(target, event)))
-    {
-        WaitForSingleObject(event, 1000);
-    }
-    CloseHandle(event);
+    WaitForOverlayFence(target, 1000);
 }
 
 void Transition(
@@ -522,6 +688,91 @@ void Transition(
     {
         list->ResourceBarrier(1, &b);
     }
+}
+
+std::string SurfaceStatusLine(const char* name)
+{
+    const SurfaceIdentifier* identifier = GetSurfaceRegistry().Find(name);
+    std::string state = "not enabled (add it to -Surfaces)";
+    if (identifier != nullptr)
+    {
+        UINT64 width = 0;
+        UINT height = 0;
+        switch (identifier->State())
+        {
+            case IdentifyState::Selected:
+                identifier->Extent(&width, &height);
+                state = "found, " + std::to_string(width) + "x" + std::to_string(height);
+                break;
+            case IdentifyState::Ambiguous:
+                state = "ambiguous: candidates tie, nothing captured (see mv_hook.log)";
+                break;
+            default:
+                state = "searching";
+                break;
+        }
+    }
+
+    char line[128]{};
+    sprintf_s(line, "%-9s %s", name, state.c_str());
+    return line;
+}
+
+// One string, a line per `kPanelLines`, separated by '\n'.
+std::string PanelStatusText(int mode)
+{
+    return std::string("BlackHook   F6 restart search   F7 cycle view   F8 capture burst\n") +
+           "view: " + kModeNames[mode] + "\n" + SurfaceStatusLine("velocity") + "\n" + SurfaceStatusLine("depth") +
+           "\n" + SurfaceStatusLine("normals") + "\n" + SurfaceStatusLine("specular") + "\n" + CaptureStatusLine();
+}
+
+// Redraws the panel and records its upload into `list` when the text has
+// changed. `fr` is a slot whose last submission has completed.
+void UpdatePanel(FrameResources& fr, ID3D12GraphicsCommandList* list, int mode)
+{
+    const DWORD now = GetTickCount();
+    if (now - g_panelCheckedAt < kPanelRefreshMs)
+    {
+        return;
+    }
+    g_panelCheckedAt = now;
+
+    const std::string text = PanelStatusText(mode);
+    if (text == g_panelText)
+    {
+        return;
+    }
+    g_panelText = text;
+
+    memset(g_panelBits, 0, static_cast<size_t>(kPanelWidth) * kPanelHeight * sizeof(uint32_t));
+    size_t start = 0;
+    for (UINT line = 0; line < kPanelLines && start <= text.size(); ++line)
+    {
+        size_t end = text.find('\n', start);
+        end = end == std::string::npos ? text.size() : end;
+        TextOutA(g_panelDc, 8, static_cast<int>(4 + line * kPanelLineHeight), text.data() + start,
+                 static_cast<int>(end - start));
+        start = end + 1;
+    }
+    GdiFlush();
+
+    // White text: every channel holds the coverage.
+    for (UINT i = 0; i < kPanelWidth * kPanelHeight; ++i)
+    {
+        fr.panelMapped[i] = static_cast<uint8_t>(g_panelBits[i] & 0xFF);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = g_panelTex.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = fr.panelUpload.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint = {DXGI_FORMAT_R8_UNORM, kPanelWidth, kPanelHeight, 1, kPanelWidth};
+
+    Transition(list, g_panelTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(list, g_panelTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 } // namespace
@@ -567,12 +818,7 @@ void StartOverlayHotkeyThread()
                 {
                     const int next = (g_mode.load() + 1) % static_cast<int>(OverlayMode::Count);
                     g_mode.store(next);
-                    // Must match OverlayMode in overlay.h, including its count.
-                    static_assert(static_cast<int>(OverlayMode::Count) == 4, "kNames is out of sync with OverlayMode");
-                    static const char* kNames[] = {
-                        "normal", "SceneVelocity (raw channels, engine view)", "SceneVelocity over gameplay",
-                        "GBuffer grid (frame | depth / normals | specular)"};
-                    Log(std::string("overlay: mode -> ") + kNames[next]);
+                    Log(std::string("overlay: mode -> ") + kModeNames[next]);
                 }
                 wasDown = isDown;
                 Sleep(30);
@@ -678,8 +924,9 @@ void OverlayCaptureSurface(
 
 void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint64_t frame)
 {
+    // The status panel is drawn in every mode, off included.
     const int mode = g_mode.load(std::memory_order_relaxed);
-    if (mode == 0 || !swapChain || !queue)
+    if (!swapChain || !queue)
     {
         return;
     }
@@ -718,10 +965,13 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         g_rootSignature.Reset();
         g_srvHeap.Reset();
         g_rtvHeap.Reset();
+        g_panelTex.Reset();
         for (FrameResources& f : g_frames)
         {
             f.commandList.Reset();
             f.allocator.Reset();
+            f.panelUpload.Reset();
+            f.panelMapped = nullptr;
             f.fenceValue = 0;
         }
         g_fence.Reset();
@@ -775,43 +1025,56 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         staleBySurface[s] = (!c.valid || frame < c.copyFrame || frame - c.copyFrame > kMaxAcceptableCopyAge) ? 1.0f : 0.0f;
     }
 
-    if (stale)
+    // Off, nothing is drawn from the copies, so there is nothing to measure.
+    if (mode != 0)
     {
-        ++g_staleCount;
-        ++g_staleRun;
-        if (g_staleRun > g_staleRunMax)
+        if (stale)
         {
-            g_staleRunMax = g_staleRun;
+            ++g_staleCount;
+            ++g_staleRun;
+            if (g_staleRun > g_staleRunMax)
+            {
+                g_staleRunMax = g_staleRun;
+            }
+        }
+        else
+        {
+            ++g_freshCount;
+            g_staleRun = 0;
+        }
+        if (copyAge != UINT64_MAX && copyAge > g_maxCopyAge)
+        {
+            g_maxCopyAge = copyAge;
+        }
+
+        if (++g_freshnessWindow >= kFreshnessLogInterval)
+        {
+            Log("overlay: velocity freshness over " + std::to_string(g_freshnessWindow) + " presents - " +
+                std::to_string(g_freshCount) + " drawn, " + std::to_string(g_staleCount) +
+                " withheld as stale, longest stale run " + std::to_string(g_staleRunMax) + " frames, max copy age " +
+                std::to_string(g_maxCopyAge) + " frames");
+            g_freshnessWindow = 0;
+            g_freshCount = 0;
+            g_staleCount = 0;
+            g_staleRunMax = 0;
+            g_maxCopyAge = 0;
         }
     }
-    else
-    {
-        ++g_freshCount;
-        g_staleRun = 0;
-    }
-    if (copyAge != UINT64_MAX && copyAge > g_maxCopyAge)
-    {
-        g_maxCopyAge = copyAge;
-    }
 
-    if (++g_freshnessWindow >= kFreshnessLogInterval)
-    {
-        Log("overlay: velocity freshness over " + std::to_string(g_freshnessWindow) + " presents - " +
-            std::to_string(g_freshCount) + " drawn, " + std::to_string(g_staleCount) +
-            " withheld as stale, longest stale run " + std::to_string(g_staleRunMax) + " frames, max copy age " +
-            std::to_string(g_maxCopyAge) + " frames");
-        g_freshnessWindow = 0;
-        g_freshCount = 0;
-        g_staleCount = 0;
-        g_staleRunMax = 0;
-        g_maxCopyAge = 0;
-    }
-
-    // A frame slot whose last submission has completed; never wait for one.
+    // Waits up to `kSlotWaitMs` for the next frame slot to retire. A skipped
+    // frame shows the game's image without the overlay, which reads as a
+    // blink. The wait can outlast a frame if the game's queue waits on a fence
+    // signalled after this Present (unverified).
     const UINT slotIndex = g_frame % kFrames;
     FrameResources& fr = g_frames[slotIndex];
-    if (fr.fenceValue != 0 && g_fence->GetCompletedValue() < fr.fenceValue)
+    if (fr.fenceValue != 0 && !WaitForOverlayFence(fr.fenceValue, kSlotWaitMs))
     {
+        if (++g_skippedFrames == 1 || g_skippedFrames % 100 == 0)
+        {
+            Log("overlay: " + std::to_string(g_skippedFrames) + " frame(s) drawn without the overlay: the GPU had not "
+                "finished the overlay's work from " + std::to_string(kFrames) + " presents earlier within " +
+                std::to_string(kSlotWaitMs) + " ms");
+        }
         return;
     }
     g_frame++;
@@ -822,13 +1085,23 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     }
 
     ID3D12GraphicsCommandList* list = fr.commandList.Get();
+    UpdatePanel(fr, list, mode);
 
-    // Snapshot the finished frame before drawing over it.
-    Transition(list, backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Transition(list, g_sceneColorTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyResource(g_sceneColorTex.Get(), backBuffer.Get());
-    Transition(list, g_sceneColorTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Transition(list, backBuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (mode != 0)
+    {
+        // Snapshot the finished frame before drawing over it.
+        Transition(list, backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(
+            list, g_sceneColorTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(g_sceneColorTex.Get(), backBuffer.Get());
+        Transition(
+            list, g_sceneColorTex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(list, backBuffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    else
+    {
+        Transition(list, backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
 
     // Composite over the whole back buffer, through this slot's own RTV.
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -839,6 +1112,12 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     D3D12_VIEWPORT viewport{
         0.0f, 0.0f, static_cast<float>(backDesc.Width), static_cast<float>(backDesc.Height), 0.0f, 1.0f};
     D3D12_RECT scissor{0, 0, static_cast<LONG>(backDesc.Width), static_cast<LONG>(backDesc.Height)};
+    if (mode == 0)
+    {
+        // Only the panel is drawn: its offset in the shader plus its size.
+        scissor.right = std::min<LONG>(scissor.right, 16 + kPanelWidth);
+        scissor.bottom = std::min<LONG>(scissor.bottom, 16 + kPanelHeight);
+    }
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
 
@@ -848,8 +1127,12 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     list->SetPipelineState(g_pipelineState.Get());
     list->SetGraphicsRootDescriptorTable(0, g_srvHeap->GetGPUDescriptorHandleForHeapStart());
 
+    // Without normals and specular, the grid's second row would be empty.
+    SurfaceRegistry& registry = GetSurfaceRegistry();
+    const bool gridHasGBuffers = registry.Find("normals") != nullptr || registry.Find("specular") != nullptr;
+
     // Matches the shader's `cbuffer Params`.
-    const float constants[8] = {
+    const float constants[9] = {
         staleBySurface[kSurfaceVelocity],
         staleBySurface[kSurfaceDepth],
         staleBySurface[kSurfaceNormals],
@@ -858,8 +1141,9 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         kOverGameplayBlend,
         static_cast<float>(velocity.desc.Width ? velocity.desc.Width : 1),
         static_cast<float>(velocity.desc.Height ? velocity.desc.Height : 1),
+        gridHasGBuffers ? 2.0f : 1.0f,
     };
-    list->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
+    list->SetGraphicsRoot32BitConstants(1, 9, constants, 0);
 
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);

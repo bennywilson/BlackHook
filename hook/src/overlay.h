@@ -11,23 +11,19 @@ namespace mv
 {
 
 // Draws captured surfaces into the game's back buffer at Present. F7 cycles the
-// modes; `MV_OVERLAY=<n>` picks the starting one.
-//
-//   0  Off             Nothing drawn, no GPU cost.
-//   1  SceneVelocity   The channels straight to RGB, as the engine's
-//                      `visualizetexture SceneVelocity` shows them.
-//   2  Over gameplay   The same, composited over the frame.
-//   3  GBuffer grid    2x2: frame   | depth (log-scaled)
-//                           normals | specular
-//                      Raw channels. A quadrant whose surface was not
-//                      refreshed this frame gets a red border. Normals and
-//                      specular need `MV_SURFACES`.
-//
+// modes, and `MV_OVERLAY=<n>` picks the starting one. Every mode draws the
+// status panel.
 enum class OverlayMode
 {
     Off = 0,
+    // Shows `SceneVelocity`'s channels as RGB.
     Velocity = 1,
+    // Shows the same, composited over the frame.
     VelocityOverGameplay = 2,
+    // Shows frame and depth over normals and specular, in raw channels except
+    // log-scaled depth. A quadrant whose surface was not refreshed this frame
+    // gets a red border. Without normals and specular (`MV_SURFACES`), the
+    // grid shows only its top row.
     GBufferGrid = 3,
     Count = 4
 };
