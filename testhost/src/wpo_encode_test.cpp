@@ -87,6 +87,7 @@ bool Check(HRESULT hr, const char* what) {
         printf("[wpo-encode-test] FAILED %s: 0x%08lX\n", what, static_cast<unsigned long>(hr));
         return false;
     }
+
     return true;
 }
 
@@ -95,6 +96,7 @@ bool WriteFileBytes(const std::string& path, const void* data, size_t bytes) {
     if (!f) {
         return false;
     }
+
     f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
     return f.good();
 }
@@ -117,6 +119,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "D3D12CreateDevice")) {
         return 1;
     }
+
     ComPtr<ID3D12InfoQueue> infoQueue;
     device.As(&infoQueue);
 
@@ -126,11 +129,13 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue)), "CreateCommandQueue")) {
         return 1;
     }
+
     ComPtr<ID3D12CommandAllocator> allocator;
     if (!Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
                "CreateCommandAllocator")) {
         return 1;
     }
+
     ComPtr<ID3D12GraphicsCommandList> cmdList;
     if (!Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                                           IID_PPV_ARGS(&cmdList)),
@@ -148,8 +153,10 @@ int RunWpoEncodeTest(const std::string& outputDir) {
         if (rootError) {
             printf("[wpo-encode-test] %s\n", static_cast<const char*>(rootError->GetBufferPointer()));
         }
+
         return 1;
     }
+
     ComPtr<ID3D12RootSignature> rootSignature;
     if (!Check(device->CreateRootSignature(0, rootBlob->GetBufferPointer(), rootBlob->GetBufferSize(),
                                             IID_PPV_ARGS(&rootSignature)),
@@ -174,6 +181,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
                error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown");
         return 1;
     }
+
     hr = D3DCompile(kShaderSource, strlen(kShaderSource), "wpo_encode_test", macros, nullptr, "PSMain", "ps_5_0", 0,
                      0, &psBlob, &error);
     if (FAILED(hr)) {
@@ -229,6 +237,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap)), "CreateDescriptorHeap(RTV)")) {
         return 1;
     }
+
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(renderTarget.Get(), nullptr, rtv);
 
@@ -288,6 +297,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(cmdList->Close(), "cmdList->Close")) {
         return 1;
     }
+
     ID3D12CommandList* lists[] = {cmdList.Get()};
     queue->ExecuteCommandLists(1, lists);
 
@@ -295,12 +305,14 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence")) {
         return 1;
     }
+
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     queue->Signal(fence.Get(), 1);
     if (fence->GetCompletedValue() < 1) {
         fence->SetEventOnCompletion(1, event);
         WaitForSingleObject(event, INFINITE);
     }
+
     CloseHandle(event);
 
     // A shader with no vertex buffer and no bound resources is the kind of path
@@ -320,6 +332,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
                 ++errors;
             }
         }
+
         infoQueue->ClearStoredMessages();
     }
 
@@ -327,6 +340,7 @@ int RunWpoEncodeTest(const std::string& outputDir) {
     if (!Check(readback->Map(0, nullptr, &mapped), "readback->Map")) {
         return 1;
     }
+
     CreateDirectoryA(outputDir.c_str(), nullptr);
     const std::string binPath = outputDir + "\\wpo_vel_00000.bin";
     const bool wroteBin = WriteFileBytes(binPath, mapped, static_cast<size_t>(totalBytes));

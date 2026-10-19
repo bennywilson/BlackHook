@@ -34,6 +34,7 @@ void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
     {
         return;
     }
+
     {
         std::lock_guard<std::mutex> lock(seenMutex_);
         if (!seen_.insert(resource).second)
@@ -41,6 +42,7 @@ void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
             return;
         }
     }
+
     if (identifyBudget_.fetch_sub(1, std::memory_order_relaxed) <= 0)
     {
         if (!budgetExhaustionReported_.exchange(true))
@@ -48,8 +50,10 @@ void SurfaceRegistry::ConsiderResource(ID3D12Resource* resource) noexcept
             Log("registry: identification budget of " + std::to_string(kIdentifyBudget) +
                 " resources is spent; resources created from now on are not examined until a reopen.");
         }
+
         return;
     }
+
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     profileStore_.EnsureProfiled(resource, desc);
     for (Entry& e : entries_)
@@ -84,6 +88,7 @@ SurfaceRegistry::Entry* SurfaceRegistry::FindEntry(const char* name) noexcept
             return &e;
         }
     }
+
     return nullptr;
 }
 
@@ -96,6 +101,7 @@ SurfaceRegistry::Entry* SurfaceRegistry::FindEntry(const SurfaceIdentifier* iden
             return &e;
         }
     }
+
     return nullptr;
 }
 
@@ -107,6 +113,7 @@ void SurfaceRegistry::Configure() noexcept
         e.identifier->SetKnownSourceExclusion(&knownSources_);
         e.identifier->SetMutualExclusion(this);
     }
+
     diag_ = DiagEnabled();
     velocity_ = Find("velocity");
     depth_ = Find("depth");
@@ -118,6 +125,7 @@ void SurfaceRegistry::Configure() noexcept
             optionals_.push_back(e.identifier);
         }
     }
+
     for (const Entry& e : entries_)
     {
         const SurfaceSpec& spec = e.identifier->Spec();
@@ -126,6 +134,7 @@ void SurfaceRegistry::Configure() noexcept
             sharedCallSignals_ = sharedCallSignals_ || spec.signals[i].id == SignalId::SharesCallWithEdge;
         }
     }
+
     // Second pass, once every identifier has a stable address: resolve each
     // `spec.extentFrom` and record the reverse edge for the reopen cascade.
     for (Entry& e : entries_)
@@ -135,6 +144,7 @@ void SurfaceRegistry::Configure() noexcept
         {
             continue;
         }
+
         Entry* source = FindEntry(extentFrom);
         if (source == nullptr)
         {
@@ -142,6 +152,7 @@ void SurfaceRegistry::Configure() noexcept
                 "\", which is not a registered surface - extent dependency NOT wired");
             continue;
         }
+
         e.identifier->SetExtentSource(source->identifier);
         e.extentSource = source->identifier;
         source->dependents.push_back(e.identifier);
@@ -189,6 +200,7 @@ int SurfaceRegistry::OnBarrierTransition(
             {
                 continue;
             }
+
             if (id->ValidateCandidate(resource))
             {
                 if (count < outCapacity)
@@ -209,6 +221,7 @@ int SurfaceRegistry::OnBarrierTransition(
             id->MarkCandidate(resource, resource->GetDesc());
         }
     }
+
     return count;
 }
 
@@ -234,6 +247,7 @@ void SurfaceRegistry::OnFrame(uint64_t frame) noexcept
     {
         DumpBarrierProfiles();
     }
+
     if (diag_ && !optionals_.empty() && (frame == 600 || frame == kProfileDumpFrame))
     {
         DumpBatchStats(frame);
@@ -262,6 +276,7 @@ void SurfaceRegistry::OnBarrierBatch(
             {
                 continue;
             }
+
             for (int e = 0; e < kTriggerEdgeCount; ++e)
             {
                 perEdge[e] += IsTriggerEdgeFor(kEdges[e], static_cast<int>(barriers[i].Transition.StateBefore),
@@ -270,6 +285,7 @@ void SurfaceRegistry::OnBarrierBatch(
                                   : 0;
             }
         }
+
         if (perEdge[0] + perEdge[1] >= 2) // a lone edge shares its call with nothing
         {
             for (UINT i = 0; i < count; ++i)
@@ -278,6 +294,7 @@ void SurfaceRegistry::OnBarrierBatch(
                 {
                     continue;
                 }
+
                 const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
                 for (int own = 0; own < kTriggerEdgeCount; ++own)
                 {
@@ -285,6 +302,7 @@ void SurfaceRegistry::OnBarrierBatch(
                     {
                         continue;
                     }
+
                     for (int other = 0; other < kTriggerEdgeCount; ++other)
                     {
                         if (perEdge[other] - (own == other ? 1 : 0) > 0)
@@ -302,6 +320,7 @@ void SurfaceRegistry::OnBarrierBatch(
     {
         return;
     }
+
     // Only once velocity and depth are both selected; before that, "not in a
     // call with velocity's edge" means nothing.
     if (velocity_->Selected() == nullptr || depth_->Selected() == nullptr)
@@ -320,6 +339,7 @@ void SurfaceRegistry::OnBarrierBatch(
         {
             continue;
         }
+
         const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
         const int before = static_cast<int>(t.StateBefore);
         const int after = static_cast<int>(t.StateAfter);
@@ -334,6 +354,7 @@ void SurfaceRegistry::OnBarrierBatch(
             }
         }
     }
+
     if (rtToSrv == 0)
     {
         return; // the common case: nothing here an optional surface's candidate could be part of
@@ -345,18 +366,21 @@ void SurfaceRegistry::OnBarrierBatch(
         {
             continue;
         }
+
         const D3D12_RESOURCE_TRANSITION_BARRIER& t = barriers[i].Transition;
         if (!IsTriggerEdgeFor(TriggerEdge::RenderTargetToShaderResource, static_cast<int>(t.StateBefore),
                               static_cast<int>(t.StateAfter)))
         {
             continue;
         }
+
         for (SurfaceIdentifier* optional : optionals_)
         {
             if (!optional->IsShortlisted(t.pResource))
             {
                 continue;
             }
+
             if (candidateEdgeObserver_ != nullptr)
             {
                 UINT64 width = 0;
@@ -367,10 +391,12 @@ void SurfaceRegistry::OnBarrierBatch(
                     candidateEdgeObserver_(optional->Spec().name, cmdList, t.pResource, static_cast<int>(t.StateAfter));
                 }
             }
+
             if (!diag_)
             {
                 continue;
             }
+
             std::lock_guard<std::mutex> lock(batchMutex_);
             BatchStats& s = batchStats_[{optional, t.pResource}];
             ++s.edges;
@@ -378,6 +404,7 @@ void SurfaceRegistry::OnBarrierBatch(
             {
                 s.withSurface[e] += (trackedIn[e] != nullptr && trackedIn[e] != t.pResource) ? 1 : 0;
             }
+
             s.otherRtToSrv += rtToSrv - 1;
             s.maxOtherRtToSrv = std::max<uint64_t>(s.maxOtherRtToSrv, rtToSrv - 1);
         }
@@ -396,6 +423,7 @@ void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
         {
             return "anyDepth=-";
         }
+
         return "anyDepth=" +
                std::to_string(p.triggerEdgesSharingCallWith[rt][depth] * 100 / p.triggerEdgeCountByEdge[rt]) + "%";
     };
@@ -411,6 +439,7 @@ void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
             {
                 continue;
             }
+
             ID3D12Resource* resource = key.second;
             BarrierProfile p;
             const bool known = profileStore_.Get(resource, &p);
@@ -424,12 +453,14 @@ void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
                 {
                     continue;
                 }
+
                 shares += std::string(id->Spec().name) + "=" + pct(s.withSurface[e]) + " ";
                 if (resource == id->Selected() || id->IsCandidate(resource))
                 {
                     heldBy += std::string(" [") + id->Spec().name + "'s]";
                 }
             }
+
             char avg[32];
             snprintf(avg, sizeof(avg), "%.2f", s.edges ? static_cast<double>(s.otherRtToSrv) / s.edges : 0.0);
             Log(prefix + "   " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
@@ -440,6 +471,7 @@ void SurfaceRegistry::DumpBatchStats(uint64_t frame) noexcept
                 " | avgOtherRtToSrvInCall=" + avg + " max=" + std::to_string(s.maxOtherRtToSrv));
         }
     }
+
     FlushLogs();
 }
 
@@ -453,6 +485,7 @@ void SurfaceRegistry::NoteBackBufferSize(uint64_t width, uint32_t height) noexce
             // track the back buffer itself.
             continue;
         }
+
         if (e.identifier->NoteBackBufferSize(width, height))
         {
             ReopenCascade(
@@ -468,6 +501,7 @@ void SurfaceRegistry::NoteKnownSourceResource(ID3D12Resource* resource) noexcept
     {
         return; // already known: the usual case, every Present
     }
+
     // Newly known: purge it from any shortlist that got it first.
     for (Entry& e : entries_)
     {
@@ -501,6 +535,7 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
     {
         return;
     }
+
     std::vector<Entry*> cascade;
     CollectCascade(root, &cascade);
 
@@ -522,6 +557,7 @@ void SurfaceRegistry::ReopenCascade(const char* rootName, ReopenReason reason, c
                 reason == ReopenReason::Requested ? ReopenReason::Requested : ReopenReason::DependencyReopened,
                 dependentDetail.c_str());
         }
+
         // For every identifier in the cascade, root or dependent; the observer
         // decides whether a dependent's reopen matters (depth's, per burst).
         if (reopenObserver_ != nullptr)
@@ -544,11 +580,13 @@ const char* SurfaceRegistry::HeldByOther(ID3D12Resource* resource, const Surface
         {
             continue;
         }
+
         if (e.identifier->IsCandidate(resource))
         {
             return e.identifier->Spec().name;
         }
     }
+
     return nullptr;
 }
 
@@ -561,6 +599,7 @@ bool SurfaceRegistry::IsAnyCandidate(ID3D12Resource* resource) const noexcept
             return true;
         }
     }
+
     return false;
 }
 

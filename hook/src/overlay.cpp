@@ -103,6 +103,7 @@ float4 GBufferGrid(float2 uv)
         if (uv.y < 0.25 || uv.y >= 0.75) return float4(0.0.xxx, 1.0);
         uv.y -= 0.25;
     }
+
     float2 cell = floor(uv * 2.0);
     float2 local = frac(uv * 2.0);
     int index = (int)(cell.y * 2.0 + cell.x);
@@ -140,6 +141,7 @@ float4 GBufferGrid(float2 uv)
     {
         c = FetchAt(Specular, local).rgb; // R metallic, G specular, B roughness
     }
+
     return float4(c, 1.0);
 }
 
@@ -204,6 +206,7 @@ float4 ModeColor(VSOut i)
     {
         return float4(written ? raw : 0.0.xxx, 1.0);
     }
+
     return float4(written ? lerp(scene, raw, Blend) : scene, 1.0);
 }
 
@@ -382,6 +385,7 @@ bool CompileShaders(ComPtr<ID3DBlob>& vs, ComPtr<ID3DBlob>& ps)
             (error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown"));
         return false;
     }
+
     hr = D3DCompile(
         kShaderSource, strlen(kShaderSource), "overlay", nullptr, nullptr, "PSMain", "ps_5_0", flags, 0, &ps, &error);
     if (FAILED(hr))
@@ -390,6 +394,7 @@ bool CompileShaders(ComPtr<ID3DBlob>& vs, ComPtr<ID3DBlob>& ps)
             (error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown"));
         return false;
     }
+
     return true;
 }
 
@@ -435,6 +440,7 @@ bool CreateRootSignature()
             (error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown"));
         return false;
     }
+
     hr = g_device->CreateRootSignature(
         0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_rootSignature));
     return SUCCEEDED(hr);
@@ -491,6 +497,7 @@ bool CreatePanel()
     {
         return false;
     }
+
     CreateSrvFor(g_panelTex.Get(), DXGI_FORMAT_R8_UNORM, kPanelSrv);
 
     D3D12_HEAP_PROPERTIES uploadHeap{};
@@ -513,6 +520,7 @@ bool CreatePanel()
         {
             return false;
         }
+
         f.panelMapped = static_cast<uint8_t*>(mapped);
     }
 
@@ -551,6 +559,7 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     blend.LogicOp = D3D12_LOGIC_OP_NOOP;
     blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
     pso.SampleMask = UINT_MAX;
     pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -576,6 +585,7 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     {
         return false;
     }
+
     g_srvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // One RTV per in-flight frame: a descriptor must outlive every command list
@@ -588,6 +598,7 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
     {
         return false;
     }
+
     g_rtvDescriptorSize = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     for (UINT i = 0; i < kSrvCount; ++i)
@@ -602,6 +613,7 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
         {
             return false;
         }
+
         if (FAILED(g_device->CreateCommandList(
                 0,
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -611,6 +623,7 @@ bool Initialise(ID3D12Device* device, DXGI_FORMAT backBufferFormat)
         {
             return false;
         }
+
         g_frames[i].commandList->Close();
     }
 
@@ -647,6 +660,7 @@ bool WaitForOverlayFence(UINT64 target, DWORD timeoutMs)
     {
         WaitForSingleObject(event, timeoutMs);
     }
+
     CloseHandle(event);
     return g_fence->GetCompletedValue() >= target;
 }
@@ -674,6 +688,7 @@ void Transition(
     {
         return;
     }
+
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = resource;
@@ -735,6 +750,7 @@ void UpdatePanel(FrameResources& fr, ID3D12GraphicsCommandList* list, int mode)
     {
         return;
     }
+
     g_panelCheckedAt = now;
 
     const std::string text = PanelStatusText(mode);
@@ -742,6 +758,7 @@ void UpdatePanel(FrameResources& fr, ID3D12GraphicsCommandList* list, int mode)
     {
         return;
     }
+
     g_panelText = text;
 
     memset(g_panelBits, 0, static_cast<size_t>(kPanelWidth) * kPanelHeight * sizeof(uint32_t));
@@ -754,6 +771,7 @@ void UpdatePanel(FrameResources& fr, ID3D12GraphicsCommandList* list, int mode)
                  static_cast<int>(end - start));
         start = end + 1;
     }
+
     GdiFlush();
 
     // White text: every channel holds the coverage.
@@ -789,6 +807,7 @@ void StartOverlayHotkeyThread()
     {
         return;
     }
+
     // `MV_OVERLAY=<mode>`: start in that mode (for mv_testhost, which cannot
     // press F7).
     char initial[8]{};
@@ -807,6 +826,7 @@ void StartOverlayHotkeyThread()
                 std::to_string(static_cast<int>(OverlayMode::Count) - 1) + " - ignored, starting off");
         }
     }
+
     g_hotkeyThread = std::thread(
         []
         {
@@ -834,6 +854,7 @@ void StopOverlayHotkeyThread()
     {
         return;
     }
+
     // Detach, never join: see `g_hotkeyThread`.
     g_hotkeyThread.detach();
 }
@@ -896,11 +917,13 @@ void OverlayCaptureSurface(
             WaitForOverlayIdle();
             copy.tex.Reset();
         }
+
         if (!CreateMatchingTexture(desc, copy.tex))
         {
             Log(std::string("overlay: failed to create ") + kSurfaceNames[index] + " copy texture");
             return;
         }
+
         copy.desc = desc;
         CreateSrvFor(copy.tex.Get(), srvFormat, index);
         Log(std::string("overlay: ") + kSurfaceNames[index] + " copy texture created " +
@@ -942,12 +965,14 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     {
         return;
     }
+
     ComPtr<ID3D12Resource> backBuffer;
     const UINT index = swapChain3->GetCurrentBackBufferIndex();
     if (FAILED(swapChain3->GetBuffer(index, IID_PPV_ARGS(&backBuffer))) || backBuffer == nullptr)
     {
         return;
     }
+
     const D3D12_RESOURCE_DESC backDesc = backBuffer->GetDesc();
 
     // A back-buffer format change also invalidates the pipeline's RTV format:
@@ -961,6 +986,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         {
             copy = SourceCopy{};
         }
+
         g_pipelineState.Reset();
         g_rootSignature.Reset();
         g_srvHeap.Reset();
@@ -974,6 +1000,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
             f.panelMapped = nullptr;
             f.fenceValue = 0;
         }
+
         g_fence.Reset();
         g_initialised = false;
     }
@@ -985,12 +1012,14 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         {
             return;
         }
+
         if (!Initialise(device.Get(), backDesc.Format))
         {
             g_initFailed = true;
             Log("overlay: initialisation failed, overlay disabled");
             return;
         }
+
         g_initialised = true;
     }
 
@@ -1003,10 +1032,12 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
             WaitForOverlayIdle();
             g_sceneColorTex.Reset();
         }
+
         if (!CreateMatchingTexture(backDesc, g_sceneColorTex))
         {
             return;
         }
+
         g_sceneColorDesc = backDesc;
         CreateSrvFor(g_sceneColorTex.Get(), backDesc.Format, kSurfaceColor);
     }
@@ -1042,6 +1073,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
             ++g_freshCount;
             g_staleRun = 0;
         }
+
         if (copyAge != UINT64_MAX && copyAge > g_maxCopyAge)
         {
             g_maxCopyAge = copyAge;
@@ -1075,8 +1107,10 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
                 "finished the overlay's work from " + std::to_string(kFrames) + " presents earlier within " +
                 std::to_string(kSlotWaitMs) + " ms");
         }
+
         return;
     }
+
     g_frame++;
 
     if (FAILED(fr.allocator->Reset()) || FAILED(fr.commandList->Reset(fr.allocator.Get(), nullptr)))
@@ -1118,6 +1152,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
         scissor.right = std::min<LONG>(scissor.right, 16 + kPanelWidth);
         scissor.bottom = std::min<LONG>(scissor.bottom, 16 + kPanelHeight);
     }
+
     list->RSSetViewports(1, &viewport);
     list->RSSetScissorRects(1, &scissor);
 
@@ -1154,6 +1189,7 @@ void OverlayOnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, uint
     {
         return;
     }
+
     ID3D12CommandList* lists[] = {list};
     if (g_originalExecuteCommandLists != nullptr)
     {

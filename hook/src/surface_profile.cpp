@@ -120,8 +120,10 @@ T Lookup(const Named<T> (&table)[N], const std::string& name, const char* what, 
         {
             return entry.value;
         }
+
         known += (known.empty() ? "" : ", ") + std::string(entry.name);
     }
+
     Fail(path + ": unknown " + what + " '" + name + "' (known: " + known + ")");
 }
 
@@ -134,6 +136,7 @@ const char* FormatName(DXGI_FORMAT format)
             return entry.name;
         }
     }
+
     return "?";
 }
 
@@ -170,6 +173,7 @@ public:
         {
             Fail(path_ + ": missing required field '" + key + "'");
         }
+
         return *value;
     }
 
@@ -180,12 +184,14 @@ public:
         {
             Fail(Path(key) + ": expected an integer");
         }
+
         const int64_t v = value.get<int64_t>();
         if (v < lo || v > hi)
         {
             Fail(Path(key) + ": " + std::to_string(v) + " is outside [" + std::to_string(lo) + ", " +
                  std::to_string(hi) + "]");
         }
+
         return v;
     }
 
@@ -196,6 +202,7 @@ public:
         {
             Fail(Path(key) + ": expected a string");
         }
+
         return value.get<std::string>();
     }
 
@@ -206,6 +213,7 @@ public:
         {
             Fail(Path(key) + ": expected true or false");
         }
+
         return value.get<bool>();
     }
 
@@ -232,6 +240,7 @@ UINT ParseFlags(const json& value, const std::string& path)
     {
         Fail(path + ": expected an array of flag names");
     }
+
     UINT flags = 0;
     for (size_t i = 0; i < value.size(); ++i)
     {
@@ -240,8 +249,10 @@ UINT ParseFlags(const json& value, const std::string& path)
         {
             Fail(at + ": expected a flag name");
         }
+
         flags |= Lookup(kFlags, value[i].get<std::string>(), "resource flag", at);
     }
+
     return flags;
 }
 
@@ -258,6 +269,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
     {
         Fail(f.Path("formats") + ": expected 1.." + std::to_string(std::size(spec.formats)) + " format entries");
     }
+
     for (size_t i = 0; i < formats.size(); ++i)
     {
         Fields ff(formats[i], f.Path("formats") + "[" + std::to_string(i) + "]");
@@ -273,14 +285,17 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
                 Fail(ff.Path("format") + ": " + FormatName(candidate.format) + " is listed twice");
             }
         }
+
         spec.formats[spec.formatCount++] = candidate;
     }
+
     spec.requiredFlags = ParseFlags(f.Required("required_flags"), f.Path("required_flags"));
     spec.forbiddenFlags = ParseFlags(f.Required("forbidden_flags"), f.Path("forbidden_flags"));
     if ((spec.requiredFlags & spec.forbiddenFlags) != 0)
     {
         Fail(path + ": a flag is both required and forbidden, so nothing could ever pass");
     }
+
     spec.minWidth = static_cast<UINT64>(f.Int("min_width", 0, 1 << 16));
     spec.minHeight = static_cast<UINT>(f.Int("min_height", 0, 1 << 16));
     spec.maxBackBufferMultiple = static_cast<uint8_t>(f.Int("max_back_buffer_multiple", 0, 255));
@@ -292,6 +307,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         {
             Fail(f.Path("extent_from") + ": expected the name of another surface");
         }
+
         spec.extentFrom = Intern(extentFrom->get<std::string>());
     }
 
@@ -306,6 +322,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
     {
         Fail(f.Path("signals") + ": expected 0.." + std::to_string(std::size(spec.signals)) + " signal entries");
     }
+
     for (size_t i = 0; i < signals.size(); ++i)
     {
         Fields sf(signals[i], f.Path("signals") + "[" + std::to_string(i) + "]");
@@ -320,6 +337,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
             signal.edge = Lookup(kTriggers, sf.String("edge"), "edge", sf.Path("edge"));
             signal.minPercent = static_cast<int>(sf.Int("min_percent", 1, 100));
         }
+
         sf.RejectUnknown();
         for (uint8_t j = 0; j < spec.signalCount; ++j)
         {
@@ -331,6 +349,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
                 Fail(sf.Path("signal") + ": '" + signalName + "' is listed twice");
             }
         }
+
         spec.signals[spec.signalCount++] = signal;
     }
 
@@ -354,8 +373,10 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
             {
                 Fail(rival.Path("same_descriptor") + ": expected true or false");
             }
+
             spec.rivalSameDescriptor = same->get<bool>();
         }
+
         rival.RejectUnknown();
     }
 
@@ -370,6 +391,7 @@ SurfaceSpec ParseSurface(const json& obj, const std::string& name, const std::st
         {
             Fail(f.Path("enabled") + ": expected true or false");
         }
+
         spec.enabled = enabled->get<bool>();
     }
 
@@ -404,22 +426,27 @@ void AddProfiles(ProfileSet& set, const std::string& text, const std::string& so
         {
             Fail(top.Path("default_profile") + ": expected a profile name");
         }
+
         set.defaultProfile = defaultProfile->get<std::string>();
     }
+
     const json& profiles = top.Required("profiles");
     if (!profiles.is_object())
     {
         Fail(top.Path("profiles") + ": expected an object of named profiles");
     }
+
     for (auto it = profiles.begin(); it != profiles.end(); ++it)
     {
         if (set.profiles.contains(it.key()))
         {
             Log("profile: '" + it.key() + "' from " + source + " replaces the one from " + set.sourceOf[it.key()]);
         }
+
         set.profiles[it.key()] = it.value();
         set.sourceOf[it.key()] = source;
     }
+
     top.RejectUnknown();
 }
 
@@ -432,6 +459,7 @@ json Resolve(const ProfileSet& set, const std::string& name, int depth)
     {
         Fail("profile '" + name + "': 'extends' chain is deeper than 8 - is there a cycle?");
     }
+
     const auto it = set.profiles.find(name);
     if (it == set.profiles.end())
     {
@@ -440,22 +468,27 @@ json Resolve(const ProfileSet& set, const std::string& name, int depth)
         {
             known += (known.empty() ? "" : ", ") + p.key();
         }
+
         Fail("no profile named '" + name + "' (have: " + known + ")");
     }
+
     json profile = *it;
     if (!profile.is_object())
     {
         Fail("profile '" + name + "': expected an object");
     }
+
     const auto extends = profile.find("extends");
     if (extends == profile.end())
     {
         return profile;
     }
+
     if (!extends->is_string())
     {
         Fail("profile '" + name + "'.extends: expected a profile name");
     }
+
     // A same-named profile from MV_PROFILE_FILE has already replaced the
     // embedded one, so it would find itself as its parent.
     if (extends->get<std::string>() == name)
@@ -463,6 +496,7 @@ json Resolve(const ProfileSet& set, const std::string& name, int depth)
         Fail("profile '" + name + "' extends itself - to patch the embedded '" + name +
              "', give the patch a new name");
     }
+
     json resolved = Resolve(set, extends->get<std::string>(), depth + 1);
     profile.erase("extends");
     resolved.merge_patch(profile);
@@ -477,6 +511,7 @@ std::string EnvVar(const char* name)
     {
         return {};
     }
+
     return std::string(buffer, length);
 }
 
@@ -487,6 +522,7 @@ std::string ReadFile(const std::string& path)
     {
         Fail("MV_PROFILE_FILE: cannot open '" + path + "'");
     }
+
     std::ostringstream text;
     text << in.rdbuf();
     return text.str();
@@ -500,6 +536,7 @@ std::string Summary(const SurfaceSpec& spec)
         line += (i ? ", " : "") + std::string(FormatName(spec.formats[i].format)) + "=" +
                 std::to_string(spec.formats[i].score);
     }
+
     char flags[64];
     snprintf(flags, sizeof(flags), "], required_flags=0x%X, forbidden_flags=0x%X", spec.requiredFlags,
              spec.forbiddenFlags);
@@ -510,6 +547,7 @@ std::string Summary(const SurfaceSpec& spec)
     {
         line += ", extent_from=" + std::string(spec.extentFrom);
     }
+
     return line;
 }
 
@@ -543,6 +581,7 @@ void Load()
                 Fail("MV_ENGINE_VERSION='" + version +
                      "' is not major.minor, so no profile can be derived from it - fix it, or set MV_PROFILE");
             }
+
             name = "ue" + std::to_string(major) + "." + std::to_string(minor) + "-generic";
             selectedBy = "MV_ENGINE_VERSION=" + version;
         }
@@ -552,6 +591,7 @@ void Load()
             {
                 Fail("neither MV_PROFILE nor MV_ENGINE_VERSION is set, and no default_profile is defined");
             }
+
             name = set.defaultProfile;
             selectedBy = "default_profile";
         }
@@ -567,6 +607,7 @@ void Load()
             Fail(profile.Path("description") + ": expected a string");
         }
     }
+
     const json& surfacesJson = profile.Required("surfaces");
     Fields surfaces(surfacesJson, profile.Path("surfaces"));
     // velocity and depth are required and always on: every dump is keyed off
@@ -581,6 +622,7 @@ void Load()
             Fail(surfaces.Path(spec->name) + ".enabled: " + spec->name + " cannot be disabled");
         }
     }
+
     for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
     {
         const char* optionalName = kSurfaceNames[kFirstOptionalSurface + i];
@@ -591,6 +633,7 @@ void Load()
             g_profile.optional[i].present = true;
         }
     }
+
     surfaces.RejectUnknown();
     profile.RejectUnknown();
 
@@ -606,6 +649,7 @@ void Load()
         {
             Fail("MV_IDENTIFY_FRAMES='" + identifyFrames + "' is not a frame count in [1, 1000000]");
         }
+
         g_profile.velocity.settleFrames = frames;
         g_profile.overrides = "velocity.settle_frames=" + std::to_string(frames) + " (MV_IDENTIFY_FRAMES)";
     }
@@ -620,6 +664,7 @@ void Load()
         {
             continue;
         }
+
         SurfaceProfile::OptionalSurface* target = nullptr;
         std::string known;
         for (int i = 0; i < SurfaceProfile::kOptionalSurfaceCount; ++i)
@@ -630,14 +675,17 @@ void Load()
                 target = &g_profile.optional[i];
             }
         }
+
         if (target == nullptr)
         {
             Fail("MV_SURFACES names '" + surface + "' - only optional surfaces can be opted into (" + known + ")");
         }
+
         if (!target->present)
         {
             Fail("MV_SURFACES=" + surface + ", but " + path + " has no " + surface + " spec");
         }
+
         if (!target->spec.enabled)
         {
             target->spec.enabled = true;
@@ -653,6 +701,7 @@ void Load()
             all.push_back(&optional.spec);
         }
     }
+
     // Only the always-registered surfaces can be an extent source.
     const auto specNamed = [&](const char* name) -> const SurfaceSpec*
     {
@@ -663,6 +712,7 @@ void Load()
                 return spec;
             }
         }
+
         return nullptr;
     };
     for (const SurfaceSpec* spec : all)
@@ -676,10 +726,12 @@ void Load()
             {
                 Fail(path + ": " + s->name + ".extent_from names '" + s->extentFrom + "', which is not a surface");
             }
+
             if (hops == all.size())
             {
                 Fail(path + ": " + spec->name + "'s extent_from chain loops back on itself");
             }
+
             s = source;
         }
     }
@@ -712,10 +764,12 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
                                                  "]"));
             }
         }
+
         if (!g_profile.overrides.empty())
         {
             Log("profile:   override: " + g_profile.overrides);
         }
+
         return &g_profile;
     }
     catch (const std::exception& e)
@@ -727,6 +781,7 @@ const SurfaceProfile* LoadSurfaceProfile() noexcept
     {
         Log("profile: FAILED with an unknown exception. Surface identification is DISABLED for this session.");
     }
+
     return nullptr;
 }
 
@@ -739,6 +794,7 @@ const SurfaceSpec* SurfaceProfile::Optional(const char* surfaceName) const noexc
             return &optional[i].spec;
         }
     }
+
     return nullptr;
 }
 

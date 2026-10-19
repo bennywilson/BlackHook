@@ -97,6 +97,7 @@ public:
     {
         return sharedCallSignals_ || (!optionals_.empty() && (diag_ || candidateEdgeObserver_ != nullptr));
     }
+
     void OnBarrierBatch(ID3D12GraphicsCommandList* cmdList, const D3D12_RESOURCE_BARRIER* barriers, UINT count) noexcept;
 
     // `MV_SNAPSHOT`: each RT -> SRV edge of a resource an optional surface has

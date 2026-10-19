@@ -29,6 +29,7 @@ const std::string& OutputRoot()
         {
             return std::string(kOutputRoot) + "/";
         }
+
         char tempPath[MAX_PATH]{};
         GetTempPathA(MAX_PATH, tempPath);
         return std::string(tempPath);
@@ -78,6 +79,7 @@ NamedFile* FileFor(const std::string& name)
         nf.stream.open(OutputDir("logs") + "mv_" + name + ".log", std::ios::app);
         it = files.emplace(name, std::move(nf)).first;
     }
+
     return it->second.stream.is_open() ? &it->second : nullptr;
 }
 
@@ -98,6 +100,7 @@ void Log(const std::string& message)
     {
         return;
     }
+
     f->stream << "[" << Timestamp() << "] " << message << "\n";
     f->stream.flush();
 }
@@ -110,6 +113,7 @@ void LogTo(const std::string& name, const std::string& message)
     {
         return;
     }
+
     f->stream << "[" << Timestamp() << "] " << message << "\n";
     if (++f->unflushed >= kFlushEvery)
     {

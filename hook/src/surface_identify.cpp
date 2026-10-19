@@ -23,6 +23,7 @@ std::string StateName(int state)
     {
         return "COMMON/PRESENT";
     }
+
     struct Bit
     {
         int value;
@@ -58,10 +59,12 @@ std::string StateName(int state)
             remaining &= ~bit.value;
         }
     }
+
     if (remaining != 0 || out.empty())
     {
         out += (out.empty() ? "" : "|") + std::string("0x") + std::to_string(remaining);
     }
+
     return out;
 }
 
@@ -84,6 +87,7 @@ bool IsTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfter) noex
         case TriggerEdge::DepthWriteToReadable:
             return stateBefore == D3D12_RESOURCE_STATE_DEPTH_WRITE && IsDepthReadableState(stateAfter);
     }
+
     return false;
 }
 
@@ -97,6 +101,7 @@ bool IsReverseTriggerEdgeFor(TriggerEdge trigger, int stateBefore, int stateAfte
             // Depth's reverse edge (readable -> DEPTH_WRITE) is not tracked.
             return false;
     }
+
     return false;
 }
 
@@ -111,6 +116,7 @@ void BarrierProfileStore::EnsureProfiled(ID3D12Resource* resource, const D3D12_R
     {
         return;
     }
+
     BarrierProfile p;
     p.width = desc.Width;
     p.height = desc.Height;
@@ -138,14 +144,17 @@ bool BarrierProfileStore::RecordTransition(ID3D12Resource* resource, uint64_t fr
             {
                 ++p.framesWithExactlyTwo;
             }
+
             if (p.eventsThisFrame % 2 == 0)
             {
                 ++p.framesWithEvenCount;
             }
         }
+
         p.eventsThisFrame = 0;
         p.lastFrame = frame;
     }
+
     ++p.eventsThisFrame;
     ++p.transitions;
 
@@ -159,6 +168,7 @@ bool BarrierProfileStore::RecordTransition(ID3D12Resource* resource, uint64_t fr
             break;
         }
     }
+
     if (!recorded && p.pairsUsed < BarrierProfile::kMaxPairs)
     {
         p.pairs[p.pairsUsed].before = stateBefore;
@@ -193,6 +203,7 @@ bool BarrierProfileStore::RecordTransition(ID3D12Resource* resource, uint64_t fr
     {
         ++p.alternationViolations;
     }
+
     p.lastAfter = stateAfter;
 
     return true;
@@ -216,6 +227,7 @@ bool BarrierProfileStore::Get(ID3D12Resource* resource, BarrierProfile* out) con
     {
         return false;
     }
+
     *out = it->second;
     return true;
 }
@@ -269,6 +281,7 @@ bool KnownSourceSet::Note(ID3D12Resource* resource) noexcept
     {
         return false;
     }
+
     for (auto& slot : resources_)
     {
         ID3D12Resource* expected = nullptr;
@@ -276,11 +289,13 @@ bool KnownSourceSet::Note(ID3D12Resource* resource) noexcept
         {
             return true;
         }
+
         if (expected == resource)
         {
             return false; // raced with another Note() of the same pointer
         }
     }
+
     // Full. Each `ResizeBuffers` returns new buffer pointers, so the set fills
     // after a few resizes. Evict round-robin: the oldest entries are buffers a
     // resize already freed, while a current back buffer left searchable would
@@ -296,6 +311,7 @@ bool KnownSourceSet::Contains(ID3D12Resource* resource) const noexcept
     {
         return false;
     }
+
     for (const auto& slot : resources_)
     {
         if (slot.load(std::memory_order_acquire) == resource)
@@ -303,6 +319,7 @@ bool KnownSourceSet::Contains(ID3D12Resource* resource) const noexcept
             return true;
         }
     }
+
     return false;
 }
 
@@ -357,6 +374,7 @@ bool SurfaceIdentifier::StructurallyPlausible(
             break;
         }
     }
+
     if (*formatScore == 0)
     {
         *rejection = "format is not one this surface's table can return";
@@ -428,6 +446,7 @@ bool SurfaceIdentifier::StructurallyPlausible(
             return false;
         }
     }
+
     return true;
 }
 
@@ -456,6 +475,7 @@ std::string SurfaceIdentifier::ProfileLine(const BarrierProfile& p) const
     const uint64_t otherPairs = p.transitions > triggerEdgeCount + reverseEdgeCount
                                      ? p.transitions - triggerEdgeCount - reverseEdgeCount
                                      : 0;
+
     return "framesSeen=" + std::to_string(p.framesSeen) + " exactly2=" + std::to_string(p.framesWithExactlyTwo) +
            " even=" + std::to_string(p.framesWithEvenCount) + " trigger=" + std::to_string(triggerEdgeCount) +
            " reverse=" + std::to_string(reverseEdgeCount) + " otherPairs=" + std::to_string(otherPairs) +
@@ -471,6 +491,7 @@ std::string SurfaceIdentifier::PairsLine(const BarrierProfile& p)
         out += " " + StateName(p.pairs[i].before) + "->" + StateName(p.pairs[i].after) + "=" +
                std::to_string(p.pairs[i].count);
     }
+
     return out.empty() ? " (none)" : out;
 }
 
@@ -487,6 +508,7 @@ std::pair<UINT64, UINT> SurfaceIdentifier::ModalResolution() const noexcept
             best = size;
         }
     }
+
     return best;
 }
 
@@ -500,6 +522,7 @@ void SurfaceIdentifier::LogResolutionHistogram() const noexcept
             byCount.push_back({count, size});
         }
     }
+
     std::sort(byCount.rbegin(), byCount.rend());
     std::string line = std::string(spec_.logPrefix) + ": render-target resolution histogram (top 6, derived not assumed):";
     for (size_t i = 0; i < byCount.size() && i < 6; ++i)
@@ -507,6 +530,7 @@ void SurfaceIdentifier::LogResolutionHistogram() const noexcept
         line += " " + std::to_string(byCount[i].second.first) + "x" + std::to_string(byCount[i].second.second) + "=" +
                 std::to_string(byCount[i].first);
     }
+
     Log(line);
 }
 
@@ -530,6 +554,7 @@ void SurfaceIdentifier::ConsiderResource(ID3D12Resource* resource, const D3D12_R
             // first when the search finds nothing.
             Log(std::string(spec_.logPrefix) + ": near-miss " + DescLine(resource, desc) + " - rejected: " + rejection);
         }
+
         return;
     }
 
@@ -538,6 +563,7 @@ void SurfaceIdentifier::ConsiderResource(ID3D12Resource* resource, const D3D12_R
     {
         return;
     }
+
     // A reopen can clear the shared "seen" set while this identifier keeps its
     // shortlist (`reopenClearsShortlist` false), so a resource can be offered
     // twice. A second entry would tie with the first in `Decide()`.
@@ -563,6 +589,7 @@ void SurfaceIdentifier::OnTransition(ID3D12Resource* resource, uint64_t frame, b
     {
         return;
     }
+
     ID3D12Resource* selected = identified_.load(std::memory_order_acquire);
     if (resource == selected || resource == identifiedAlt_.load(std::memory_order_acquire) ||
         (selected != nullptr && isCandidate))
@@ -646,6 +673,7 @@ int SurfaceIdentifier::CollectSignals(
                 break;
             }
         }
+
         evaluated[n++] = {name, sw.weight, present};
     }
 
@@ -663,18 +691,21 @@ int SurfaceIdentifier::CollectSignals(
                             std::to_string(formatScore) + "  format is a desktop-tier format";
         }
     }
+
     for (int i = 0; i < n; ++i)
     {
         if (evaluated[i].present)
         {
             total += evaluated[i].weight;
         }
+
         if (signalsLine != nullptr)
         {
             *signalsLine += std::string("\n ") + spec_.logPrefix + ":       [" + (evaluated[i].present ? "x" : " ") +
                             "] +" + std::to_string(evaluated[i].weight) + "  " + evaluated[i].name;
         }
     }
+
     return total;
 }
 
@@ -710,6 +741,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         {
             continue;
         }
+
         const uint64_t triggerEdgeCount = profile.triggerEdgeCountByEdge[edge];
 
         // Behaviour gate: produced and then consumed on at least half the
@@ -747,6 +779,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
             {
                 continue; // dependency hasn't resolved; can't test extent yet
             }
+
             if (desc.Width != extentWidth || desc.Height != extentHeight)
             {
                 Log(std::string(spec_.logPrefix) + ": rejected " + DescLine(resource, desc) +
@@ -784,6 +817,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
                 Log(std::string(spec_.logPrefix) + ":     observed transitions:" + PairsLine(profile));
             }
         }
+
         // Measure the next window fresh. The strict tests are all-or-nothing
         // over cumulative counters, so one stretch of odd behaviour (injecting
         // at a main menu) would fail them for the rest of the session. The
@@ -793,6 +827,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         {
             profileStore_->ResetMeasurement();
         }
+
         decideAtFrame_.store(frame + spec_.settleFrames * 2, std::memory_order_relaxed);
         return;
     }
@@ -809,10 +844,12 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
             {
                 return a.score > b.score;
             }
+
             if (a.triggerEdgeCount != b.triggerEdgeCount)
             {
                 return a.triggerEdgeCount > b.triggerEdgeCount;
             }
+
             return a.profile.transitions > b.profile.transitions;
         });
 
@@ -873,6 +910,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
         decideAtFrame_.store(frame + spec_.settleFrames * 2, std::memory_order_relaxed);
         return;
     }
+
     identifiedWidth_.store(winner.desc.Width, std::memory_order_relaxed);
     identifiedHeight_.store(winner.desc.Height, std::memory_order_relaxed);
     identifiedFormat_.store(static_cast<int>(winner.desc.Format), std::memory_order_relaxed);
@@ -894,6 +932,7 @@ void SurfaceIdentifier::Decide(uint64_t frame) noexcept
             evidenceMask |= 1u << i;
         }
     }
+
     selectedEvidenceMask_.store(evidenceMask, std::memory_order_relaxed);
     Log(std::string(spec_.logPrefix) + ": SELECTED " + DescLine(winner.resource, winner.desc) +
         " | score=" + std::to_string(winner.score) + " | survivors=" + std::to_string(survivors.size()));
@@ -916,6 +955,7 @@ void SurfaceIdentifier::OnFrame(uint64_t frame) noexcept
             // needed after that.
             return;
         }
+
         if (decideAtFrame_.load(std::memory_order_relaxed) == 0)
         {
             decideAtFrame_.store(frame, std::memory_order_relaxed);
@@ -928,6 +968,7 @@ void SurfaceIdentifier::OnFrame(uint64_t frame) noexcept
         // empty profiles.
         decideAtFrame_.store(frame + spec_.settleFrames, std::memory_order_relaxed);
     }
+
     if (!decisionMade_.load(std::memory_order_relaxed) && frame >= decideAtFrame_.load(std::memory_order_relaxed))
     {
         Decide(frame);
@@ -945,6 +986,7 @@ IdentifyState SurfaceIdentifier::State() const noexcept
     {
         return IdentifyState::Selected;
     }
+
     return decisionMade_.load(std::memory_order_relaxed) ? IdentifyState::Ambiguous : IdentifyState::Searching;
 }
 
@@ -954,6 +996,7 @@ bool SurfaceIdentifier::Extent(UINT64* width, UINT* height) const noexcept
     {
         return false;
     }
+
     *width = identifiedWidth_.load(std::memory_order_relaxed);
     *height = identifiedHeight_.load(std::memory_order_relaxed);
     return *width != 0 && *height != 0;
@@ -965,6 +1008,7 @@ bool SurfaceIdentifier::IsCandidate(ID3D12Resource* resource) const noexcept
     {
         return false;
     }
+
     std::shared_lock lock(candidateMutex_);
     return candidates_.count(resource) != 0;
 }
@@ -975,6 +1019,7 @@ bool SurfaceIdentifier::ValidateCandidate(ID3D12Resource* resource) noexcept
     {
         return false;
     }
+
     D3D12_RESOURCE_DESC recorded{};
     {
         std::shared_lock lock(candidateMutex_);
@@ -983,8 +1028,10 @@ bool SurfaceIdentifier::ValidateCandidate(ID3D12Resource* resource) noexcept
         {
             return false;
         }
+
         recorded = it->second.desc;
     }
+
     // GetDesc() outside the call that handed us the resource is safe only
     // because a candidate is held by reference (see MarkCandidate).
     const D3D12_RESOURCE_DESC current = resource->GetDesc();
@@ -996,6 +1043,7 @@ bool SurfaceIdentifier::ValidateCandidate(ID3D12Resource* resource) noexcept
     {
         return true;
     }
+
     Log(std::string(spec_.logPrefix) + ": candidate " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
         " no longer matches the desc it was accepted with (" + std::to_string(recorded.Width) + "x" +
         std::to_string(recorded.Height) + " fmt=" + std::to_string(static_cast<int>(recorded.Format)) + " -> " +
@@ -1014,6 +1062,7 @@ void SurfaceIdentifier::MarkCandidate(ID3D12Resource* resource, const D3D12_RESO
             " - another surface holds it");
         return;
     }
+
     std::unique_lock lock(candidateMutex_);
     auto& entry = candidates_[resource];
     entry.resource = resource; // ComPtr::operator= AddRefs
@@ -1036,6 +1085,7 @@ int SurfaceIdentifier::RivalHasSelectedEvidence(ID3D12Resource* resource) const 
     {
         return -1; // too little history to judge either way
     }
+
     const uint32_t mask = selectedEvidenceMask_.load(std::memory_order_relaxed);
     for (uint8_t i = 0; i < spec_.signalCount; ++i)
     {
@@ -1044,6 +1094,7 @@ int SurfaceIdentifier::RivalHasSelectedEvidence(ID3D12Resource* resource) const 
             return 0;
         }
     }
+
     return 1;
 }
 
@@ -1054,6 +1105,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
     {
         return false;
     }
+
     // Cheapest checks first: this runs on every trigger edge of every frame.
     ID3D12Resource* selected = SelectedRaw();
     if (selected == nullptr || resource == selected || resource == nullptr ||
@@ -1061,6 +1113,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
     {
         return false;
     }
+
     if (FramesSinceEdge(frame) < spec_.rivalStallFrames)
     {
         return false;
@@ -1105,6 +1158,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
         {
             profileStore_->EnsureProfiled(resource, desc);
         }
+
         evidence = RivalHasSelectedEvidence(resource);
         if (evidence == 0)
         {
@@ -1114,6 +1168,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
                     " takes the edge but lacks the shares_call_with_edge evidence the selection rests on. (Logged "
                     "once.)");
             }
+
             return false;
         }
     }
@@ -1152,6 +1207,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
         {
             return false;
         }
+
         if (adoptions_.fetch_add(1, std::memory_order_relaxed) >= spec_.rivalMaxAdoptions)
         {
             if (!adoptLimitReported_.exchange(true))
@@ -1160,6 +1216,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
                     std::to_string(spec_.rivalMaxAdoptions) + " reached - no longer following new " + spec_.name +
                     " allocations. Restart to reset.");
             }
+
             return false;
         }
 
@@ -1177,11 +1234,13 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
     {
         return false;
     }
+
     const int n = rivalReports_.fetch_add(1, std::memory_order_relaxed);
     if (n >= spec_.rivalMaxReports)
     {
         return false;
     }
+
     Log(std::string(spec_.logPrefix) + ": RIVAL " + std::to_string(reinterpret_cast<uintptr_t>(resource)) + " " +
         std::to_string(desc.Width) + "x" + std::to_string(desc.Height) + " fmt=" +
         std::to_string(static_cast<int>(desc.Format)) + " took the trigger edge on frame " + std::to_string(frame) +
@@ -1191,6 +1250,7 @@ bool SurfaceIdentifier::OnUnmatchedEdge(ID3D12Resource* resource, uint64_t frame
         Log(std::string(spec_.logPrefix) + ": further RIVAL lines suppressed until the pass resumes (cap " +
             std::to_string(spec_.rivalMaxReports) + ").");
     }
+
     return false;
 }
 
@@ -1204,6 +1264,7 @@ bool SurfaceIdentifier::IsShortlisted(ID3D12Resource* resource) noexcept
             return true;
         }
     }
+
     return false;
 }
 
@@ -1217,15 +1278,18 @@ bool SurfaceIdentifier::ForgetKnownSource(ID3D12Resource* resource) noexcept
         dropped = it != shortlist_.end();
         shortlist_.erase(it, shortlist_.end());
     }
+
     {
         std::unique_lock lock(candidateMutex_);
         dropped = candidates_.erase(resource) != 0 || dropped;
     }
+
     if (dropped)
     {
         Log(std::string(spec_.logPrefix) + ": dropped " + std::to_string(reinterpret_cast<uintptr_t>(resource)) +
             " from the shortlist: it is a swapchain back buffer");
     }
+
     return SelectedRaw() == resource;
 }
 
@@ -1237,6 +1301,7 @@ void SurfaceIdentifier::ForgetAllCandidates() noexcept
         dropped = candidates_.size();
         candidates_.clear();
     }
+
     if (dropped != 0)
     {
         Log(std::string(spec_.logPrefix) + ": dropped " + std::to_string(dropped) +
@@ -1261,14 +1326,17 @@ void SurfaceIdentifier::Reopen(ReopenReason reason, const char* detail) noexcept
             std::lock_guard<std::mutex> lock(shortlistMutex_);
             shortlist_.clear();
         }
+
         if (profileStore_ != nullptr)
         {
             profileStore_->Clear();
         }
+
         {
             std::lock_guard<std::mutex> lock(resolutionMutex_);
             resolutionHistogram_.clear();
         }
+
         // `SurfaceRegistry::ReopenCascade` refills the shared seen-set and
         // budget, once per cascade.
     }
@@ -1307,11 +1375,13 @@ bool SurfaceIdentifier::NoteBackBufferSize(uint64_t width, uint32_t height) noex
     {
         return false;
     }
+
     if (identified_.load(std::memory_order_acquire) == nullptr && !decisionMade_.load(std::memory_order_relaxed))
     {
         // Nothing decided yet; the search sees the new size anyway.
         return false;
     }
+
     Log(std::string(spec_.logPrefix) + ": back buffer resized " + std::to_string(previousWidth) + "x" +
         std::to_string(previousHeight) + " -> " + std::to_string(width) + "x" + std::to_string(height) +
         "; UE rebuilds its scene textures at the new extent.");
@@ -1330,10 +1400,12 @@ bool SurfaceIdentifier::IsSilent(uint64_t frame, uint64_t* framesSilent) noexcep
     {
         return false;
     }
+
     if (framesSilent != nullptr)
     {
         *framesSilent = frame - last;
     }
+
     // Logged once per silence: a menu can hold it for hundreds of thousands
     // of frames.
     if (!silenceReported_.exchange(true))
@@ -1342,6 +1414,7 @@ bool SurfaceIdentifier::IsSilent(uint64_t frame, uint64_t* framesSilent) noexcep
             std::to_string(frame - last) + " frames (last on frame " + std::to_string(last) +
             "). A menu or pause looks like this; the same resource usually resumes.");
     }
+
     return true;
 }
 
@@ -1351,6 +1424,7 @@ uint64_t SurfaceIdentifier::FramesSinceEdge(uint64_t frame) const noexcept
     {
         return 0;
     }
+
     const uint64_t last = lastEdgeFrame_.load(std::memory_order_relaxed);
     return frame > last ? frame - last : 0;
 }

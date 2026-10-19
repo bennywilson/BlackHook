@@ -124,11 +124,13 @@ IUnknown* ComIdentity(IUnknown* object)
     {
         return nullptr;
     }
+
     IUnknown* identity = nullptr;
     if (FAILED(object->QueryInterface(IID_PPV_ARGS(&identity))) || identity == nullptr)
     {
         return object;
     }
+
     identity->Release(); // we want the address as a key, not a reference
     return identity;
 }
@@ -222,6 +224,7 @@ bool DumpFullyDrained()
     {
         return false;
     }
+
     for (const Slot& slot : g_slots)
     {
         if (slot.state == SlotState::Submitted)
@@ -229,6 +232,7 @@ bool DumpFullyDrained()
             return false;
         }
     }
+
     return true;
 }
 
@@ -282,6 +286,7 @@ void SnapshotDumpLayout(int surface, const SurfaceCapture& capture)
     {
         return;
     }
+
     tracked.footprints = capture.footprints;
     tracked.bytes = capture.bytes;
     tracked.subresources = capture.subresources;
@@ -300,10 +305,12 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
         tracked.known = true;
         return true;
     }
+
     if (SameLayout(tracked.desc, desc))
     {
         return true;
     }
+
     const int short_by = EndBurst(BurstEndReason::LayoutChanged);
     Log(std::string("capture: burst ENDED - the ") + name + " layout changed, " + DescToString(tracked.desc) + " -> " +
         DescToString(desc) + ". A dump holds one layout; " + std::to_string(short_by) +
@@ -357,11 +364,13 @@ const std::string& DumpDir()
             OutputDir("dumps");
             return OutputDir("dumps/mv_dump");
         }
+
         std::string d = override;
         if (!d.empty() && d.back() != '\\' && d.back() != '/')
         {
             d += '\\';
         }
+
         CreateDirectoryA(d.c_str(), nullptr);
         return d;
     }();
@@ -381,11 +390,13 @@ bool DepthCaptureEnabled()
         {
             return true;
         }
+
         const bool off = std::string(value, length) == "0";
         if (off)
         {
             Log("capture: MV_CAPTURE_DEPTH=0 - depth is not captured this session.");
         }
+
         return !off;
     }();
     return enabled;
@@ -403,6 +414,7 @@ bool WriteJobToDisk(const WriteJob& job)
         job.append ? OPEN_ALWAYS : CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
+
     DWORD written = 0;
     bool ok = file != INVALID_HANDLE_VALUE;
     if (ok)
@@ -411,10 +423,12 @@ bool WriteJobToDisk(const WriteJob& job)
         {
             SetFilePointer(file, 0, nullptr, FILE_END);
         }
+
         ok = WriteFile(file, job.data.data(), static_cast<DWORD>(job.data.size()), &written, nullptr) &&
              written == job.data.size();
         CloseHandle(file);
     }
+
     if (!ok)
     {
         const uint64_t n = g_failedWrites.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -424,13 +438,16 @@ bool WriteJobToDisk(const WriteJob& job)
                 std::to_string(job.data.size()) + " bytes, err=" + std::to_string(GetLastError()) + ") - " +
                 std::to_string(n) + " failed so far. Disk full, or an unwritable MV_DUMP_DIR?");
         }
+
         return false;
     }
+
     if (!job.renameTo.empty() && !MoveFileExA(job.path.c_str(), job.renameTo.c_str(), MOVEFILE_REPLACE_EXISTING))
     {
         Log("capture: failed to seal " + job.renameTo + " (rename from " + job.path +
             ") err=" + std::to_string(GetLastError()) + ". The frames are on disk but have no manifest.");
     }
+
     return true;
 }
 
@@ -446,10 +463,12 @@ void WriterThread()
             {
                 return; // stopping, and everything queued has been written
             }
+
             job = std::move(g_writeQueue.front());
             g_writeQueue.pop_front();
             g_queuedBytes -= job.data.size();
         }
+
         WriteJobToDisk(job);
 
         // This line, not "burst recorded", is the signal that it is safe to
@@ -483,11 +502,13 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
         {
             return false;
         }
+
         if (!g_writerStarted)
         {
             g_writerStarted = true;
             g_writerThread = std::thread(WriterThread);
         }
+
         // frames.csv and the manifest always go through: without them the
         // frames on disk cannot be read.
         if (renameTo.empty() && data.size() > 4096 && g_queuedBytes + data.size() > kMaxQueuedBytes)
@@ -497,9 +518,11 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
                 "MB pending), dropping " + path + " - dropped " + std::to_string(n) + " so far");
             return false;
         }
+
         g_queuedBytes += data.size();
         g_writeQueue.push_back(WriteJob{std::move(path), std::move(data), append, std::move(renameTo)});
     }
+
     g_writeCv.notify_one();
     return true;
 }
@@ -514,17 +537,20 @@ bool EnqueueFrame(std::vector<WriteJob> jobs)
     {
         total += job.data.size();
     }
+
     {
         std::lock_guard<std::mutex> lock(g_writeMutex);
         if (g_writerStop)
         {
             return false;
         }
+
         if (!g_writerStarted)
         {
             g_writerStarted = true;
             g_writerThread = std::thread(WriterThread);
         }
+
         if (g_queuedBytes + total > kMaxQueuedBytes)
         {
             const uint64_t n = g_droppedWrites.fetch_add(jobs.size()) + jobs.size();
@@ -533,12 +559,14 @@ bool EnqueueFrame(std::vector<WriteJob> jobs)
                 std::to_string(total / (1024 * 1024)) + "MB) - dropped " + std::to_string(n) + " so far");
             return false;
         }
+
         g_queuedBytes += total;
         for (WriteJob& job : jobs)
         {
             g_writeQueue.push_back(std::move(job));
         }
     }
+
     g_writeCv.notify_one();
     return true;
 }
@@ -573,6 +601,7 @@ UINT PlaneCountFor(ID3D12Device* device, DXGI_FORMAT format)
     {
         return 1;
     }
+
     return info.PlaneCount == 0 ? 1 : info.PlaneCount;
 }
 
@@ -595,12 +624,14 @@ bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_D
     {
         return true;
     }
+
     const char* name = kSurfaceNames[surface];
     if (capture.readback != nullptr)
     {
         Log(std::string("capture: ") + name + " layout changed, " + DescToString(capture.desc) + " -> " +
             DescToString(desc) + "; rebuilding footprints");
     }
+
     const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
     capture.footprints.resize(subresources);
     UINT64 total = 0;
@@ -614,6 +645,7 @@ bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_D
         Log(std::string("capture: failed to create ") + name + " readback buffer");
         return false;
     }
+
     Log(std::string("capture: ") + name + " readback buffer created, " + std::to_string(total) + " bytes, " +
         std::to_string(subresources) +
         " subresource(s), rowPitch=" + std::to_string(capture.footprints[0].Footprint.RowPitch) + kCaptureFacts[surface].note);
@@ -678,6 +710,7 @@ bool ParseEngineVersion(int* major, int* minor)
     {
         return false;
     }
+
     const std::string value(version, length);
     const size_t dot = value.find('.');
     if (dot == std::string::npos)
@@ -686,6 +719,7 @@ bool ParseEngineVersion(int* major, int* minor)
             "' is not in major.minor form; not recording it rather than recording a guess");
         return false;
     }
+
     *major = atoi(value.c_str());
     *minor = atoi(value.c_str() + dot + 1);
     return true;
@@ -740,6 +774,7 @@ std::string JsonEscape(const std::string& s)
                 }
         }
     }
+
     return out;
 }
 
@@ -788,6 +823,7 @@ std::string ProcessBaseName()
             base = p + 1;
         }
     }
+
     return base;
 }
 
@@ -831,6 +867,7 @@ std::string BuildManifest()
         j += "    \"profile\": null,\n";
         j += "    \"profile_source\": null,\n";
     }
+
     if (g_dumpLayout[kSurfaceColor].known)
     {
         const D3D12_RESOURCE_DESC& bb = g_dumpLayout[kSurfaceColor].desc;
@@ -859,6 +896,7 @@ std::string BuildManifest()
         "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted",
         "surface_reopened"};
     const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
+
     j += "  \"burst\": {\n";
     j += "    \"requested_frames\": " + std::to_string(kCaptureFrames) + ",\n";
     j += "    \"recorded_frames\": " + std::to_string(g_captureCounter.load(std::memory_order_relaxed)) + ",\n";
@@ -878,6 +916,7 @@ std::string BuildManifest()
             j += std::string("      \"reason\": ") +
                  (DepthCaptureEnabled() ? "\"never_identified\"" : "\"capture_disabled\"") + ",\n";
         }
+
         if (!layout.known && i >= kFirstOptionalSurface)
         {
             // Tells "off" from "on but never found".
@@ -885,6 +924,7 @@ std::string BuildManifest()
             const SurfaceProfile* profile = ActiveSurfaceProfile();
             const SurfaceSpec* spec = profile != nullptr ? profile->Optional(name.c_str()) : nullptr;
             const bool enabled = spec != nullptr && spec->enabled;
+
             j += std::string("      \"reason\": ") + (enabled ? "\"never_identified\"" : "\"not_enabled\"") + ",\n";
             j += "      \"detail\": " +
                  JsonString(enabled ? "enabled via MV_SURFACES=" + name + ", but no resource was identified - see the '" +
@@ -894,6 +934,7 @@ std::string BuildManifest()
                                               : "the active profile has no " + name + " spec") +
                  ",\n";
         }
+
         const bool required = i == kSurfaceVelocity || i == kSurfaceColor || (i == kSurfaceDepth && layout.known);
         j += "      \"required\": " + std::string(required ? "true" : "false") + ",\n";
         if (i == kSurfaceColor)
@@ -914,6 +955,7 @@ std::string BuildManifest()
             // `mvtools.py` refuse to decode it.
             j += ",\n      \"encoding\": { \"kind\": \"unknown\" }";
         }
+
         if (i == kSurfaceVelocity)
         {
             j += ",\n      \"coverage\": { \"strong\": " +
@@ -948,6 +990,7 @@ std::string BuildManifest()
         {
             continue;
         }
+
         if (wroteAny)
         {
             layoutSurfaces += ",\n";
@@ -1006,12 +1049,14 @@ bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
     {
         return false;
     }
+
     void* mapped = nullptr;
     D3D12_RANGE readRange{0, static_cast<SIZE_T>(bytes)};
     if (FAILED(buffer->Map(0, &readRange, &mapped)) || mapped == nullptr)
     {
         return false;
     }
+
     out.assign(static_cast<uint8_t*>(mapped), static_cast<uint8_t*>(mapped) + bytes);
     D3D12_RANGE noWrite{0, 0};
     buffer->Unmap(0, &noWrite);
@@ -1032,6 +1077,7 @@ bool DrainSlot(Slot& slot)
             total += slot.surfaces[i].bytes;
         }
     }
+
     if (!WriteQueueHasRoom(total))
     {
         const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1040,6 +1086,7 @@ bool DrainSlot(Slot& slot)
             Log("capture: write queue full, dropping frame " + std::to_string(slot.captureIndex) + " (" +
                 std::to_string(total / (1024 * 1024)) + " MB) - " + std::to_string(n) + " dropped so far");
         }
+
         return false;
     }
 
@@ -1055,6 +1102,7 @@ bool DrainSlot(Slot& slot)
     {
         return false;
     }
+
     mapped[kSurfaceVelocity] = true;
     mapped[kSurfaceColor] = true;
 
@@ -1064,6 +1112,7 @@ bool DrainSlot(Slot& slot)
         {
             continue;
         }
+
         mapped[i] = MapOut(slot.surfaces[i].readback.Get(), slot.surfaces[i].bytes, data[i]);
     }
 
@@ -1078,6 +1127,7 @@ bool DrainSlot(Slot& slot)
         {
             continue;
         }
+
         sprintf_s(nameBuf, "%s_%05d.bin", kCaptureFacts[i].filePrefix, slot.captureIndex);
         jobs.push_back(WriteJob{DumpDir() + nameBuf, std::move(data[i]), /*append=*/false, /*renameTo=*/{}});
         haveVelocity = haveVelocity || i == kSurfaceVelocity;
@@ -1099,6 +1149,7 @@ bool DrainSlot(Slot& slot)
     {
         g_drainedFrames.fetch_add(1, std::memory_order_relaxed);
     }
+
     return ok;
 }
 
@@ -1184,6 +1235,7 @@ void StartCaptureHotkeyThread()
     {
         return;
     }
+
     g_hotkeyThread = std::thread(
         []
         {
@@ -1194,6 +1246,7 @@ void StartCaptureHotkeyThread()
                 ArmBurst();
                 Log("capture: MV_AUTOCAPTURE set, starting a burst without a keypress");
             }
+
             bool wasDown = false;
             bool restartWasDown = false;
             while (!g_hotkeyStop.load(std::memory_order_relaxed))
@@ -1230,16 +1283,19 @@ bool EnsureDevice(ID3D12GraphicsCommandList* cmdList)
     {
         return true;
     }
+
     if (FAILED(cmdList->GetDevice(IID_PPV_ARGS(&g_device))) || g_device == nullptr)
     {
         return false;
     }
+
     if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
     {
         Log("capture: CreateFence failed");
         g_device.Reset();
         return false;
     }
+
     return true;
 }
 
@@ -1254,6 +1310,7 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
             return &candidate;
         }
     }
+
     for (Slot& candidate : g_slots)
     {
         if (candidate.state == SlotState::Free)
@@ -1270,9 +1327,11 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
                 surface.queueSubmissionsAtRecord = 0;
                 surface.coverage = Coverage::None;
             }
+
             return &candidate;
         }
     }
+
     return nullptr;
 }
 
@@ -1285,6 +1344,7 @@ void LogNoFreeSlot()
     {
         return;
     }
+
     std::string states;
     for (const Slot& s : g_slots)
     {
@@ -1304,6 +1364,7 @@ void LogNoFreeSlot()
                 break;
         }
     }
+
     Log("capture: no free slot (" + std::to_string(misses) + " skipped so far, " +
         std::to_string(g_framesRemaining.load(std::memory_order_relaxed)) + " frames still requested) - slots=[" +
         states + "] fenceCompleted=" + std::to_string(g_fence != nullptr ? g_fence->GetCompletedValue() : 0) +
@@ -1326,6 +1387,7 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
     {
         return;
     }
+
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     Slot* slot = AcquireSlotForFrame(frame);
     if (slot == nullptr)
@@ -1334,8 +1396,10 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
         {
             LogNoFreeSlot();
         }
+
         return;
     }
+
     SurfaceCapture& capture = slot->surfaces[surface];
 
     // Which of a frame's edges lands (the `arbitration` in `kCaptureFacts`).
@@ -1351,6 +1415,7 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
         {
             return;
         }
+
         if (velocityDone && !g_depthAfterVelocityReported.exchange(true))
         {
             Log("capture: depth becomes readable only after velocity on this title, so the dump's depth "
@@ -1367,15 +1432,18 @@ void OnSurfaceReadable(int surface, ID3D12GraphicsCommandList* cmdList, ID3D12Re
     {
         return;
     }
+
     const bool firstUse = capture.readback == nullptr;
     if (!EnsureReadback(capture, surface, desc))
     {
         return;
     }
+
     if (firstUse)
     {
         SnapshotDumpLayout(surface, capture);
     }
+
     RecordCopyToReadback(cmdList, resource, capture.readback.Get(), capture.footprints,
                          static_cast<D3D12_RESOURCE_STATES>(stateAfter), g_originalResourceBarrier);
 
@@ -1404,6 +1472,7 @@ int SurfaceIndex(const char* name)
             return i;
         }
     }
+
     return -1;
 }
 
@@ -1414,17 +1483,20 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
     {
         return;
     }
+
     std::lock_guard<std::mutex> lock(g_mutex);
     if (queue == g_queue.Get())
     {
         g_queueSubmissions.fetch_add(1, std::memory_order_relaxed);
     }
+
     for (Slot& slot : g_slots)
     {
         if (slot.state != SlotState::Recording)
         {
             continue;
         }
+
         // Velocity only: the depth and GBuffer copies also ride the game's
         // list but are not graded.
         SurfaceCapture& surface = slot.surfaces[kSurfaceVelocity];
@@ -1432,12 +1504,14 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
         {
             continue;
         }
+
         for (UINT i = 0; i < numCommandLists; ++i)
         {
             if (ComIdentity(commandLists[i]) != surface.recordedList)
             {
                 continue;
             }
+
             if (queue == g_queue.Get())
             {
                 surface.coverage = Coverage::Strong;
@@ -1461,11 +1535,13 @@ void NotifySurfaceReopened(const char* surfaceName)
     {
         return; // no burst in progress; nothing to end
     }
+
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0)
     {
         return; // ended between the check above and taking the lock
     }
+
     const std::string name = surfaceName != nullptr ? surfaceName : "";
     // Velocity is always required; depth as frozen for this burst
     // (`g_depthRequiredForBurst`).
@@ -1474,6 +1550,7 @@ void NotifySurfaceReopened(const char* surfaceName)
     {
         return;
     }
+
     const int short_by = EndBurst(BurstEndReason::SurfaceReopened);
     Log("capture: burst ENDED - the " + name + " search reopened mid-burst. " + std::to_string(short_by) +
         " of " + std::to_string(kCaptureFrames) + " requested frames not captured. Press F8 again once it has "
@@ -1526,6 +1603,7 @@ void ProcessSnapshots()
     {
         return;
     }
+
     const unsigned long long now = g_frameIndex.load(std::memory_order_relaxed);
     for (auto it = g_snapshots.begin(); it != g_snapshots.end();)
     {
@@ -1536,14 +1614,17 @@ void ProcessSnapshots()
             {
                 s.fence = g_nextFenceValue++;
             }
+
             ++it;
             continue;
         }
+
         if (g_fence->GetCompletedValue() < s.fence)
         {
             ++it;
             continue;
         }
+
         std::vector<uint8_t> data;
         if (MapOut(s.readback.Get(), s.bytes, data))
         {
@@ -1555,6 +1636,7 @@ void ProcessSnapshots()
             Log(std::string("capture: snapshot written - ") + name + " (copied on frame " + std::to_string(s.frame) +
                 ")");
         }
+
         it = g_snapshots.erase(it);
     }
 }
@@ -1569,6 +1651,7 @@ void SnapshotCandidate(const char* surfaceName, ID3D12GraphicsCommandList* cmdLi
     {
         return;
     }
+
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_snapshotTaken.size() >= kMaxSnapshots ||
         std::find(g_snapshotTaken.begin(), g_snapshotTaken.end(), resource) != g_snapshotTaken.end() ||
@@ -1576,6 +1659,7 @@ void SnapshotCandidate(const char* surfaceName, ID3D12GraphicsCommandList* cmdLi
     {
         return;
     }
+
     g_snapshotTaken.push_back(resource);
 
     Snapshot s;
@@ -1591,6 +1675,7 @@ void SnapshotCandidate(const char* surfaceName, ID3D12GraphicsCommandList* cmdLi
         Log("capture: snapshot readback creation failed - skipping one candidate");
         return;
     }
+
     RecordCopyToReadback(
         cmdList, resource, s.readback.Get(), s.footprints, static_cast<D3D12_RESOURCE_STATES>(stateAfter),
         g_originalResourceBarrier);
@@ -1708,10 +1793,12 @@ void OnPresent(IDXGISwapChain* swapChain)
             break;
         }
     }
+
     if (slot == nullptr || g_device == nullptr || g_queue == nullptr)
     {
         return;
     }
+
     if (g_framesRemaining.load(std::memory_order_relaxed) <= 0)
     {
         // The burst ended mid-frame. Submitting would drive the count below zero
@@ -1719,6 +1806,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         slot->state = SlotState::Free;
         return;
     }
+
     if (!slot->surfaces[kSurfaceVelocity].present)
     {
         // Depth arrived but velocity did not. Every tool keys off velocity, so
@@ -1729,9 +1817,11 @@ void OnPresent(IDXGISwapChain* swapChain)
             Log("capture: frame " + std::to_string(frame) + " had no velocity copy (" + std::to_string(n) +
                 " such frames so far). Releasing the slot; nothing is written for this frame.");
         }
+
         slot->state = SlotState::Free;
         return;
     }
+
     // Every captured frame carries every surface this burst requires. Partial
     // frames happen at burst edges (F8 lands after depth's edges but before
     // velocity's) and are dropped. A title that never identifies depth still
@@ -1741,6 +1831,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         missing = "depth";
     }
+
     if (missing != nullptr)
     {
         const uint64_t n = g_incompleteFrames.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1749,6 +1840,7 @@ void OnPresent(IDXGISwapChain* swapChain)
             Log("capture: frame " + std::to_string(frame) + " has velocity but no " + missing +
                 " (a burst starting mid-frame); not written. " + std::to_string(n) + " so far.");
         }
+
         slot->state = SlotState::Free;
         return;
     }
@@ -1758,6 +1850,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         return;
     }
+
     ComPtr<ID3D12Resource> backBuffer;
     const UINT backBufferIndex = swapChain3->GetCurrentBackBufferIndex();
     // `GetBuffer` adds a reference, so holding the pointer is safe.
@@ -1775,12 +1868,14 @@ void OnPresent(IDXGISwapChain* swapChain)
         // This would have been the first frame at the new layout.
         return;
     }
+
     SurfaceCapture& color = slot->surfaces[kSurfaceColor];
     const bool firstColorUse = color.readback == nullptr;
     if (!EnsureReadback(color, kSurfaceColor, desc))
     {
         return;
     }
+
     if (firstColorUse)
     {
         SnapshotDumpLayout(kSurfaceColor, color);
@@ -1815,11 +1910,13 @@ void OnPresent(IDXGISwapChain* swapChain)
         {
             return;
         }
+
         if (FAILED(g_device->CreateCommandList(
                 0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot->allocator.Get(), nullptr, IID_PPV_ARGS(&slot->commandList))))
         {
             return;
         }
+
         slot->commandList->Close();
     }
 
@@ -1884,6 +1981,7 @@ void StopCaptureHotkeyThread(bool processExiting)
     {
         return;
     }
+
     if (processExiting)
     {
         // Detach: at `DLL_PROCESS_DETACH` Windows has already ended every
@@ -1912,6 +2010,7 @@ void ShutdownCapture(bool processExiting)
         {
             return;
         }
+
         g_writerStop = true;
         if (processExiting)
         {
@@ -1921,19 +2020,24 @@ void ShutdownCapture(bool processExiting)
                 Log("capture: process exiting with " + std::to_string(pending) +
                     " writes queued - those frames are LOST. Wait for 'write queue drained' before quitting.");
             }
+
             if (g_writerThread.joinable())
             {
                 g_writerThread.detach(); // same argument as the hotkey thread above
             }
+
             return;
         }
+
         writer = std::move(g_writerThread);
     }
+
     g_writeCv.notify_all();
     if (writer.joinable())
     {
         writer.join();
     }
+
     Log("capture: writer drained and stopped");
 }
 

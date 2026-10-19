@@ -137,6 +137,7 @@ bool Check(HRESULT hr, const char* what) {
         printf("[testhost] FAILED %s: 0x%08lX\n", what, static_cast<unsigned long>(hr));
         return false;
     }
+
     return true;
 }
 
@@ -146,6 +147,7 @@ int DrainInfoQueue(ID3D12InfoQueue* infoQueue, const char* phase) {
     if (infoQueue == nullptr) {
         return 0;
     }
+
     int errors = 0;
     const UINT64 count = infoQueue->GetNumStoredMessages();
     std::vector<uint8_t> buffer;
@@ -154,11 +156,13 @@ int DrainInfoQueue(ID3D12InfoQueue* infoQueue, const char* phase) {
         if (FAILED(infoQueue->GetMessage(i, nullptr, &length))) {
             continue;
         }
+
         buffer.resize(length);
         auto* message = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
         if (FAILED(infoQueue->GetMessage(i, message, &length))) {
             continue;
         }
+
         const char* severity = "INFO";
         switch (message->Severity) {
             case D3D12_MESSAGE_SEVERITY_CORRUPTION: severity = "CORRUPTION"; ++errors; break;
@@ -166,11 +170,13 @@ int DrainInfoQueue(ID3D12InfoQueue* infoQueue, const char* phase) {
             case D3D12_MESSAGE_SEVERITY_WARNING:    severity = "WARNING";    break;
             default: break;
         }
+
         if (message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
             printf("[debug-layer/%s] %s (id %d): %.*s\n", phase, severity, static_cast<int>(message->ID),
                    static_cast<int>(message->DescriptionByteLength), message->pDescription);
         }
     }
+
     infoQueue->ClearStoredMessages();
     return errors;
 }
@@ -203,6 +209,7 @@ bool CreatePlacedTexture(ID3D12Device* device, DXGI_FORMAT format, UINT64 width,
                        options.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2;
     heapDesc.Flags = (tier2 ? D3D12_HEAP_FLAG_NONE : D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES) |
                      D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
     return Check(device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap") &&
            Check(device->CreatePlacedResource(heap.Get(), 0, &desc, state, &clear, IID_PPV_ARGS(&resource)),
                  "CreatePlacedResource");
@@ -222,13 +229,16 @@ std::vector<std::string> ThisRunsLog(HMODULE hook) {
     if (logDirectory == nullptr) {
         return lines;
     }
+
     std::ifstream in(std::string(logDirectory()) + "mv_hook.log", std::ios::binary);
     for (std::string line; std::getline(in, line);) {
         if (line.find("InitThread running") != std::string::npos) {
             lines.clear();
         }
+
         lines.push_back(line);
     }
+
     return lines;
 }
 
@@ -242,6 +252,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         PostQuitMessage(0);
         return 0;
     }
+
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
@@ -316,12 +327,14 @@ int main(int argc, char** argv) {
         printf("[testhost] Negative profile test: MV_PROFILE=%s (velocity narrowed to the wrong format) - "
                "identification must find NO candidate and must not fall back\n", kNegativeProfile);
     }
+
     if (normals || specular) {
         const char* surfaces = normals && specular ? "normals,specular" : normals ? "normals" : "specular";
         SetEnvironmentVariableA("MV_SURFACES", surfaces);
         printf("[testhost] MV_SURFACES=%s: GBuffer look-alikes join the line-up and must be the ones selected\n",
                surfaces);
     }
+
     // Every path below that expects identification to select nothing.
     const bool expectNothingSelected = ambiguous || negativeProfile;
     std::string dumpDir;
@@ -355,6 +368,7 @@ int main(int argc, char** argv) {
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"MvTestHostWindow";
     RegisterClassExW(&wc);
+
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"mv_testhost", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,
         nullptr, nullptr, wc.hInstance, nullptr);
@@ -362,12 +376,14 @@ int main(int argc, char** argv) {
         printf("[testhost] CreateWindowExW failed\n");
         return 1;
     }
+
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
     ComPtr<IDXGIFactory6> factory;
     if (!Check(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2")) {
         return 1;
     }
+
     ComPtr<IDXGIAdapter1> adapter;
     factory->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
 
@@ -400,6 +416,7 @@ int main(int argc, char** argv) {
                "CreateSwapChainForHwnd")) {
         return 1;
     }
+
     ComPtr<IDXGISwapChain3> swapChain;
     swapChain1.As(&swapChain);
 
@@ -445,6 +462,7 @@ int main(int argc, char** argv) {
             copy.velocityAllocation = extra;
             lineUp.insert(lineUp.begin() + 1, copy);
         }
+
         lineUp.front().velocityAllocation = 1;
     }
 
@@ -493,11 +511,13 @@ int main(int argc, char** argv) {
         gbufferB.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         gbufferB.viewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
         gbufferB.shouldBeSpecular = true;
+
         LookAlike gbufferC = gbufferB;
         gbufferC.name = "GBufferC";
         gbufferC.why = "specular decoy: identical descriptor (base colour), never batched with depth";
         gbufferC.behaviour = Behaviour::Velocity;
         gbufferC.shouldBeSpecular = false;
+
         lineUp.insert(lineUp.begin(), gbufferC);
         lineUp.insert(lineUp.begin(), gbufferB);
     }
@@ -529,6 +549,7 @@ int main(int argc, char** argv) {
     if (!Check(device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap)), "CreateDescriptorHeap")) {
         return 1;
     }
+
     const UINT rtvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     auto rtvAt = [&](UINT i) {
         D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -546,6 +567,7 @@ int main(int argc, char** argv) {
                                  D3D12_RESOURCE_STATE_RENDER_TARGET, clearValue, target.heap, target.resource)) {
             return 1;
         }
+
         target.rtvIndex = kBackBufferCount + static_cast<UINT>(i);
         if (target.viewFormat != DXGI_FORMAT_UNKNOWN) {
             D3D12_RENDER_TARGET_VIEW_DESC rtvDesc{};
@@ -555,6 +577,7 @@ int main(int argc, char** argv) {
         } else {
             device->CreateRenderTargetView(target.resource.Get(), nullptr, rtvAt(target.rtvIndex));
         }
+
         printf("[testhost] look-alike %zu: %-22s %llux%u fmt=%2d - %s\n", i, target.name, target.width,
                target.height, static_cast<int>(target.format), target.why);
     }
@@ -582,6 +605,7 @@ int main(int argc, char** argv) {
     if (!Check(device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&dsvHeap)), "CreateDescriptorHeap(DSV)")) {
         return 1;
     }
+
     const UINT dsvSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     auto dsvAt = [&](UINT i) {
         D3D12_CPU_DESCRIPTOR_HANDLE h = dsvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -604,6 +628,7 @@ int main(int argc, char** argv) {
                                  D3D12_RESOURCE_STATE_DEPTH_WRITE, clearValue, target.heap, target.resource)) {
             return 1;
         }
+
         D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
         dsvDesc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
         dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -618,6 +643,7 @@ int main(int argc, char** argv) {
         if (!Check(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])), "GetBuffer")) {
             return 1;
         }
+
         device->CreateRenderTargetView(backBuffers[i].Get(), nullptr, rtvAt(i));
     }
 
@@ -628,12 +654,14 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
     ComPtr<ID3D12GraphicsCommandList> cmdList;
     if (!Check(device->CreateCommandList(
                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0].Get(), nullptr, IID_PPV_ARGS(&cmdList)),
                "CreateCommandList")) {
         return 1;
     }
+
     cmdList->Close();
 
     ComPtr<ID3D12Fence> fence;
@@ -652,11 +680,13 @@ int main(int argc, char** argv) {
             printf("[testhost] LoadLibraryW failed: %lu\n", GetLastError());
             return 1;
         }
+
         printf("[testhost] loaded hook, waiting for it to install...\n");
         Sleep(1500); // InstallD3D12Hooks runs on its own thread
     } else {
         printf("[testhost] no --hook given; running unhooked (baseline)\n");
     }
+
     // The resource the hook selected for a surface, or nullptr.
     const auto identifiedFn = HookExport<void* (*)(const char*)>(hookModule, "MvIdentifiedSurface");
     auto identified = [&](const char* surface) { return identifiedFn != nullptr ? identifiedFn(surface) : nullptr; };
@@ -725,6 +755,7 @@ int main(int argc, char** argv) {
         } else if (frame >= velocitySwitchStart) {
             active = 2;
         }
+
         return allocation == active;
     };
 
@@ -747,9 +778,11 @@ int main(int argc, char** argv) {
             if (target.allocation != 0 && !gbufferAllocationActive(target.allocation, frame)) {
                 continue; // the other allocation of GBufferA is in use this frame
             }
+
             if (target.velocityAllocation != 0 && !velocityAllocationActive(target.velocityAllocation, frame)) {
                 continue; // another allocation of SceneVelocity is in use this frame
             }
+
             // Write it as a render target, so it holds real bytes.
             const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvAt(target.rtvIndex);
             cmdList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
@@ -772,6 +805,7 @@ int main(int argc, char** argv) {
                             sceneDepth = d.resource.Get();
                         }
                     }
+
                     D3D12_RESOURCE_BARRIER pair[2]{};
                     pair[0].Type = pair[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     pair[0].Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -872,12 +906,14 @@ int main(int argc, char** argv) {
                     expected = &target;
                 }
             }
+
             printf("\n[testhost] ==== identification ====\n");
             for (const LookAlike& target : lineUp) {
                 const bool isPicked = picked == static_cast<void*>(target.resource.Get());
                 printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED" : "");
             }
+
             if (negativeProfile) {
                 // The narrowed profile is the one that ran (a load failure also
                 // selects nothing), nothing was selected (no fallback), and the
@@ -888,6 +924,7 @@ int main(int argc, char** argv) {
                 const bool saidNoCandidate = AnyLine(ThisRunsLog(hookModule), "identify: NO candidate");
 
                 identificationPassed = profileOk && picked == nullptr && saidNoCandidate;
+
                 printf("[testhost]   active profile: %s %s\n", profile.empty() ? "<none - failed to load>" : profile.c_str(),
                        profileOk ? "(as requested)" : "(NOT the negative-test profile)");
                 printf("[testhost]   selected:       %s\n", picked == nullptr ? "nothing" : "SOMETHING");
@@ -950,12 +987,14 @@ int main(int argc, char** argv) {
                     expected = &target;
                 }
             }
+
             printf("\n[testhost] ==== depth identification ====\n");
             for (const DepthLookAlike& target : depthLineUp) {
                 const bool isPicked = picked == static_cast<void*>(target.resource.Get());
                 printf("[testhost]   %-16s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED" : "");
             }
+
             if (expectNothingSelected) {
                 // Velocity identified nothing, and depth is sized from it.
                 depthIdentificationPassed = picked == nullptr;
@@ -985,10 +1024,12 @@ int main(int argc, char** argv) {
             if (target.shouldBeNormals) {
                 expected = &target;
             }
+
             const bool isPicked = picked == static_cast<void*>(target.resource.Get());
             printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                    isPicked ? "<== SELECTED as normals" : "");
         }
+
         if (expectNothingSelected) {
             // Normals takes its extent from velocity, which selected nothing.
             normalsIdentificationPassed = picked == nullptr;
@@ -1012,6 +1053,7 @@ int main(int argc, char** argv) {
                     decoy = ptr;
                 }
             }
+
             int adoptions = 0;
             bool adoptedWrong = false;
             bool refusedDecoy = false;
@@ -1020,12 +1062,15 @@ int main(int argc, char** argv) {
                     ++adoptions;
                     adoptedWrong = adoptedWrong || line.find(secondAlloc) == std::string::npos;
                 }
+
                 if (line.find("normals: NOT a rival") != std::string::npos && line.find(decoy) != std::string::npos) {
                     refusedDecoy = true;
                 }
             }
+
             const bool rivalOk = adoptions >= 1 && !adoptedWrong && refusedDecoy;
             normalsIdentificationPassed = pickedRight && excludedVelocity && rivalOk;
+
             printf("[testhost]   velocity's buffer excluded from the normals ranking as held: %s\n",
                    excludedVelocity ? "yes" : "NO");
             printf("[testhost]   GBufferA's 2nd allocation adopted as a rival: %d adoption(s)%s\n", adoptions,
@@ -1049,12 +1094,14 @@ int main(int argc, char** argv) {
             if (target.shouldBeSpecular) {
                 expected = &target;
             }
+
             const bool isPicked = picked == static_cast<void*>(target.resource.Get());
             if (isPicked || target.format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
                 printf("[testhost]   %-22s %p %s\n", target.name, static_cast<void*>(target.resource.Get()),
                        isPicked ? "<== SELECTED as specular" : "");
             }
         }
+
         if (expectNothingSelected) {
             specularIdentificationPassed = picked == nullptr;
             printf("[testhost] %s\n", specularIdentificationPassed
@@ -1108,6 +1155,7 @@ int main(int argc, char** argv) {
                         return nextFrame - 1;
                     }
                 }
+
                 return -1;
             };
             auto capturingHasStarted = [&] {
@@ -1116,6 +1164,7 @@ int main(int argc, char** argv) {
                 if (h == INVALID_HANDLE_VALUE) {
                     return false;
                 }
+
                 FindClose(h);
                 return true;
             };
@@ -1149,11 +1198,13 @@ int main(int argc, char** argv) {
                 for (UINT i = 0; i < kBackBufferCount; ++i) {
                     backBuffers[i].Reset(); // DXGI requires no outstanding back-buffer refs before ResizeBuffers
                 }
+
                 queue->Signal(fence.Get(), ++fenceValue);
                 if (fence->GetCompletedValue() < fenceValue) {
                     fence->SetEventOnCompletion(fenceValue, fenceEvent);
                     WaitForSingleObject(fenceEvent, 5000);
                 }
+
                 const UINT resizedWidth = kWidth + 128;
                 const UINT resizedHeight = kHeight + 72;
                 if (!Check(
@@ -1166,6 +1217,7 @@ int main(int argc, char** argv) {
                         Check(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])), "GetBuffer (post-resize)");
                         device->CreateRenderTargetView(backBuffers[i].Get(), nullptr, rtvAt(i));
                     }
+
                     printf(
                         "[testhost]   resized back buffer %ux%u -> %ux%u\n", kWidth, kHeight, resizedWidth,
                         resizedHeight);
@@ -1191,6 +1243,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+
                 printf(
                     "[testhost] test 1 (resize triggers reidentification): %s\n", resizeTestPassed ? "PASS" : "FAIL");
 
@@ -1233,6 +1286,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+
                 printf(
                     "[testhost] test 2 (depth reallocation recovers): %s\n",
                     depthReopenRecoveryPassed ? "PASS" : "FAIL");
@@ -1296,6 +1350,7 @@ int main(int argc, char** argv) {
                 if (h == INVALID_HANDLE_VALUE) {
                     return 0;
                 }
+
                 int n = 0;
                 do {
                     ++n;
@@ -1331,6 +1386,7 @@ int main(int argc, char** argv) {
                        "window, before the 2nd allocation was adopted)\n", normalsFrames, velocities,
                        velocities - normalsFrames);
             }
+
             printf("[testhost]   specular frames: %d\n", specularFrames);
             if (!specular && specularFrames != 0) {
                 printf("[testhost] FAIL - specular was captured without MV_SURFACES=specular\n");
@@ -1342,6 +1398,7 @@ int main(int argc, char** argv) {
             } else if (specular && !expectNothingSelected) {
                 printf("[testhost] PASS - every captured frame also has specular\n");
             }
+
             if (expectNothingSelected) {
                 // Nothing identified, so nothing may be captured.
                 dumpContentsPassed = velocities == 0 && depths == 0;
@@ -1363,6 +1420,7 @@ int main(int argc, char** argv) {
                 printf("[testhost] FAIL - the dump is missing one of the per-frame artefacts\n");
                 dumpContentsPassed = false;
             }
+
             dumpContentsPassed = dumpContentsPassed && normalsDumpOk;
         }
     }
@@ -1382,10 +1440,12 @@ int main(int argc, char** argv) {
         printf("[testhost] %s\n", normalsIdentificationPassed ? "PASS - normals identification"
                                                               : "FAIL - normals identification");
     }
+
     if (specular) {
         printf("[testhost] %s\n", specularIdentificationPassed ? "PASS - specular identification"
                                                                : "FAIL - specular identification");
     }
+
     if (reopenTests) {
         printf("[testhost] %s\n", resizeTestPassed ? "PASS - reopen test 1 (resize stops capture until reidentified)"
                                                      : "FAIL - reopen test 1 (resize stops capture until reidentified)");
@@ -1399,12 +1459,14 @@ int main(int argc, char** argv) {
 
     CloseHandle(fenceEvent);
     DestroyWindow(hwnd);
+
     const int exitCode =
         (totalErrors == 0 && identificationPassed && depthIdentificationPassed && dumpContentsPassed &&
          normalsIdentificationPassed && specularIdentificationPassed &&
          (!reopenTests || (resizeTestPassed && depthReopenRecoveryPassed && midBurstReopenEndedBurst)))
             ? 0
             : 1;
+
     printf("[testhost] exiting with code %d\n", exitCode);
     fflush(stdout);
     return exitCode;

@@ -65,6 +65,7 @@ inline bool IsDepthReadableState(int state)
     {
         return false;
     }
+
     constexpr int kReadable =
         static_cast<int>(D3D12_RESOURCE_STATE_DEPTH_READ) | static_cast<int>(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     return (state & ~kReadable) == 0;
@@ -248,6 +249,7 @@ public:
             fn(resource, profile);
         }
     }
+
     size_t Size() const noexcept;
 
 private:
@@ -380,6 +382,7 @@ private:
     {
         return identified_.load(std::memory_order_acquire);
     }
+
     bool StructurallyPlausibleForRival(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) const noexcept;
     std::string DescLine(ID3D12Resource* resource, const D3D12_RESOURCE_DESC& desc) const noexcept;
 

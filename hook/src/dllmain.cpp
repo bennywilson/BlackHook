@@ -90,5 +90,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         default:
             break;
     }
+
     return TRUE;
 }

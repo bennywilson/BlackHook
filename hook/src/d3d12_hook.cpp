@@ -144,11 +144,13 @@ void NoteKnownSources(IDXGISwapChain* const swapChain)
     {
         return;
     }
+
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swapChain->GetDesc(&desc)))
     {
         return;
     }
+
     for (UINT i = 0; i < desc.BufferCount; ++i)
     {
         Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
@@ -168,6 +170,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
     mv::OverlayOnPresent(swapChain, mv::GetPresentingQueue(), frame);
+
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     g_presentCount.fetch_add(1, std::memory_order_relaxed);
     LogHeartbeatIfDue();
@@ -184,6 +187,7 @@ HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags, const DX
     mv::GetSurfaceRegistry().OnFrame(frame);
     mv::OnPresent(swapChain);
     mv::OverlayOnPresent(swapChain, mv::GetPresentingQueue(), frame);
+
     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
     g_present1Count.fetch_add(1, std::memory_order_relaxed);
     LogHeartbeatIfDue();
@@ -218,6 +222,7 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
         // The inner, forwarded call: the outer one handles the same barriers.
         return;
     }
+
     g_resourceBarrierCount.fetch_add(1, std::memory_order_relaxed);
 
     if (!barriers)
@@ -307,6 +312,7 @@ bool CreateHook(void* target, void* detour, void** original, const char* name)
         Log(std::string("MH_CreateHook failed for ") + name + ": " + MH_StatusToString(status));
         return false;
     }
+
     return true;
 }
 
@@ -427,6 +433,7 @@ bool InstallD3D12Hooks()
         DestroyWindow(hwnd);
         return false;
     }
+
     commandList->Close();
 
     // MinHook patches the function code behind each vtable slot, which every
@@ -480,11 +487,13 @@ bool InstallD3D12Hooks()
             }
         }
     }
+
     mv::GetSurfaceRegistry().SetReopenObserver(&mv::NotifySurfaceReopened);
     if (GetEnvironmentVariableA("MV_SNAPSHOT", nullptr, 0) != 0)
     {
         mv::GetSurfaceRegistry().SetCandidateEdgeObserver(&mv::SnapshotCandidate);
     }
+
     mv::GetSurfaceRegistry().Configure();
 
     if (ok)
